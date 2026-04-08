@@ -36,6 +36,14 @@ memmap2 = "0.9"
 # on the big (16384, 96) head projection.
 matrixmultiply = "0.3"
 
+# SentencePiece Rust bindings. Wraps the C++ library which must be
+# installed on the system: `brew install sentencepiece` on macOS,
+# `apt install libsentencepiece-dev` on Debian/Ubuntu, etc.
+# We use SentencePiece directly (rather than tokenizers crate + JSON
+# conversion) because L3TC ships SPM .model files and we want
+# bit-identical tokenization for round-trip correctness.
+sentencepiece = "0.11"
+
 [dev-dependencies]
 # Deterministic rng for tests
 rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }

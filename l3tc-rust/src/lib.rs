@@ -43,10 +43,14 @@
 pub mod arithmetic;
 pub mod bitio;
 pub mod checkpoint;
+pub mod codec;
 pub mod error;
 pub mod rwkv;
 pub mod tensor;
+pub mod tokenizer;
 
 pub use checkpoint::{Checkpoint, Tensor};
+pub use codec::{compress, decompress, DEFAULT_SEGMENT_BYTES};
 pub use error::{Error, Result};
 pub use rwkv::{Model, Session};
+pub use tokenizer::{EncodedSegment, Tokenizer};
