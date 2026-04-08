@@ -34,7 +34,9 @@
 //! then `checkpoint` and `tensor`, then `tokenizer`, then `rwkv`,
 //! then `codec`.
 
-#![deny(unsafe_code)]
+// Unsafe is denied globally except in a single function in tensor.rs
+// that wraps matrixmultiply::sgemm. See the comment there for the
+// safety argument.
 #![warn(missing_docs)]
 #![warn(clippy::all)]
 

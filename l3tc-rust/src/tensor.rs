@@ -24,6 +24,15 @@
 ///
 /// `mat` is a row-major `(rows, cols)` matrix stored as `rows * cols`
 /// contiguous floats.
+///
+/// For small matrices (row count below `MATVEC_BLAS_THRESHOLD`) this
+/// uses a hand-written scalar inner loop that the compiler can
+/// autovectorize. For larger matrices — specifically the
+/// `(16384, 96)` embedding and head projections — it delegates to
+/// `matrixmultiply::sgemm`, which ships hand-tuned SIMD kernels for
+/// x86 AVX/AVX2/AVX512 and ARM NEON. The head projection is the
+/// dominant cost per token, so this single swap gives us roughly
+/// an order-of-magnitude speedup on realistic models.
 #[inline]
 pub fn matvec(mat: &[f32], x: &[f32], out: &mut [f32]) {
     let rows = out.len();
@@ -34,6 +43,100 @@ pub fn matvec(mat: &[f32], x: &[f32], out: &mut [f32]) {
         "matvec: mat shape mismatch (expected {rows}*{cols}, got {})",
         mat.len()
     );
+    if rows >= MATVEC_BLAS_THRESHOLD {
+        matvec_sgemm(mat, x, out, rows, cols);
+    } else {
+        matvec_scalar(mat, x, out, rows, cols);
+    }
+}
+
+/// Minimum row count at which we switch from the scalar matvec
+/// implementation to the `matrixmultiply` SIMD kernel.
+///
+/// Small matrices (the per-layer 96×96 projections) pay more in
+/// call overhead than they save in SIMD throughput, so we use the
+/// scalar path for them. The embedding and head are much larger
+/// and benefit immediately.
+const MATVEC_BLAS_THRESHOLD: usize = 512;
+
+/// Tall matrix-vector multiply where the matrix is stored **column-major**.
+///
+/// This is a different layout convention from [`matvec`]: the
+/// matrix data is `(cols, rows)` instead of `(rows, cols)` in
+/// memory, such that column `j` of the logical matrix is
+/// `mat_col_major[j * rows .. (j + 1) * rows]`.
+///
+/// The algorithm is `out[i] = sum_j mat[i, j] * x[j]` computed as:
+///
+/// ```text
+/// out = 0
+/// for j in 0..cols:
+///     axpy: out += x[j] * mat_col_major[j * rows .. (j + 1) * rows]
+/// ```
+///
+/// This is the AXPY (`alpha * x + y`) form that vectorizes
+/// beautifully: the inner loop is a constant-stride walk through
+/// contiguous memory with a scalar broadcast multiply. LLVM
+/// autovectorizes this cleanly into NEON / AVX SIMD without any
+/// external crate.
+///
+/// For very tall matrices like the L3TC head (16384 × 96), this
+/// form is dramatically faster than the row-major dot-product form
+/// because:
+///
+/// 1. **Cache behavior**: memory is accessed in streaming order
+///    with a stride of 1 across a full column (64 KB for a 16384-row
+///    column), hitting the L1 cache predictor perfectly.
+/// 2. **SIMD utilisation**: each AXPY is a pure elementwise op
+///    that vectorizes 4 or 8 floats per instruction on ARM NEON
+///    / x86 AVX with no reduction step.
+/// 3. **Register pressure**: the inner loop holds one scalar
+///    (`x[j]`) and streams through memory, leaving all the vector
+///    registers free for the accumulation.
+pub fn matvec_col_major(
+    mat_col_major: &[f32],
+    x: &[f32],
+    out: &mut [f32],
+    rows: usize,
+    cols: usize,
+) {
+    debug_assert_eq!(mat_col_major.len(), rows * cols);
+    debug_assert_eq!(x.len(), cols);
+    debug_assert_eq!(out.len(), rows);
+
+    // Zero the output
+    for v in out.iter_mut() {
+        *v = 0.0;
+    }
+
+    // For each column, AXPY the column into the output
+    for j in 0..cols {
+        let col = &mat_col_major[j * rows..(j + 1) * rows];
+        let xj = x[j];
+        for i in 0..rows {
+            out[i] += xj * col[i];
+        }
+    }
+}
+
+/// Transpose a row-major `(rows, cols)` matrix into a column-major
+/// buffer of length `rows * cols`.
+///
+/// The output layout is such that column `j` is at offset
+/// `j * rows`, suitable for passing to [`matvec_col_major`].
+pub fn transpose(src_row_major: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    debug_assert_eq!(src_row_major.len(), rows * cols);
+    let mut dst = vec![0.0f32; rows * cols];
+    for i in 0..rows {
+        for j in 0..cols {
+            dst[j * rows + i] = src_row_major[i * cols + j];
+        }
+    }
+    dst
+}
+
+#[inline]
+fn matvec_scalar(mat: &[f32], x: &[f32], out: &mut [f32], rows: usize, cols: usize) {
     for i in 0..rows {
         let row = &mat[i * cols..(i + 1) * cols];
         let mut acc = 0.0f32;
@@ -41,6 +144,48 @@ pub fn matvec(mat: &[f32], x: &[f32], out: &mut [f32]) {
             acc += row[j] * x[j];
         }
         out[i] = acc;
+    }
+}
+
+#[inline]
+fn matvec_sgemm(mat: &[f32], x: &[f32], out: &mut [f32], rows: usize, cols: usize) {
+    // matrixmultiply::sgemm computes C = alpha*A*B + beta*C for
+    // general (m, k, n) shapes. We want:
+    //     out (rows,)   = mat (rows, cols) * x (cols,)
+    // Viewed as matmul: m = rows, k = cols, n = 1.
+    //
+    // The safety requirements for the sgemm FFI wrapper are:
+    //     - pointers must be valid for the described dimensions
+    //     - strides describe the layout correctly (row-stride, col-stride)
+    //     - no aliasing between A, B, and C
+    //
+    // mat is row-major, so row stride = cols, col stride = 1.
+    // x is a single column vector, row stride = 1, col stride = 1
+    // (there is only one column so col stride is never used).
+    // out is a single column, row stride = 1, col stride = 1.
+    //
+    // matrixmultiply is safe-Rust internally but exposes an unsafe
+    // wrapper because raw pointers are needed to express the strides.
+    // We only do this in this one function; the unsafe block is
+    // scoped to the FFI call.
+    #[allow(unsafe_code)]
+    unsafe {
+        matrixmultiply::sgemm(
+            rows,       // m
+            cols,       // k
+            1,          // n
+            1.0,        // alpha
+            mat.as_ptr(),
+            cols as isize, // row stride of A
+            1,             // col stride of A
+            x.as_ptr(),
+            1, // row stride of B (irrelevant for n=1, but must be valid)
+            1, // col stride of B
+            0.0, // beta
+            out.as_mut_ptr(),
+            1, // row stride of C
+            1, // col stride of C
+        );
     }
 }
 

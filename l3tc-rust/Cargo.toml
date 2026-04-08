@@ -30,6 +30,12 @@ byteorder = "1.5"
 # Memory-mapped file reads for large inputs (read-only, zero-copy)
 memmap2 = "0.9"
 
+# SIMD-optimized matmul. Same crate ndarray and burn use under the
+# hood; pure Rust, SGEMM / DGEMM kernels tuned for x86 AVX/AVX2/AVX512
+# and ARM NEON. Dramatically faster than a naive scalar matvec loop
+# on the big (16384, 96) head projection.
+matrixmultiply = "0.3"
+
 [dev-dependencies]
 # Deterministic rng for tests
 rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }

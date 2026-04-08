@@ -1,0 +1,15 @@
+# Local cargo configuration.
+#
+# Enables target-cpu=native for release builds so that the compiler
+# can use the full instruction set of the host machine. On Apple
+# Silicon this enables ARMv8.5 / NEON variants that rustc's default
+# `aarch64-apple-darwin` target doesn't assume.
+#
+# This makes the release binary non-portable (it's built for the
+# exact CPU model of the build machine) but gives us access to the
+# full SIMD width. For the public release artifacts later we'll
+# build per-architecture without this flag; for local development
+# and benchmarking it's the fastest option.
+
+[build]
+rustflags = ["-C", "target-cpu=native"]
