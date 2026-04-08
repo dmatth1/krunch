@@ -40,6 +40,11 @@
 
 pub mod arithmetic;
 pub mod bitio;
+pub mod checkpoint;
 pub mod error;
+pub mod rwkv;
+pub mod tensor;
 
+pub use checkpoint::{Checkpoint, Tensor};
 pub use error::{Error, Result};
+pub use rwkv::{Model, Session};

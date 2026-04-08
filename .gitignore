@@ -43,3 +43,7 @@ target/
 **/target/
 *.rs.bk
 Cargo.lock.bak
+
+# Converted checkpoint binaries — regeneratable from the .pth files
+# via scripts/convert_checkpoint.py; too big for git (~13 MB each)
+l3tc-rust/checkpoints/*.bin
