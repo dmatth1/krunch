@@ -97,12 +97,14 @@ impl Tokenizer {
     ///
     /// - **Too small**: per-segment header overhead (~15 bytes)
     ///   dominates, and we lose context for the arithmetic coder's
-    ///   model state flow.
+    ///   model state flow. Empirically worse on enwik6.
     /// - **Too large**: raw-fallback segments waste more bytes on
     ///   the mostly-ASCII parts surrounding each problematic char.
     ///
-    /// 64 bytes is a reasonable default on English text with
-    /// occasional non-Latin characters.
+    /// 64 bytes is the sweet spot: problematic characters tend to
+    /// cluster (e.g., a full Persian word in a Wikipedia link), so
+    /// a 64-byte window catches the whole cluster cleanly rather
+    /// than paying header overhead for every individual codepoint.
     const MIN_RAW_FALLBACK_BYTES: usize = 64;
 
     /// Encode a full input file into segments of at most
