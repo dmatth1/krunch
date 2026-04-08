@@ -37,3 +37,9 @@ bench/results/*.tmp
 
 # Logs
 *.log
+
+# Rust build artifacts
+target/
+**/target/
+*.rs.bk
+Cargo.lock.bak
