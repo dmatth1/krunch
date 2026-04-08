@@ -453,12 +453,15 @@ impl<'a> Session<'a> {
         // Head projection: logits[i] = sum_j head[i, j] * normed[j]
         // computed as an AXPY over the column-major head buffer.
         // This is the single biggest matmul in the forward pass
-        // (16384 × 96 = 1.57 M FLOPs) and streaming through a
-        // column at a time is 5-10× faster than the row-major
-        // dot-product form on modern CPUs. The parallel version
-        // splits output rows across rayon workers, giving another
-        // 2-4× on multi-core machines.
-        tensor::matvec_col_major_par(
+        // (16384 × 96 = 1.57 M FLOPs).
+        //
+        // Using the SERIAL matvec_col_major: the parallel version
+        // tried rayon across output rows but the thread-pool
+        // dispatch overhead on 3 MB of inputs exceeded the
+        // savings from multi-threading. Segment-level parallelism
+        // (in codec.rs) is where the actual parallelism wins.
+        // Within a segment's forward pass, serial is fastest.
+        tensor::matvec_col_major(
             &self.model.head_col_major,
             &self.scratch.normed,
             &mut self.logits,

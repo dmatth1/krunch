@@ -53,10 +53,10 @@ pub fn matvec(mat: &[f32], x: &[f32], out: &mut [f32]) {
 /// Minimum row count at which we switch from the scalar matvec
 /// implementation to the `matrixmultiply` SIMD kernel.
 ///
-/// Small matrices (the per-layer 96×96 projections) pay more in
-/// call overhead than they save in SIMD throughput, so we use the
-/// scalar path for them. The embedding and head are much larger
-/// and benefit immediately.
+/// The per-layer 96×96 projections use the scalar path because
+/// matrixmultiply::sgemm has measurable per-call overhead and is
+/// internally optimized for matmul (not matvec with n=1). At
+/// rows=96, scalar beats sgemm slightly on this specific machine.
 const MATVEC_BLAS_THRESHOLD: usize = 512;
 
 /// Parallel version of [`matvec_col_major`] for very tall matrices.
