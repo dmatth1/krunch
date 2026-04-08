@@ -155,28 +155,25 @@ pub fn compress(
     let total_bytes = text.len() as u64;
 
     // Compress every segment in parallel. Each segment gets its
-    // own Session and CodecScratch (both are per-segment state
-    // that can't be shared across threads). The per-segment
-    // allocation cost is ~100 KB, dwarfed by the compute work, so
-    // we don't bother with a session pool yet.
+    // own Session and CodecScratch. We briefly experimented with a
+    // thread_local pool to avoid per-segment allocation, but the
+    // Session allocation is cheap enough (~100 KB, dwarfed by the
+    // compute work per segment) that pooling didn't move the
+    // needle — and the pooled version required an unsafe lifetime
+    // transmute that wasn't worth the risk.
     //
-    // Segments that need raw fallback still run through the
-    // arithmetic coder — we can skip that and emit an empty ac_body,
-    // saving a tiny amount of compute. The raw bytes go into the
-    // serialized output alongside the ac_body.
+    // Segments that need raw fallback skip the arithmetic coder
+    // entirely and emit an empty ac_body (the decoder uses the
+    // raw bytes instead).
     let segment_bodies: Result<Vec<Vec<u8>>> = segments
         .par_iter()
         .map(|seg| {
             if seg.needs_raw_fallback {
-                // Skip arithmetic coding entirely — the decoder
-                // will use the raw bytes. We still need an (empty)
-                // ac_body for format uniformity.
-                Ok(Vec::new())
-            } else {
-                let mut session = Session::new(model);
-                let mut scratch = CodecScratch::new(model.vocab_size);
-                compress_segment(seg, &mut session, model, &mut scratch)
+                return Ok(Vec::new());
             }
+            let mut session = Session::new(model);
+            let mut scratch = CodecScratch::new(model.vocab_size);
+            compress_segment(seg, &mut session, model, &mut scratch)
         })
         .collect();
     let segment_bodies = segment_bodies?;

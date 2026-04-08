@@ -361,7 +361,76 @@ def default_neural() -> list[Compressor]:
     return [
         L3TC(variant="3.2M", batch_size=1, device="cpu"),
         L3TC(variant="3.2M", batch_size=128, device="cpu"),
+        L3tcRust(),
     ]
+
+
+class L3tcRust(Compressor):
+    """l3tc-rust: Phase 2 Rust port of L3TC-200K.
+
+    Shells out to the release binary at
+    `l3tc-rust/target/release/l3tc`. Built from
+    `l3tc-rust/src/bin/l3tc.rs`. Requires the converted 200K
+    checkpoint at `l3tc-rust/checkpoints/l3tc_200k.bin` (produced
+    by `l3tc-rust/scripts/convert_checkpoint.py`) and the SPM
+    tokenizer at `vendor/L3TC/dictionary/.../*.model`.
+    """
+
+    name = "l3tc-rust-200k"
+    extension = "l3tc"
+    expected_available = True
+
+    @property
+    def binary(self) -> str:
+        return "l3tc-rust-200k"  # placeholder — we check via absolute path
+
+    def _rust_bin(self) -> Path:
+        return _repo_root() / "l3tc-rust" / "target" / "release" / "l3tc"
+
+    def available(self) -> bool:
+        return self._rust_bin().exists()
+
+    def compress_cmd(self, input_path: Path, output_path: Path) -> list[str]:
+        bin_path = self._rust_bin()
+        return [
+            str(bin_path),
+            "compress",
+            str(input_path),
+            "-o",
+            str(output_path),
+            "--model",
+            str(_repo_root() / "l3tc-rust" / "checkpoints" / "l3tc_200k.bin"),
+            "--tokenizer",
+            str(
+                _repo_root()
+                / "vendor"
+                / "L3TC"
+                / "dictionary"
+                / "vocab_enwik8_bpe_16384_0.999"
+                / "spm_enwik8_bpe_16384_0.999.model"
+            ),
+        ]
+
+    def decompress_cmd(self, input_path: Path, output_path: Path) -> list[str]:
+        bin_path = self._rust_bin()
+        return [
+            str(bin_path),
+            "decompress",
+            str(input_path),
+            "-o",
+            str(output_path),
+            "--model",
+            str(_repo_root() / "l3tc-rust" / "checkpoints" / "l3tc_200k.bin"),
+            "--tokenizer",
+            str(
+                _repo_root()
+                / "vendor"
+                / "L3TC"
+                / "dictionary"
+                / "vocab_enwik8_bpe_16384_0.999"
+                / "spm_enwik8_bpe_16384_0.999.model"
+            ),
+        ]
 
 
 def all_compressors() -> list[Compressor]:

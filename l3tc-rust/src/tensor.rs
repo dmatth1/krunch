@@ -197,13 +197,38 @@ pub fn transpose(src_row_major: &[f32], rows: usize, cols: usize) -> Vec<f32> {
 
 #[inline]
 fn matvec_scalar(mat: &[f32], x: &[f32], out: &mut [f32], rows: usize, cols: usize) {
+    // Use 4 independent accumulators to break the scalar reduction
+    // dependency chain. With `acc += row[j] * x[j]` as a single
+    // accumulator, each FMA depends on the previous one, serializing
+    // the inner loop to ~1 FLOP per cycle. With 4 independent accs,
+    // the compiler can issue 4 FMAs per cycle (on ARM NEON) and
+    // still sum them horizontally at the end.
+    //
+    // For the 96x96 projections in L3TC this turns an 80 us/token
+    // hotspot into something closer to ~30 us/token once LLVM
+    // notices the pattern and lowers to NEON fmla/fmul instructions.
+    let cols_4 = cols & !3; // round down to multiple of 4
     for i in 0..rows {
         let row = &mat[i * cols..(i + 1) * cols];
-        let mut acc = 0.0f32;
-        for j in 0..cols {
-            acc += row[j] * x[j];
+        let mut a0 = 0.0f32;
+        let mut a1 = 0.0f32;
+        let mut a2 = 0.0f32;
+        let mut a3 = 0.0f32;
+        let mut j = 0;
+        while j < cols_4 {
+            a0 += row[j] * x[j];
+            a1 += row[j + 1] * x[j + 1];
+            a2 += row[j + 2] * x[j + 2];
+            a3 += row[j + 3] * x[j + 3];
+            j += 4;
         }
-        out[i] = acc;
+        // Tail
+        let mut tail = 0.0f32;
+        while j < cols {
+            tail += row[j] * x[j];
+            j += 1;
+        }
+        out[i] = (a0 + a1) + (a2 + a3) + tail;
     }
 }
 
