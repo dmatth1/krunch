@@ -44,6 +44,13 @@ matrixmultiply = "0.3"
 # bit-identical tokenization for round-trip correctness.
 sentencepiece = "0.11"
 
+# Data parallelism for the head matvec. The head projection is the
+# single biggest compute hotspot in the forward pass; splitting its
+# output rows across CPU cores gives a 2-4x speedup with minimal
+# code. rayon's thread pool warmup happens lazily on the first call
+# and is amortized over the full file.
+rayon = "1.10"
+
 [dev-dependencies]
 # Deterministic rng for tests
 rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }

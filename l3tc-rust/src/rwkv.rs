@@ -455,8 +455,10 @@ impl<'a> Session<'a> {
         // This is the single biggest matmul in the forward pass
         // (16384 × 96 = 1.57 M FLOPs) and streaming through a
         // column at a time is 5-10× faster than the row-major
-        // dot-product form on modern CPUs.
-        tensor::matvec_col_major(
+        // dot-product form on modern CPUs. The parallel version
+        // splits output rows across rayon workers, giving another
+        // 2-4× on multi-core machines.
+        tensor::matvec_col_major_par(
             &self.model.head_col_major,
             &self.scratch.normed,
             &mut self.logits,

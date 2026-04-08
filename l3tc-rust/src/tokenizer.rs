@@ -46,6 +46,25 @@ pub struct EncodedSegment {
     /// On decode, these are pulled out and appended to the output
     /// whenever we see an unk token.
     pub unks: Vec<Vec<u8>>,
+    /// The original segment text.
+    ///
+    /// Used in two cases:
+    /// 1. To compute the byte length of this segment for framing.
+    /// 2. As a fallback payload when SPM's decode doesn't faithfully
+    ///    round-trip the original (see `needs_raw_fallback`).
+    ///
+    /// Always held for now; future phases may drop this for
+    /// memory-sensitive contexts.
+    pub raw: String,
+    /// Whether the arithmetic-coded token stream can faithfully
+    /// reproduce `raw` via `sp.decode(tokens)`.
+    ///
+    /// `false` (the common case) means we round-trip through tokens
+    /// normally. `true` means SentencePiece normalizes some
+    /// character in `raw` (ZWNJ, combining marks, etc.) such that
+    /// the token path would lose bytes — the codec must write `raw`
+    /// as a raw fallback alongside the ac body.
+    pub needs_raw_fallback: bool,
 }
 
 /// Wrapper around a loaded SentencePiece model.
@@ -67,6 +86,25 @@ impl Tokenizer {
         self.sp.len()
     }
 
+    /// Minimum segment size before we stop subdividing a
+    /// raw-fallback segment.
+    ///
+    /// When a segment fails to round-trip through SPM because of
+    /// normalization, [`encode_file`] recursively halves it to
+    /// isolate the problematic characters into small sub-segments.
+    /// Once a segment is ≤ this many bytes, we stop splitting and
+    /// store it raw. The value trades off between two overheads:
+    ///
+    /// - **Too small**: per-segment header overhead (~15 bytes)
+    ///   dominates, and we lose context for the arithmetic coder's
+    ///   model state flow.
+    /// - **Too large**: raw-fallback segments waste more bytes on
+    ///   the mostly-ASCII parts surrounding each problematic char.
+    ///
+    /// 64 bytes is a reasonable default on English text with
+    /// occasional non-Latin characters.
+    const MIN_RAW_FALLBACK_BYTES: usize = 64;
+
     /// Encode a full input file into segments of at most
     /// `segment_bytes` bytes each, mirroring the L3TC preprocessor
     /// algorithm.
@@ -82,6 +120,16 @@ impl Tokenizer {
     ///
     /// Each returned segment's token list starts with the BOS token
     /// (L3TC's convention).
+    ///
+    /// # Raw-fallback refinement
+    ///
+    /// If a segment's tokens do not faithfully decode back to the
+    /// original (see `needs_raw_fallback` on [`EncodedSegment`]),
+    /// we recursively halve it until either (a) the halves round-
+    /// trip cleanly or (b) the sub-segment is below
+    /// [`Tokenizer::MIN_RAW_FALLBACK_BYTES`]. This isolates the
+    /// problematic characters into small raw-fallback chunks so
+    /// that the surrounding ASCII-ish content compresses normally.
     pub fn encode_file(&self, text: &str, segment_bytes: usize) -> Result<Vec<EncodedSegment>> {
         let mut segment_lines: Vec<String> = Vec::new();
         let mut cache = String::new();
@@ -130,9 +178,40 @@ impl Tokenizer {
 
         let mut segments = Vec::with_capacity(segment_lines.len());
         for seg in segment_lines {
-            segments.push(self.encode_segment(&seg)?);
+            self.encode_segment_with_refinement(&seg, &mut segments)?;
         }
         Ok(segments)
+    }
+
+    /// Encode `text` as a single segment, and if it fails to
+    /// round-trip through SPM, recursively subdivide it until each
+    /// raw-fallback sub-segment is at most
+    /// [`Tokenizer::MIN_RAW_FALLBACK_BYTES`] bytes.
+    ///
+    /// Results are appended to `out`. This is the refinement loop
+    /// for [`encode_file`].
+    fn encode_segment_with_refinement(
+        &self,
+        text: &str,
+        out: &mut Vec<EncodedSegment>,
+    ) -> Result<()> {
+        let seg = self.encode_segment(text)?;
+        if !seg.needs_raw_fallback || text.len() <= Self::MIN_RAW_FALLBACK_BYTES {
+            out.push(seg);
+            return Ok(());
+        }
+
+        // Split in half at a char boundary
+        let mid = safe_byte_boundary(text, text.len() / 2);
+        if mid == 0 || mid == text.len() {
+            // Couldn't find a meaningful split point; keep as is.
+            out.push(seg);
+            return Ok(());
+        }
+        let (left, right) = text.split_at(mid);
+        self.encode_segment_with_refinement(left, out)?;
+        self.encode_segment_with_refinement(right, out)?;
+        Ok(())
     }
 
     /// Encode a single already-chunked text segment.
@@ -146,27 +225,72 @@ impl Tokenizer {
         let mut unks = Vec::new();
         tokens.push(BOS_ID);
 
+        // NB: piece.span.{0,1} from the sentencepiece Rust crate
+        // are CHARACTER (codepoint) indices, not byte indices.
+        // This is inconsistent with the crate's doc comment, which
+        // claims byte offsets, but the underlying C++ SentencePiece
+        // reports char positions. We use `char_indices` below to
+        // translate back to byte positions when needed.
+        //
+        // For unk detection we just need the ID check; the surface
+        // bytes come from the raw `text` via the char offset
+        // translation.
+        let char_bytes: Vec<(usize, char)> = text.char_indices().collect();
+
         for piece in pieces {
-            // Skip pieces whose surface span is empty — L3TC's
-            // Python preprocessor does the same (`if n.begin == n.end:
-            // continue`).
-            //
-            // The sentencepiece Rust crate exposes the span as a
-            // (begin, end) byte-offset tuple on PieceWithId.
-            let (begin, end) = (piece.span.0 as usize, piece.span.1 as usize);
-            if begin == end {
+            let (char_begin, char_end) =
+                (piece.span.0 as usize, piece.span.1 as usize);
+            if char_begin == char_end {
                 continue;
             }
             let id = piece.id;
             if id == UNK_ID {
-                // Record the raw UTF-8 bytes of the unk span
-                let unk_bytes = text.as_bytes()[begin..end].to_vec();
+                // Convert char offsets to byte offsets
+                let byte_begin = char_bytes
+                    .get(char_begin)
+                    .map(|(b, _)| *b)
+                    .unwrap_or(text.len());
+                let byte_end = char_bytes
+                    .get(char_end)
+                    .map(|(b, _)| *b)
+                    .unwrap_or(text.len());
+                let unk_bytes = text.as_bytes()[byte_begin..byte_end].to_vec();
                 unks.push(unk_bytes);
             }
             tokens.push(id);
         }
 
-        Ok(EncodedSegment { tokens, unks })
+        // Determine whether the tokens will faithfully round-trip.
+        // If sp.decode(tokens_minus_bos) != text_minus_unks, we
+        // need to fall back to storing the raw bytes. We
+        // specifically exclude the unk positions from the comparison
+        // because unk bytes are already stored separately.
+        let needs_raw_fallback = !self.tokens_faithfully_decode(text, &tokens, &unks)?;
+
+        Ok(EncodedSegment {
+            tokens,
+            unks,
+            raw: text.to_string(),
+            needs_raw_fallback,
+        })
+    }
+
+    /// Check whether the given token stream + unks will reproduce
+    /// the original text byte-exact when passed back through
+    /// [`Tokenizer::decode_segment`].
+    ///
+    /// This is the robust correctness check used by encoders to
+    /// decide whether to fall back to raw byte storage. Returns
+    /// `true` on a faithful round trip, `false` if SPM's
+    /// normalization lost information.
+    fn tokens_faithfully_decode(
+        &self,
+        original: &str,
+        tokens: &[u32],
+        unks: &[Vec<u8>],
+    ) -> Result<bool> {
+        let decoded = self.decode_segment(tokens, unks)?;
+        Ok(decoded == original)
     }
 
     /// Decode a token id list back to text, substituting unk bytes

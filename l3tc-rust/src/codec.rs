@@ -11,7 +11,7 @@
 //! ```text
 //! header:
 //!     magic:         b"LRUS"   (4 bytes)
-//!     version:       u8        (= 1)
+//!     version:       u8        (= 2)
 //!     flags:         u8        (reserved, = 0)
 //!     reserved:      u16       (= 0)
 //!     total_bytes:   u64       original uncompressed byte length
@@ -19,14 +19,36 @@
 //! For each segment:
 //!     n_tokens:      u32
 //!     n_unks:        u32
+//!     seg_flags:     u8        bit 0: use raw fallback
 //!     ac_bytes:      u32       length of the arithmetic-coded body
 //!     ac_body:       bytes     arithmetic coder output for this segment
 //!     For each unk:
 //!         unk_len:   u16       length in bytes of the raw unk payload
 //!         unk_data:  bytes     raw UTF-8 bytes of the unk surface
+//!     If seg_flags bit 0 is set:
+//!         raw_len:   u32
+//!         raw_data:  bytes     original segment text, used verbatim
+//!                              on decode (overrides the token path)
 //! trailer:
 //!     magic:         b"!END"   (4 bytes)
 //! ```
+//!
+//! # Raw fallback segments
+//!
+//! SentencePiece normalizes certain characters during tokenization
+//! (zero-width joiners, combining marks, some NFC forms) which
+//! means `sp.decode(sp.encode(text)) != text` for those inputs.
+//! When the encoder detects this at segment-tokenization time (see
+//! `Tokenizer::encode_segment`), it sets `needs_raw_fallback` and
+//! the codec writes the original segment bytes alongside the
+//! arithmetic-coded body. The decoder ignores the ac_body and
+//! emits the raw bytes directly.
+//!
+//! For ASCII-only text the fallback is never triggered. For text
+//! with occasional non-ASCII characters (e.g. Persian/Arabic in
+//! enwik6) a small fraction of segments use the fallback. The
+//! total overhead is a few bytes per fallback segment (the length
+//! prefix) on top of the segment's raw byte count.
 //!
 //! # Compression flow
 //!
@@ -80,7 +102,20 @@ const MAGIC: &[u8; 4] = b"LRUS";
 /// Trailer magic bytes.
 const TRAILER: &[u8; 4] = b"!END";
 /// Format version this module reads and writes.
-const VERSION: u8 = 1;
+///
+/// v2 adds the per-segment `seg_flags` byte with a `use raw
+/// fallback` bit so the decoder can use the original segment
+/// bytes verbatim when SentencePiece normalization would
+/// otherwise lose information (ZWNJ, combining marks, etc.).
+const VERSION: u8 = 2;
+
+/// Per-segment flag bit: "raw fallback bytes follow the unks".
+///
+/// When the encoder detects that `sp.decode(tokens) != original`
+/// for a given segment (because of SPM normalization), it sets
+/// this bit and appends the raw segment bytes so the decoder can
+/// emit them directly instead of reconstructing via tokens.
+const SEG_FLAG_RAW_FALLBACK: u8 = 0x01;
 
 /// Default segment length in bytes (matches L3TC).
 pub const DEFAULT_SEGMENT_BYTES: usize = 2048;
@@ -91,49 +126,109 @@ pub const DEFAULT_SEGMENT_BYTES: usize = 2048;
 /// self-sufficient: you can decompress it with [`decompress`] and
 /// the same `model` + `tokenizer` to recover the original text
 /// exactly.
+///
+/// Segments are processed **in parallel** via rayon when there are
+/// multiple of them. Each segment is independent (the model state
+/// is reset at segment boundaries, and the arithmetic coder output
+/// is per-segment), so segment-level parallelism is embarrassingly
+/// parallel and sidesteps the per-token rayon dispatch overhead
+/// that made intra-segment parallelism uneconomical. On a multi-
+/// core machine this gives a near-linear speedup in the number of
+/// segments up to the core count.
 pub fn compress(
     text: &str,
     tokenizer: &Tokenizer,
     model: &Model,
     segment_bytes: usize,
 ) -> Result<Vec<u8>> {
+    use rayon::prelude::*;
+
     let segments = tokenizer.encode_file(text, segment_bytes)?;
     let total_bytes = text.len() as u64;
 
+    // Compress every segment in parallel. Each segment gets its
+    // own Session and CodecScratch (both are per-segment state
+    // that can't be shared across threads). The per-segment
+    // allocation cost is ~100 KB, dwarfed by the compute work, so
+    // we don't bother with a session pool yet.
+    //
+    // Segments that need raw fallback still run through the
+    // arithmetic coder — we can skip that and emit an empty ac_body,
+    // saving a tiny amount of compute. The raw bytes go into the
+    // serialized output alongside the ac_body.
+    let segment_bodies: Result<Vec<Vec<u8>>> = segments
+        .par_iter()
+        .map(|seg| {
+            if seg.needs_raw_fallback {
+                // Skip arithmetic coding entirely — the decoder
+                // will use the raw bytes. We still need an (empty)
+                // ac_body for format uniformity.
+                Ok(Vec::new())
+            } else {
+                let mut session = Session::new(model);
+                let mut scratch = CodecScratch::new(model.vocab_size);
+                compress_segment(seg, &mut session, model, &mut scratch)
+            }
+        })
+        .collect();
+    let segment_bodies = segment_bodies?;
+
+    // Serialize the header + each segment + trailer. This is
+    // sequential but trivial — just byte copies.
     let mut out = Vec::with_capacity(text.len() / 8);
     write_header(&mut out, total_bytes, segments.len() as u32)?;
-
-    let mut session = Session::new(model);
-    let mut scratch = CodecScratch::new(model.vocab_size);
-
-    for seg in &segments {
-        let ac_body = compress_segment(seg, &mut session, model, &mut scratch)?;
-        write_segment(&mut out, seg, &ac_body)?;
-        session.reset();
+    for (seg, body) in segments.iter().zip(segment_bodies.iter()) {
+        write_segment(&mut out, seg, body)?;
     }
-
     write_trailer(&mut out)?;
     Ok(out)
 }
 
 /// Decompress a blob produced by [`compress`] back to text.
+///
+/// Like [`compress`], this processes segments in parallel using
+/// rayon. Each segment is independently decodable (the model state
+/// is reset at segment boundaries and each segment has its own
+/// arithmetic-coded body), so segment-level parallelism gives a
+/// near-linear speedup in the number of segments up to the core
+/// count.
 pub fn decompress(bytes: &[u8], tokenizer: &Tokenizer, model: &Model) -> Result<String> {
+    use rayon::prelude::*;
+
     let mut cursor = std::io::Cursor::new(bytes);
     let (total_bytes, n_segments) = read_header(&mut cursor)?;
 
-    let mut session = Session::new(model);
-    let mut scratch = CodecScratch::new(model.vocab_size);
-    let mut out = String::with_capacity(total_bytes as usize);
-
+    // First pass: read all segment metadata + bodies sequentially.
+    // This is I/O bound and very cheap (just byte copies).
+    let mut raw_segments: Vec<SegmentRead> = Vec::with_capacity(n_segments as usize);
     for _ in 0..n_segments {
-        let (n_tokens, unks, ac_body) = read_segment_meta(&mut cursor)?;
-        let tokens = decompress_segment(n_tokens, &ac_body, &mut session, model, &mut scratch)?;
-        let text = tokenizer.decode_segment(&tokens, &unks)?;
-        out.push_str(&text);
-        session.reset();
+        raw_segments.push(read_segment_meta(&mut cursor)?);
     }
-
     read_trailer(&mut cursor)?;
+
+    // Second pass: decode each segment in parallel. Each thread
+    // owns a fresh Session (because LayerState is per-thread).
+    // Raw-fallback segments skip the token path entirely and emit
+    // the stored raw bytes.
+    let decoded: Result<Vec<String>> = raw_segments
+        .par_iter()
+        .map(|seg| -> Result<String> {
+            if let Some(raw) = &seg.raw_fallback {
+                return Ok(String::from_utf8(raw.clone())?);
+            }
+            let mut session = Session::new(model);
+            let mut scratch = CodecScratch::new(model.vocab_size);
+            let tokens =
+                decompress_segment(seg.n_tokens, &seg.ac_body, &mut session, model, &mut scratch)?;
+            tokenizer.decode_segment(&tokens, &seg.unks)
+        })
+        .collect();
+
+    let decoded = decoded?;
+    let mut out = String::with_capacity(total_bytes as usize);
+    for piece in decoded {
+        out.push_str(&piece);
+    }
     Ok(out)
 }
 
@@ -323,29 +418,18 @@ fn logits_to_cum_freqs_scratch(logits: &[f32], cum: &mut [u64], exps: &mut [f32]
     }
 
     // --- Pass 2: compute shifted exps and sum in a single loop ---
-    // Writing to `exps[i]` in a simple for-i loop vectorizes
-    // cleanly; the `.push()` pattern the previous version used
-    // couldn't because each push has a capacity check.
     //
     // We use a fast exp approximation (see `fast_exp_neg`) instead
     // of `f32::exp`. libm's `.exp()` is a scalar library call that
-    // cannot be autovectorized, so it costs ~5 ns per element = 82
-    // us for a 16384-element softmax. The fast approximation is a
-    // ~4-line polynomial + bit-manipulation routine that the
-    // compiler auto-vectorizes cleanly into ARM NEON / x86 AVX,
-    // giving 5-10x speedup on this loop.
+    // cannot be autovectorized; the approximation is a ~4-line
+    // polynomial + bit-manipulation routine that the compiler
+    // auto-vectorizes into NEON / AVX SIMD.
     //
-    // Since arithmetic coding only cares about the relative
-    // magnitudes of the probability distribution (and the
-    // per-symbol error is bounded by the approximation's accuracy),
-    // a few ulps of imprecision in the softmax output cost at most
-    // a fraction of a percent of compression ratio. Verified
-    // empirically on the end-to-end enwik6 round trip.
+    // Writing to `exps[i]` in a simple for-i loop vectorizes
+    // cleanly; the `.push()` pattern used in an earlier version
+    // couldn't because each push has a capacity check.
     let mut sum = 0.0f32;
     for i in 0..n {
-        // logits[i] - max is always <= 0, so we're computing
-        // exp(x) for x in (-inf, 0]. The approximation is designed
-        // to be accurate and safe across that range.
         let e = fast_exp_neg(logits[i] - max);
         exps[i] = e;
         sum += e;
@@ -372,7 +456,6 @@ fn logits_to_cum_freqs_scratch(logits: &[f32], cum: &mut [u64], exps: &mut [f32]
     let mut best_exp = f32::NEG_INFINITY;
 
     // Build cum[i+1] = sum of freq[0..=i] in a running accumulator.
-    // We clobber exps here (it's no longer needed after scaling).
     cum[0] = 0;
     for i in 0..n {
         let e = exps[i];
@@ -386,33 +469,21 @@ fn logits_to_cum_freqs_scratch(logits: &[f32], cum: &mut [u64], exps: &mut [f32]
     }
 
     // --- Fix up the total ---
-    // If we undershot (usual case due to floors), add the residual
-    // to the argmax symbol. All cum[i] past best_idx shift up by
-    // the residual.
     if assigned < target_total {
         let residual = target_total - assigned;
         for i in (best_idx + 1)..=n {
             cum[i] += residual;
         }
     } else if assigned > target_total {
-        // Overshoot is rare but possible with the clamp-to-1 when
-        // `usable` is very small. Subtract from the argmax symbol's
-        // frequency and shift cum entries after it down.
         let excess = assigned - target_total;
-        // The freq for best_idx is cum[best_idx+1] - cum[best_idx].
         let best_freq = cum[best_idx + 1] - cum[best_idx];
         if best_freq > excess + 1 {
             for i in (best_idx + 1)..=n {
                 cum[i] -= excess;
             }
         } else {
-            // Pathological: reset to uniform
-            let uniform = target_total / n as u64;
-            cum[0] = 0;
-            for i in 0..n {
-                cum[i + 1] = cum[i] + uniform;
-            }
-            cum[n] = target_total;
+            uniform_fallback(n, cum);
+            return;
         }
     }
     debug_assert_eq!(cum[n], target_total);
@@ -477,9 +548,29 @@ fn read_header<R: Read>(r: &mut R) -> Result<(u64, u32)> {
     Ok((total_bytes, n_segments))
 }
 
+/// Per-segment data read back from a compressed file.
+struct SegmentRead {
+    /// Token count (including the implicit BOS). Unused for raw
+    /// fallback segments but still present in the format.
+    n_tokens: u32,
+    /// Unk payloads.
+    unks: Vec<Vec<u8>>,
+    /// Arithmetic-coded body.
+    ac_body: Vec<u8>,
+    /// Raw fallback bytes, if the segment was flagged with
+    /// [`SEG_FLAG_RAW_FALLBACK`] at write time.
+    raw_fallback: Option<Vec<u8>>,
+}
+
 fn write_segment<W: Write>(w: &mut W, seg: &EncodedSegment, ac_body: &[u8]) -> Result<()> {
     w.write_u32::<LittleEndian>(seg.tokens.len() as u32)?;
     w.write_u32::<LittleEndian>(seg.unks.len() as u32)?;
+    let seg_flags = if seg.needs_raw_fallback {
+        SEG_FLAG_RAW_FALLBACK
+    } else {
+        0
+    };
+    w.write_u8(seg_flags)?;
     w.write_u32::<LittleEndian>(ac_body.len() as u32)?;
     w.write_all(ac_body)?;
     for unk in &seg.unks {
@@ -492,12 +583,18 @@ fn write_segment<W: Write>(w: &mut W, seg: &EncodedSegment, ac_body: &[u8]) -> R
         w.write_u16::<LittleEndian>(unk.len() as u16)?;
         w.write_all(unk)?;
     }
+    if seg.needs_raw_fallback {
+        let raw_bytes = seg.raw.as_bytes();
+        w.write_u32::<LittleEndian>(raw_bytes.len() as u32)?;
+        w.write_all(raw_bytes)?;
+    }
     Ok(())
 }
 
-fn read_segment_meta<R: Read>(r: &mut R) -> Result<(u32, Vec<Vec<u8>>, Vec<u8>)> {
+fn read_segment_meta<R: Read>(r: &mut R) -> Result<SegmentRead> {
     let n_tokens = r.read_u32::<LittleEndian>()?;
     let n_unks = r.read_u32::<LittleEndian>()?;
+    let seg_flags = r.read_u8()?;
     let ac_bytes_len = r.read_u32::<LittleEndian>()? as usize;
     let mut ac_body = vec![0u8; ac_bytes_len];
     r.read_exact(&mut ac_body)?;
@@ -508,7 +605,20 @@ fn read_segment_meta<R: Read>(r: &mut R) -> Result<(u32, Vec<Vec<u8>>, Vec<u8>)>
         r.read_exact(&mut buf)?;
         unks.push(buf);
     }
-    Ok((n_tokens, unks, ac_body))
+    let raw_fallback = if seg_flags & SEG_FLAG_RAW_FALLBACK != 0 {
+        let raw_len = r.read_u32::<LittleEndian>()? as usize;
+        let mut raw = vec![0u8; raw_len];
+        r.read_exact(&mut raw)?;
+        Some(raw)
+    } else {
+        None
+    };
+    Ok(SegmentRead {
+        n_tokens,
+        unks,
+        ac_body,
+        raw_fallback,
+    })
 }
 
 fn write_trailer<W: Write>(w: &mut W) -> Result<()> {
