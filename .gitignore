@@ -1,0 +1,39 @@
+# Virtual environments
+.venv/
+venv/
+env/
+*.pyc
+__pycache__/
+.Python
+*.egg-info/
+
+# Vendored dependencies (set up via scripts/setup.sh)
+vendor/
+
+# Test corpora (downloaded via scripts/download_corpora.sh, too big for git)
+bench/corpora/*
+!bench/corpora/.gitkeep
+!bench/corpora/README.md
+
+# Compressed output files (artifacts of running the benchmark)
+*.gz
+*.bz2
+*.xz
+*.zst
+*.zstd
+*.l3tc
+bench/work/
+
+# Benchmark results (keep committed runs but gitignore scratch)
+bench/results/scratch/
+bench/results/*.tmp
+
+# Editor / OS artifacts
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Logs
+*.log
