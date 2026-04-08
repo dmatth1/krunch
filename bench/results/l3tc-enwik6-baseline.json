@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "corpus": "enwik6",
+  "corpus_bytes": 1000000,
+  "machine": "Apple Silicon (Mac), Python 3.12, PyTorch CPU build",
+  "run_date": "2026-04-08",
+  "notes": "L3TC reference implementation (vendor/L3TC) run through scripts/compressor.py. Single-stream, device=cpu, segment_length=2048. Timed end-to-end via subprocess wall time including Python startup and checkpoint loading.",
+  "results": [
+    {
+      "compressor": "l3tc-200k-cpu-b1",
+      "model_params": 200000,
+      "config": "config/l3tc/l3tc_200k.py",
+      "checkpoint": "l3tc_200k_bpe16k_c999_checkpoint0019.pth",
+      "input_bytes": 1000000,
+      "arithmetic_bytes": 162865,
+      "outlier_bytes": 3644,
+      "compressed_bytes": 166509,
+      "ratio": 0.1665,
+      "compress_wall_s": 75.56,
+      "compress_kb_per_s": 13.24,
+      "compress_mb_per_s": 0.01324,
+      "roundtrip_verified": false,
+      "roundtrip_note": "decompression path not exercised yet; ratio numbers from scripts/compressor.py direct output"
+    },
+    {
+      "compressor": "l3tc-3.2m-cpu-b1",
+      "model_params": 3200000,
+      "config": "config/l3tc/l3tc_3m2.py",
+      "checkpoint": "l3tc_3m2_bpe16k_c999_checkpoint0019.pth",
+      "input_bytes": 1000000,
+      "arithmetic_bytes": 127293,
+      "outlier_bytes": 3644,
+      "compressed_bytes": 130937,
+      "ratio": 0.1309,
+      "compress_wall_s": 92.97,
+      "compress_kb_per_s": 10.76,
+      "compress_mb_per_s": 0.01076,
+      "roundtrip_verified": false,
+      "roundtrip_note": "decompression path not exercised yet; ratio numbers from scripts/compressor.py direct output"
+    }
+  ],
+  "key_finding": "L3TC-200K (200k params) and L3TC-3.2M (3.2M params) have 16x parameter and ~11x compute difference but only 1.23x runtime difference. This means framework overhead dominates runtime (~97% for the 200K model) and Rust/ggml port should achieve 5-10x single-stream speedup purely by eliminating Python/PyTorch op dispatch overhead."
+}

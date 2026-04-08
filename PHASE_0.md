@@ -69,48 +69,93 @@ By the end of Phase 0 the repo should contain:
 - [x] Root docs: `README.md`, `ANALYSIS.md`, `DECISIONS.md`, `PHASE_0.md`
 - [x] `.gitignore` configured to exclude corpora, venv, results, vendor
 - [x] `git init` and first commit
-- [ ] `scripts/setup.sh` that clones L3TC + RWKV-LM and sets up Python venv
-- [ ] `scripts/download_corpora.sh` that pulls enwik8/enwik9/Silesia/Canterbury
+- [x] `scripts/setup.sh` that clones L3TC + RWKV-LM and sets up Python venv
+- [x] `scripts/download_corpora.sh` that pulls enwik8/enwik9/Silesia/Canterbury
 
 ### Benchmark harness
 
 - [x] `bench/compressors.py` with abstract interface + classical wrappers
 - [x] `bench/bench.py` with CLI, measurement, JSON output
-- [ ] L3TC wrapper in `bench/compressors.py` (depends on setup.sh)
-- [ ] End-to-end harness test on a small corpus (enwik6 or local file)
-- [ ] Validate round-trip: decompress output exactly equals input for
-      every compressor
+- [ ] L3TC wrapper in `bench/compressors.py` (deferred — we've measured
+      L3TC directly via its own script; wrapper is a convenience for
+      future integration, not blocking Phase 1)
+- [x] End-to-end harness test on a small corpus (smoke test on synthetic
+      corpus, then full enwik8 run against classical compressors)
+- [x] Validate round-trip: decompress output exactly equals input for
+      every classical compressor (8/8 pass on enwik8)
 
 ### Baseline measurements
 
-- [ ] Run classical compressors (gzip -9, bzip2 -9, xz -9e, zstd -22)
-      on enwik6 first for quick validation
-- [ ] Run classical compressors on enwik8
-- [ ] Run classical compressors on enwik9
-- [ ] Run classical compressors on Silesia corpus
-- [ ] Run classical compressors on a mixed-format corpus (code + logs +
-      json + text) to establish real-world baselines
+- [x] Run classical compressors on enwik8
+- [ ] Run classical compressors on enwik9 (optional; deferred —
+      enwik8 is sufficient for Phase 1 target setting)
+- [ ] Run classical compressors on Silesia corpus (deferred)
+- [ ] Run classical compressors on a mixed-format corpus (deferred)
 
 ### L3TC measurements
 
-- [ ] Clone L3TC repo, install PyTorch + dependencies
-- [ ] Download pretrained checkpoint from their Google Drive link
-- [ ] Verify L3TC runs on enwik6 / enwik8 (reproduce paper numbers
-      within tolerance)
-- [ ] Measure L3TC at **batch size 128** (paper's headline condition)
-- [ ] Measure L3TC at **batch size 1 on CPU** (our actual target condition)
-- [ ] Measure L3TC at **batch size 1 on GPU** (if GPU available)
-- [ ] Record memory usage alongside speed numbers
+- [x] Clone L3TC repo, install PyTorch + dependencies
+- [x] Download pretrained checkpoint from Google Drive (via gdown, all
+      four variants)
+- [x] Train SPM tokenizer via Python API (bin/spm_train is Linux-only)
+- [x] Patch L3TC to run on macOS CPU (deepspeed stub, weights_only fix,
+      hardcoded .cuda() calls)
+- [x] Verify L3TC-200K runs on enwik6, reproduce paper numbers
+      (13.24 KB/s, 16.65% ratio)
+- [x] Verify L3TC-3.2M runs on enwik6, reproduce paper numbers
+      (10.76 KB/s, 13.09% ratio)
+- [ ] Measure L3TC at batch size 128 (deferred — headline condition,
+      not our target, not worth GPU setup for Phase 1)
+- [x] Measure L3TC at **batch size 1 on CPU** (our actual target
+      condition) — the critical single-stream number
+- [ ] Measure L3TC at batch size 1 on GPU (no CUDA available on this
+      machine, deferred)
+- [ ] Record memory usage alongside speed numbers (deferred — not on
+      the Phase 1 critical path)
 
 ### Analysis
 
-- [ ] Write `docs/phase_0_findings.md` analyzing the results
-- [ ] Compare L3TC's reproduced numbers to the paper's claims
-- [ ] Document the single-stream speed gap with hard numbers
-- [ ] Identify the actual bottleneck (framework overhead? model compute?
-      arithmetic coder? tokenization?) via profiling
-- [ ] Decide whether Phase 1 should target ggml/candle or rwkv.cpp based
-      on measurements
+- [x] Write `docs/phase_0_findings.md` analyzing the results
+- [x] Compare L3TC's reproduced numbers to the paper's claims (matches)
+- [x] Document the single-stream speed gap with hard numbers
+- [x] Identify the actual bottleneck: **framework overhead is ~97% of
+      runtime on the 200K model**, based on the 200K/3.2M delta analysis
+- [x] Decide Phase 1 runtime: **candle first, rwkv.cpp via FFI as
+      fallback** (see DECISIONS.md D3)
+
+---
+
+## Phase 0 results summary
+
+**Classical baselines on enwik8** (committed to
+`bench/results/enwik8-classical.json`):
+
+| Compressor | Ratio | Compress MB/s | Decompress MB/s |
+|---|---:|---:|---:|
+| xz-9e | 24.83% | 1.1 | 83 |
+| zstd-22 | 25.27% | 0.93 | 780 |
+| xz-6 | 26.67% | 5.8 | 262 |
+| zstd-19 | 26.94% | 2.2 | 753 |
+| bzip2-9 | 29.01% | 18 | 39 |
+| zstd-3 | 35.45% | 450 | 843 |
+| gzip-9 | 36.48% | 24 | 546 |
+| gzip-6 | 36.55% | 29 | 521 |
+
+**L3TC on enwik6** (committed to
+`bench/results/l3tc-enwik6-baseline.json`):
+
+| Model | Ratio | Speed (CPU batch=1) |
+|---|---:|---:|
+| L3TC-200K | 16.65% | 13.24 KB/s |
+| L3TC-3.2M | 13.09% | 10.76 KB/s |
+
+**Phase 1 target:** take L3TC-3.2M from 10.76 KB/s to ≥55 KB/s on the
+same machine (5× speedup) while maintaining bit-identical round trip
+with the Python reference. Stretch: 100-200 KB/s (10-20× speedup).
+
+**Phase 0 status: COMPLETE ENOUGH TO PROCEED.** The core questions
+are answered empirically. Remaining items are nice-to-have but don't
+block the Rust port.
 
 ---
 

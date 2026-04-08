@@ -1,0 +1,251 @@
+{
+  "schema_version": 1,
+  "platform": "darwin",
+  "machine": {
+    "uname": "arm64",
+    "cpu": "Apple M1 Pro"
+  },
+  "timestamp": 1775683810,
+  "results": [
+    {
+      "compressor": "gzip-6",
+      "corpus": "enwik8",
+      "input_bytes": 100000000,
+      "compressed_bytes": 36548940,
+      "ratio": 0.3654894,
+      "roundtrip_ok": true,
+      "compress_wall_s": 3.490725374984322,
+      "compress_user_s": 3.326112,
+      "compress_sys_s": 0.074791,
+      "compress_peak_kb": 1856,
+      "compress_mb_per_s": 28.647340955731625,
+      "decompress_wall_s": 0.19191254102042876,
+      "decompress_user_s": 0.1437949999999999,
+      "decompress_sys_s": 0.03157199999999999,
+      "decompress_peak_kb": 2192,
+      "decompress_mb_per_s": 521.0706891185146,
+      "samples": 3,
+      "raw_compress_walls": [
+        3.5375372499984223,
+        3.441655582981184,
+        3.490725374984322
+      ],
+      "raw_decompress_walls": [
+        0.1844126670039259,
+        0.19191254102042876,
+        0.19812849999289028
+      ],
+      "error": null
+    },
+    {
+      "compressor": "gzip-9",
+      "corpus": "enwik8",
+      "input_bytes": 100000000,
+      "compressed_bytes": 36475811,
+      "ratio": 0.36475811,
+      "roundtrip_ok": true,
+      "compress_wall_s": 4.213319875008892,
+      "compress_user_s": 4.007745,
+      "compress_sys_s": 0.08443999999999996,
+      "compress_peak_kb": 2192,
+      "compress_mb_per_s": 23.734253027676647,
+      "decompress_wall_s": 0.18301337500452064,
+      "decompress_user_s": 0.14393799999999857,
+      "decompress_sys_s": 0.030767999999999907,
+      "decompress_peak_kb": 2192,
+      "decompress_mb_per_s": 546.4081518497208,
+      "samples": 3,
+      "raw_compress_walls": [
+        4.170078458002536,
+        4.215647083008662,
+        4.213319875008892
+      ],
+      "raw_decompress_walls": [
+        0.18950675000087358,
+        0.18301337500452064,
+        0.18179129200871103
+      ],
+      "error": null
+    },
+    {
+      "compressor": "bzip2-9",
+      "corpus": "enwik8",
+      "input_bytes": 100000000,
+      "compressed_bytes": 29008758,
+      "ratio": 0.29008758,
+      "roundtrip_ok": true,
+      "compress_wall_s": 5.690453458024422,
+      "compress_user_s": 5.4267949999999985,
+      "compress_sys_s": 0.11756600000000006,
+      "compress_peak_kb": 7744,
+      "compress_mb_per_s": 17.57329195953347,
+      "decompress_wall_s": 2.5395379579858854,
+      "decompress_user_s": 2.3151200000000003,
+      "decompress_sys_s": 0.13490200000000008,
+      "decompress_peak_kb": 7744,
+      "decompress_mb_per_s": 39.37724170868872,
+      "samples": 3,
+      "raw_compress_walls": [
+        5.689899249991868,
+        5.70703562500421,
+        5.690453458024422
+      ],
+      "raw_decompress_walls": [
+        2.508235125016654,
+        2.5395379579858854,
+        2.540480416995706
+      ],
+      "error": null
+    },
+    {
+      "compressor": "xz-6",
+      "corpus": "enwik8",
+      "input_bytes": 100000000,
+      "compressed_bytes": 26665156,
+      "ratio": 0.26665156,
+      "roundtrip_ok": true,
+      "compress_wall_s": 17.13886974999332,
+      "compress_user_s": 64.96934999999999,
+      "compress_sys_s": 0.7238699999999998,
+      "compress_peak_kb": 507136,
+      "compress_mb_per_s": 5.834690470183367,
+      "decompress_wall_s": 0.38132291700458154,
+      "decompress_user_s": 1.2027099999999962,
+      "decompress_sys_s": 0.10759799999999986,
+      "decompress_peak_kb": 507136,
+      "decompress_mb_per_s": 262.24492560146473,
+      "samples": 3,
+      "raw_compress_walls": [
+        16.825372499995865,
+        17.20250337498146,
+        17.13886974999332
+      ],
+      "raw_decompress_walls": [
+        0.3800126250134781,
+        0.38686879101442173,
+        0.38132291700458154
+      ],
+      "error": null
+    },
+    {
+      "compressor": "xz-9e",
+      "corpus": "enwik8",
+      "input_bytes": 100000000,
+      "compressed_bytes": 24831656,
+      "ratio": 0.24831656,
+      "roundtrip_ok": true,
+      "compress_wall_s": 92.0418067080027,
+      "compress_user_s": 91.18740100000002,
+      "compress_sys_s": 1.1685239999999997,
+      "compress_peak_kb": 757776,
+      "compress_mb_per_s": 1.0864628105057108,
+      "decompress_wall_s": 1.1982305420096964,
+      "decompress_user_s": 1.1669619999999554,
+      "decompress_sys_s": 0.10476799999999997,
+      "decompress_peak_kb": 757776,
+      "decompress_mb_per_s": 83.4563938190709,
+      "samples": 3,
+      "raw_compress_walls": [
+        98.94528866600012,
+        91.667472000001,
+        92.0418067080027
+      ],
+      "raw_decompress_walls": [
+        1.2582637919986155,
+        1.1982305420096964,
+        1.1794702500046697
+      ],
+      "error": null
+    },
+    {
+      "compressor": "zstd-3",
+      "corpus": "enwik8",
+      "input_bytes": 100000000,
+      "compressed_bytes": 35445335,
+      "ratio": 0.35445335,
+      "roundtrip_ok": true,
+      "compress_wall_s": 0.2221894579997752,
+      "compress_user_s": 0.42380099999991216,
+      "compress_sys_s": 0.030438000000000187,
+      "compress_peak_kb": 793456,
+      "compress_mb_per_s": 450.0663573341143,
+      "decompress_wall_s": 0.11856058400007896,
+      "decompress_user_s": 0.11097400000005564,
+      "decompress_sys_s": 0.02507100000000051,
+      "decompress_peak_kb": 793456,
+      "decompress_mb_per_s": 843.4506361737675,
+      "samples": 3,
+      "raw_compress_walls": [
+        0.22747266700025648,
+        0.2221894579997752,
+        0.22108399998978712
+      ],
+      "raw_decompress_walls": [
+        0.11773150000954047,
+        0.11915708301239647,
+        0.11856058400007896
+      ],
+      "error": null
+    },
+    {
+      "compressor": "zstd-19",
+      "corpus": "enwik8",
+      "input_bytes": 100000000,
+      "compressed_bytes": 26944227,
+      "ratio": 0.26944227,
+      "roundtrip_ok": true,
+      "compress_wall_s": 45.69790254198597,
+      "compress_user_s": 74.1506280000001,
+      "compress_sys_s": 0.25664200000000115,
+      "compress_peak_kb": 793456,
+      "compress_mb_per_s": 2.188284241451186,
+      "decompress_wall_s": 0.13278670801082626,
+      "decompress_user_s": 0.12445900000000165,
+      "decompress_sys_s": 0.026358999999999355,
+      "decompress_peak_kb": 793456,
+      "decompress_mb_per_s": 753.087424923938,
+      "samples": 3,
+      "raw_compress_walls": [
+        60.124911207996774,
+        45.69790254198597,
+        39.97698074998334
+      ],
+      "raw_decompress_walls": [
+        0.20700070899329148,
+        0.13278670801082626,
+        0.13103100002626888
+      ],
+      "error": null
+    },
+    {
+      "compressor": "zstd-22",
+      "corpus": "enwik8",
+      "input_bytes": 100000000,
+      "compressed_bytes": 25272471,
+      "ratio": 0.25272471,
+      "roundtrip_ok": true,
+      "compress_wall_s": 107.2523289580131,
+      "compress_user_s": 100.13635699999998,
+      "compress_sys_s": 1.0654339999999998,
+      "compress_peak_kb": 836896,
+      "compress_mb_per_s": 0.932380685543414,
+      "decompress_wall_s": 0.12826012499863282,
+      "decompress_user_s": 0.11120800000003328,
+      "decompress_sys_s": 0.03528700000000029,
+      "decompress_peak_kb": 836896,
+      "decompress_mb_per_s": 779.6655429820137,
+      "samples": 3,
+      "raw_compress_walls": [
+        113.35200033299043,
+        107.2523289580131,
+        80.56690362500376
+      ],
+      "raw_decompress_walls": [
+        0.20145770799717866,
+        0.12826012499863282,
+        0.12368383302236907
+      ],
+      "error": null
+    }
+  ]
+}
