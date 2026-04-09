@@ -9,7 +9,7 @@ use.
 
 ## Status
 
-**Phase 2 complete. Starting Phase 2.5 (INT8 head + NEON block matvecs).**
+**Phases 0-2.5 complete. Starting Phase 3 (file format + stream API + Silesia + enwik8/9).**
 
 - ✅ **Phase 0 — Reproduce L3TC with solid engineering foundations.**
   Built a Python benchmark harness, reproduced L3TC-200K and L3TC-3.2M on
@@ -28,11 +28,15 @@ use.
   all classical compressors. Final: **89 KB/s compress, 6.9× Python**,
   ratio 0.2060 on enwik6 (best ratio of any compressor in the
   benchmark, 27% better than bzip2-9).
-- 🚧 **Phase 2.5 — Aggressive speed optimizations.** INT8 quantization
-  of the 1.5 M-element head weight, hand-tuned NEON intrinsics for the
-  96×96 block matvecs, split-precision cum_freqs vectorization. Target:
-  another 2× speedup to ~150-200 KB/s.
-- ⏳ **Phase 3 — File format, stream API, Silesia benchmarks, full
+- ✅ **Phase 2.5 — Aggressive speed optimizations (partial).** Shipped
+  hand-tuned NEON `matvec_96x96` for the 12 block projections per token
+  (2.5a) and INT8 per-column quantization of the 1.5 M-element head
+  weight with a widening-AXPY matvec (2.5b). Vectorized cum_freqs
+  (2.5c) was attempted and deferred — the simple prefilter killed
+  autovectorization and the top-K approach carries too much ratio
+  risk for the now-shrunk upside. Final: **116 KB/s compress, 7.4×
+  Python**, ratio 0.2061 (essentially unchanged).
+- 🚧 **Phase 3 — File format, stream API, Silesia benchmarks, full
   enwik8/enwik9 measurements.**
 
 See [`PHASE_0.md`](PHASE_0.md), [`PHASE_1.md`](PHASE_1.md),
@@ -46,7 +50,7 @@ decision log (including what we tried and reversed). See
 
 | Compressor | Ratio | Compress MB/s | Decompress MB/s |
 |---|---:|---:|---:|
-| **l3tc-rust** (Phase 2) | **0.2060** | **0.090** | **0.090** |
+| **l3tc-rust** (Phase 2.5) | **0.2061** | **0.116** | **0.121** |
 | Python L3TC-200K | 0.1665 | 0.013 | — |
 | bzip2-9 | 0.2813 | 16.67 | 35.09 |
 | xz-9e | 0.2907 | 3.77 | 52.39 |

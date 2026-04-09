@@ -1,4 +1,12 @@
-# Phase 2.5 — Aggressive speed optimizations
+# Phase 2.5 — Aggressive speed optimizations  ✅ CLOSED (partial)
+
+**Final result:** 116 KB/s compress, 121 KB/s decompress on enwik6,
+ratio 0.2061 (essentially unchanged). 2.5a and 2.5b shipped; 2.5c
+attempted and deferred. Short of the 150 KB/s stretch target, but
+a solid +30% compress / +31% decompress over Phase 2 with ratio
+preserved. See "Outcome" section at the bottom.
+
+
 
 **Starting point (end of Phase 2):**
 - 89 KB/s compress, 92 KB/s decompress on enwik6 (1 MB)
@@ -266,3 +274,44 @@ Phase 2.5 is done when:
 
 After Phase 2.5 we move to Phase 3 (file format + stream API +
 Silesia + full enwik8/9).
+
+---
+
+## Outcome
+
+**Shipped:**
+- **2.5a** — NEON `matvec_96x96` for the 12 block projections per
+  token. Hand-tuned intrinsics: all 96 x elements preloaded into 24
+  `float32x4_t` registers, 4-way accumulator split to break the FMA
+  reduction dependency chain, fully unrolled inner loop. Commit
+  `e0ade41`. +9 KB/s compress (89 → 97) on enwik6.
+- **2.5b** — INT8 head quantization with per-column symmetric
+  scales. Quantized in-memory at load time; no checkpoint format
+  change. New `matvec_col_major_int8` widens i8→f32 in the inner
+  loop and LLVM auto-vectorizes to NEON `sxtl+scvtf+fmla`. Head
+  memory traffic drops 4× (6.3 MB → 1.6 MB per token). Commit
+  `e8042d8`. +19 KB/s compress (97 → 116) on enwik6. Ratio impact
+  +0.0001, well under the 1 pp budget.
+
+**Deferred:**
+- **2.5c** — Vectorized `cum_freqs`. Tried a simple prefilter
+  (skip `fast_exp_neg` below `max - 20`): the branch broke
+  autovectorization of pass 2 and net-regressed to 97 KB/s with
+  no ratio change. Reverted. The planned top-K (Approach 3) carries
+  real ratio risk and its upside shrank after 2.5b moved the
+  bottleneck — the f64→u64 cast loop is no longer the dominant
+  term per-token. Deferred to a future phase; if cum_freqs becomes
+  the bottleneck again we'll revisit with explicit NEON intrinsics
+  instead of hoping LLVM vectorizes around the cast.
+
+**Final numbers (enwik6, 1 MB):**
+
+| | Compress | Decompress | Ratio |
+|---|---:|---:|---:|
+| Phase 2 baseline | 89 KB/s | 92 KB/s | 0.2060 |
+| + 2.5a NEON blocks | 97 KB/s | 109 KB/s | 0.2060 |
+| + 2.5b INT8 head | **116 KB/s** | **121 KB/s** | 0.2061 |
+
+7.4× faster than Python L3TC-200K (13.24 KB/s). Byte-identical
+round trip. 35 unit tests + 4 integration tests pass. Ratio
+regression 0.0001 (0.05%), far below the 0.5 pp budget.
