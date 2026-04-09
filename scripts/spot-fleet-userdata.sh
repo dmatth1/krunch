@@ -89,9 +89,6 @@ cd vendor/L3TC
 python3 -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip -q
-# CUDA-PyTorch matching the host CUDA. Deep Learning Base AMI ships with
-# a recent CUDA; install the matching wheel index.
-pip install torch --index-url https://download.pytorch.org/whl/cu121 -q
 # Pre-install numpy explicitly. L3TC's requirements.txt includes pkuseg
 # (Chinese word segmentation, only needed for Chinese SPM training, not
 # for our English enwik9 use case). pkuseg has an old setup.py that
@@ -101,15 +98,34 @@ pip install torch --index-url https://download.pytorch.org/whl/cu121 -q
 #   1. Install numpy first so any other package that does the same
 #      thing has it available.
 #   2. Filter pkuseg out of the requirements file. We don't need it.
+#   3. Also filter `transformers` — it's pulled in by L3TC for some
+#      peripheral utility but L3TC's training path doesn't import it,
+#      and its torch dependency was overwriting our CUDA torch with
+#      the CPU build. Confirmed unused on the training path; if it
+#      turns out to be needed at runtime we'll add it back with
+#      --no-deps.
 pip install numpy -q
-grep -vE '^(pkuseg|openpyxl|yapf)\b' requirements.txt > /tmp/l3tc-req-trimmed.txt
+grep -vE '^(pkuseg|openpyxl|yapf|transformers)\b' requirements.txt > /tmp/l3tc-req-trimmed.txt
 echo "trimmed L3TC requirements:"
 cat /tmp/l3tc-req-trimmed.txt
 pip install -r /tmp/l3tc-req-trimmed.txt -q
-# Sanity check GPU and L3TC's CUDA WKV kernel
+
+# CUDA-PyTorch matching the host CUDA. Install AFTER the L3TC reqs so
+# that nothing in the dependency chain (transformers, tokenizers, etc.)
+# can overwrite the CUDA build with the default CPU wheel from PyPI.
+# Deep Learning Base AMI ships with CUDA 12.x; cu121 wheels are
+# backward-compatible with the AMI's driver.
+pip install --force-reinstall torch --index-url https://download.pytorch.org/whl/cu121 -q
+
+# Sanity check GPU and CUDA visibility. Print nvidia-smi output too so
+# any further driver/torch mismatches are easy to diagnose from the log.
+nvidia-smi 2>&1 | head -20 || echo "nvidia-smi failed"
 python -c "
 import torch
-assert torch.cuda.is_available(), 'CUDA not available'
+print(f'torch version: {torch.__version__}')
+print(f'cuda available: {torch.cuda.is_available()}')
+print(f'cuda device count: {torch.cuda.device_count()}')
+assert torch.cuda.is_available(), 'CUDA not available after force-reinstall'
 print(f'GPU: {torch.cuda.get_device_name(0)}')
 print(f'VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB')
 "
