@@ -479,7 +479,7 @@ impl<'a> Session<'a> {
         h: usize,
     ) {
         // short = relu(short_weight @ x)
-        tensor::matvec(&block.w_short, &scratch.x, &mut scratch.short);
+        tensor::matvec_96x96(&block.w_short, &scratch.x, &mut scratch.short);
         tensor::relu_inplace(&mut scratch.short);
 
         // residual = x
@@ -538,11 +538,11 @@ impl<'a> Session<'a> {
         state.state_x.copy_from_slice(&scratch.normed);
 
         // k = key @ xk
-        tensor::matvec(&att.w_key, &scratch.xk, &mut scratch.k);
+        tensor::matvec_96x96(&att.w_key, &scratch.xk, &mut scratch.k);
         // v = value @ xv
-        tensor::matvec(&att.w_value, &scratch.xv, &mut scratch.v);
+        tensor::matvec_96x96(&att.w_value, &scratch.xv, &mut scratch.v);
         // r = sigmoid(receptance @ xr)
-        tensor::matvec(&att.w_receptance, &scratch.xr, &mut scratch.r);
+        tensor::matvec_96x96(&att.w_receptance, &scratch.xr, &mut scratch.r);
         tensor::sigmoid_inplace(&mut scratch.r);
 
         // ww = time_first + k
@@ -602,7 +602,7 @@ impl<'a> Session<'a> {
             scratch.rwkv[i] = scratch.r[i] * scratch.a[i] / scratch.b[i];
         }
         // Apply output projection -> scratch.out_proj then back to rwkv
-        tensor::matvec(&att.w_output, &scratch.rwkv, &mut scratch.out_proj);
+        tensor::matvec_96x96(&att.w_output, &scratch.rwkv, &mut scratch.out_proj);
         scratch.rwkv.copy_from_slice(&scratch.out_proj);
     }
 
@@ -620,7 +620,7 @@ impl<'a> Session<'a> {
         state.state_ffn.copy_from_slice(&scratch.normed);
 
         // r = sigmoid(receptance @ xr)
-        tensor::matvec(&ffn.w_receptance, &scratch.xr, &mut scratch.r);
+        tensor::matvec_96x96(&ffn.w_receptance, &scratch.xr, &mut scratch.r);
         tensor::sigmoid_inplace(&mut scratch.r);
 
         // k = (relu(key @ xk))^2

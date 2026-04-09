@@ -59,6 +59,156 @@ pub fn matvec(mat: &[f32], x: &[f32], out: &mut [f32]) {
 /// rows=96, scalar beats sgemm slightly on this specific machine.
 const MATVEC_BLAS_THRESHOLD: usize = 512;
 
+/// Specialized hand-tuned matvec for exactly 96×96 row-major
+/// matrices on AArch64 NEON.
+///
+/// The L3TC-200K model has 16 matvec calls per token at this exact
+/// shape (8 per block × 2 blocks: K/V/R/output for time_mix, plus
+/// K/V/R for channel_mix, plus the "short" projection). These are
+/// the second-biggest compute hotspot after the head projection,
+/// and scalar code gets ~3 us each = ~50 us/token total.
+///
+/// This function reaches near-peak NEON throughput by:
+///
+/// 1. Preloading all 96 elements of `x` into 24 `float32x4_t`
+///    registers, so the inner loop only needs to stream the matrix
+///    data and never reloads x.
+/// 2. Using 4 independent f32x4 accumulators per output row, so
+///    the FMAs pipeline without a reduction dependency chain.
+/// 3. Fully unrolling the inner loop over all 24 f32x4 row chunks.
+/// 4. Horizontal-summing the 4 accumulators at the end of each row
+///    with a single `vaddvq_f32`.
+///
+/// With 4 accumulators and Apple M-series FMA throughput (~4 FMAs
+/// per cycle), the 24 FMAs per row take ~6 cycles, and the 96 rows
+/// take ~600 cycles ≈ 200 ns at 3 GHz. 16 calls per token:
+/// ~3.2 us total, down from ~50 us scalar.
+///
+/// # Safety
+///
+/// The function assumes (debug-asserted):
+/// - `mat` has exactly 96*96 = 9216 f32 elements
+/// - `x` has exactly 96 f32 elements
+/// - `out` has exactly 96 f32 elements
+///
+/// The NEON intrinsics require `target_feature = "neon"`, which is
+/// the default for `aarch64-apple-darwin`. The function is
+/// guarded by `#[cfg(target_arch = "aarch64")]` so non-ARM builds
+/// fall through to the generic scalar path via the caller.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(unsafe_code)]
+unsafe fn matvec_96x96_neon(mat: &[f32], x: &[f32], out: &mut [f32]) {
+    use std::arch::aarch64::*;
+
+    debug_assert_eq!(mat.len(), 96 * 96);
+    debug_assert_eq!(x.len(), 96);
+    debug_assert_eq!(out.len(), 96);
+
+    let mat_p = mat.as_ptr();
+    let x_p = x.as_ptr();
+    let out_p = out.as_mut_ptr();
+
+    // Preload all 96 elements of x into 24 f32x4 registers. AArch64
+    // has 32 vector registers (v0..v31), so 24 for x leaves plenty
+    // for accumulators and loaded row chunks.
+    let x00 = vld1q_f32(x_p.add(0));
+    let x01 = vld1q_f32(x_p.add(4));
+    let x02 = vld1q_f32(x_p.add(8));
+    let x03 = vld1q_f32(x_p.add(12));
+    let x04 = vld1q_f32(x_p.add(16));
+    let x05 = vld1q_f32(x_p.add(20));
+    let x06 = vld1q_f32(x_p.add(24));
+    let x07 = vld1q_f32(x_p.add(28));
+    let x08 = vld1q_f32(x_p.add(32));
+    let x09 = vld1q_f32(x_p.add(36));
+    let x10 = vld1q_f32(x_p.add(40));
+    let x11 = vld1q_f32(x_p.add(44));
+    let x12 = vld1q_f32(x_p.add(48));
+    let x13 = vld1q_f32(x_p.add(52));
+    let x14 = vld1q_f32(x_p.add(56));
+    let x15 = vld1q_f32(x_p.add(60));
+    let x16 = vld1q_f32(x_p.add(64));
+    let x17 = vld1q_f32(x_p.add(68));
+    let x18 = vld1q_f32(x_p.add(72));
+    let x19 = vld1q_f32(x_p.add(76));
+    let x20 = vld1q_f32(x_p.add(80));
+    let x21 = vld1q_f32(x_p.add(84));
+    let x22 = vld1q_f32(x_p.add(88));
+    let x23 = vld1q_f32(x_p.add(92));
+
+    for i in 0..96usize {
+        let row = mat_p.add(i * 96);
+        // 4 independent accumulators break the reduction dependency
+        let mut a0 = vdupq_n_f32(0.0);
+        let mut a1 = vdupq_n_f32(0.0);
+        let mut a2 = vdupq_n_f32(0.0);
+        let mut a3 = vdupq_n_f32(0.0);
+
+        // 24 FMAs, interleaved across accumulators. This lets the
+        // CPU pipeline 4 independent FMA chains in parallel.
+        a0 = vfmaq_f32(a0, vld1q_f32(row.add(0)), x00);
+        a1 = vfmaq_f32(a1, vld1q_f32(row.add(4)), x01);
+        a2 = vfmaq_f32(a2, vld1q_f32(row.add(8)), x02);
+        a3 = vfmaq_f32(a3, vld1q_f32(row.add(12)), x03);
+        a0 = vfmaq_f32(a0, vld1q_f32(row.add(16)), x04);
+        a1 = vfmaq_f32(a1, vld1q_f32(row.add(20)), x05);
+        a2 = vfmaq_f32(a2, vld1q_f32(row.add(24)), x06);
+        a3 = vfmaq_f32(a3, vld1q_f32(row.add(28)), x07);
+        a0 = vfmaq_f32(a0, vld1q_f32(row.add(32)), x08);
+        a1 = vfmaq_f32(a1, vld1q_f32(row.add(36)), x09);
+        a2 = vfmaq_f32(a2, vld1q_f32(row.add(40)), x10);
+        a3 = vfmaq_f32(a3, vld1q_f32(row.add(44)), x11);
+        a0 = vfmaq_f32(a0, vld1q_f32(row.add(48)), x12);
+        a1 = vfmaq_f32(a1, vld1q_f32(row.add(52)), x13);
+        a2 = vfmaq_f32(a2, vld1q_f32(row.add(56)), x14);
+        a3 = vfmaq_f32(a3, vld1q_f32(row.add(60)), x15);
+        a0 = vfmaq_f32(a0, vld1q_f32(row.add(64)), x16);
+        a1 = vfmaq_f32(a1, vld1q_f32(row.add(68)), x17);
+        a2 = vfmaq_f32(a2, vld1q_f32(row.add(72)), x18);
+        a3 = vfmaq_f32(a3, vld1q_f32(row.add(76)), x19);
+        a0 = vfmaq_f32(a0, vld1q_f32(row.add(80)), x20);
+        a1 = vfmaq_f32(a1, vld1q_f32(row.add(84)), x21);
+        a2 = vfmaq_f32(a2, vld1q_f32(row.add(88)), x22);
+        a3 = vfmaq_f32(a3, vld1q_f32(row.add(92)), x23);
+
+        // Reduce 4 accumulators to one, then horizontal sum to scalar
+        let acc = vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3));
+        *out_p.add(i) = vaddvq_f32(acc);
+    }
+}
+
+/// Fast path for 96×96 matvecs: dispatches to the NEON specialized
+/// version on aarch64, falls back to the generic scalar path
+/// otherwise.
+///
+/// The L3TC-200K block projections are exactly this shape, called
+/// 16 times per token. Callers in `rwkv.rs` should prefer this over
+/// the generic `matvec` for those specific calls.
+#[inline]
+pub fn matvec_96x96(mat: &[f32], x: &[f32], out: &mut [f32]) {
+    debug_assert_eq!(mat.len(), 96 * 96);
+    debug_assert_eq!(x.len(), 96);
+    debug_assert_eq!(out.len(), 96);
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: matvec_96x96_neon requires NEON, which is
+        // mandatory on aarch64-apple-darwin and aarch64-linux-gnu
+        // (the default aarch64 Rust targets). Shape preconditions
+        // are debug-asserted above.
+        #[allow(unsafe_code)]
+        unsafe {
+            matvec_96x96_neon(mat, x, out);
+        }
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        matvec_scalar(mat, x, out, 96, 96);
+    }
+}
+
 /// Parallel version of [`matvec_col_major`] for very tall matrices.
 ///
 /// Splits the output rows into contiguous chunks and computes each
