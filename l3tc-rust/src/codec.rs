@@ -596,6 +596,119 @@ pub fn encode_reader<R: Read, W: Write>(
     Ok(total_in)
 }
 
+/// Streaming decompress from a reader to a writer.
+///
+/// Symmetric counterpart to [`encode_reader`]. The high-value case
+/// is **raw-store files** (binary inputs) where the compressed
+/// body is the same size as the original — slurping a multi-GB
+/// raw-store file into memory just to copy it back out would
+/// defeat the purpose. For raw-store streams this function pipes
+/// bytes from `src` to `dst` with a constant 8-byte lookahead and
+/// validates the CRC32 trailer at EOF.
+///
+/// **Tokenized files** are read in full into memory because the
+/// compressed body is ~5× smaller than the output and decoding
+/// any segment requires the model state, which doesn't usefully
+/// stream. The output write itself is still incremental.
+///
+/// Returns the number of uncompressed output bytes written.
+pub fn decode_writer<R: Read, W: Write>(
+    mut src: R,
+    mut dst: W,
+    tokenizer: &Tokenizer,
+    model: &Model,
+) -> Result<u64> {
+    // Read the fixed-size header up front so we can branch on
+    // version and flags before deciding how to consume the rest.
+    let mut header = [0u8; HEADER_SIZE];
+    src.read_exact(&mut header).map_err(Error::Io)?;
+    if &header[..4] != MAGIC {
+        return Err(Error::BadCheckpoint(format!(
+            "bad magic: {:?}",
+            &header[..4]
+        )));
+    }
+    let version = header[4];
+    if version != VERSION && version != VERSION_V2_COMPAT {
+        return Err(Error::BadCheckpoint(format!(
+            "unsupported version: {version}"
+        )));
+    }
+    let flags = header[5];
+    let v3 = version == VERSION;
+
+    if flags & FLAG_RAW_STORE != 0 {
+        // --- Raw-store streaming path ---
+        //
+        // Layout: header(24) | raw(N) | trailer(4) | crc(4 if v3).
+        // We've consumed the header. Hash it, then stream the body
+        // with an 8-byte lookahead so we never write the trailer or
+        // CRC to dst.
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&header);
+        let tail_size = if v3 { 8 } else { 4 };
+        let mut tail: Vec<u8> = Vec::with_capacity(tail_size + 64 * 1024);
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut written: u64 = 0;
+        loop {
+            let n = src.read(&mut buf).map_err(Error::Io)?;
+            if n == 0 {
+                break;
+            }
+            tail.extend_from_slice(&buf[..n]);
+            // Drain everything that's safely outside the lookahead.
+            if tail.len() > tail_size {
+                let drain_n = tail.len() - tail_size;
+                let drained = &tail[..drain_n];
+                hasher.update(drained);
+                dst.write_all(drained).map_err(Error::Io)?;
+                written += drain_n as u64;
+                tail.drain(..drain_n);
+            }
+        }
+        if tail.len() != tail_size {
+            return Err(Error::BadCheckpoint(format!(
+                "raw-store stream truncated: tail has {} bytes, expected {tail_size}",
+                tail.len()
+            )));
+        }
+        let trailer_seen = &tail[..4];
+        if trailer_seen != TRAILER {
+            return Err(Error::BadCheckpoint(format!(
+                "bad trailer in raw-store stream: {trailer_seen:?}"
+            )));
+        }
+        // Trailer bytes are part of the CRC payload.
+        hasher.update(trailer_seen);
+        if v3 {
+            let stored_crc = LittleEndian::read_u32(&tail[4..8]);
+            let computed = hasher.finalize();
+            if stored_crc != computed {
+                return Err(Error::BadCheckpoint(format!(
+                    "CRC32 mismatch in raw-store stream: stored {stored_crc:08x}, computed {computed:08x}"
+                )));
+            }
+        }
+        return Ok(written);
+    }
+
+    // --- Tokenized path ---
+    //
+    // Slurp the remainder of src (it's at most ~25% of the output
+    // text size) and reuse the existing in-memory decode. The
+    // output write is then a single chunk; we could also stream
+    // segment outputs as they decode, but parallelism in
+    // decompress() makes that nontrivial without losing speed.
+    let mut rest = Vec::new();
+    src.read_to_end(&mut rest).map_err(Error::Io)?;
+    let mut full = Vec::with_capacity(HEADER_SIZE + rest.len());
+    full.extend_from_slice(&header);
+    full.extend_from_slice(&rest);
+    let payload = decompress_bytes(&full, tokenizer, model)?;
+    dst.write_all(&payload).map_err(Error::Io)?;
+    Ok(payload.len() as u64)
+}
+
 /// Write adapter that computes a CRC32 over every byte written.
 ///
 /// Used by [`encode_reader`] so the streaming writer can produce

@@ -32,7 +32,8 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use l3tc::{
-    decompress_bytes, encode_reader, Checkpoint, Model, Tokenizer, DEFAULT_SEGMENT_BYTES,
+    decode_writer, decompress_bytes, encode_reader, Checkpoint, Model, Tokenizer,
+    DEFAULT_SEGMENT_BYTES,
 };
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -251,10 +252,7 @@ fn run_decompress(
     };
     let output = output.unwrap_or(&default_out);
 
-    let t0 = Instant::now();
-    let compressed = std::fs::read(input)
-        .with_context(|| format!("reading compressed input {input:?}"))?;
-    let read_dt = t0.elapsed();
+    let read_dt = std::time::Duration::from_secs(0);
 
     let t0 = Instant::now();
     let model = load_model(model_path)?;
@@ -265,24 +263,38 @@ fn run_decompress(
         .with_context(|| format!("loading tokenizer {tokenizer_path:?}"))?;
     let tok_load_dt = t0.elapsed();
 
+    // Streaming decode: pipe src → dst with bounded RSS for
+    // raw-store files. Tokenized files still slurp the compressed
+    // body internally (it's small) but the output write stays
+    // streaming.
     let t0 = Instant::now();
-    let payload = decompress_bytes(&compressed, &tokenizer, &model)
+    let in_file = std::fs::File::open(input)
+        .with_context(|| format!("opening input {input:?}"))?;
+    let src = std::io::BufReader::new(in_file);
+    let out_file = std::fs::File::create(output)
+        .with_context(|| format!("creating output {output:?}"))?;
+    let mut out_buf = std::io::BufWriter::new(out_file);
+    let written = decode_writer(src, &mut out_buf, &tokenizer, &model)
         .with_context(|| "decompression failed")?;
+    use std::io::Write;
+    out_buf
+        .flush()
+        .with_context(|| format!("flushing output {output:?}"))?;
+    drop(out_buf);
     let decompress_dt = t0.elapsed();
+    let write_dt = std::time::Duration::from_secs(0);
 
-    let t0 = Instant::now();
-    std::fs::write(output, &payload)
-        .with_context(|| format!("writing output {output:?}"))?;
-    let write_dt = t0.elapsed();
-
-    let output_bytes = payload.len();
+    let output_bytes = written as usize;
     let decompress_kb_s = (output_bytes as f64 / 1024.0) / decompress_dt.as_secs_f64();
 
+    let compressed_bytes = std::fs::metadata(input)
+        .with_context(|| format!("stat input {input:?}"))?
+        .len() as usize;
     println!(
         "{} -> {}  {} bytes -> {} bytes",
         input.display(),
         output.display(),
-        compressed.len(),
+        compressed_bytes,
         output_bytes,
     );
 
