@@ -1,21 +1,32 @@
 # l3tc-prod
 
-**The fastest neural lossless compressor on CPU.**
+**The fastest CPU learned compressor on the Large Text
+Compression Benchmark, by 10-83× wall-clock.**
 
-A production Rust implementation of a small RWKV-v4 + HiRA language
-model driving an arithmetic coder. On enwik6, l3tc-prod runs at
-**131 KB/s on a single Apple Silicon machine** at a 0.1699 ratio —
-**40× faster than NNCP and ~80× faster than CMIX**, the previous
-shipped neural/PAQ compressors that occupy the same ratio band.
-Slower than classical codecs (gzip / xz / zstd) by a wide margin,
-but uniquely occupying the narrow band where *learned* compression
-becomes interactive enough to use. See
-[Headline numbers](#headline-numbers) below for the full table.
+A production Rust implementation of a small RWKV-v4 + HiRA
+language model driving an arithmetic coder. On enwik6, l3tc-prod
+runs at **131 KB/s on a current Apple Silicon machine** at a
+**0.1699 ratio**. Compared to the published-speed entries on the
+[Large Text Compression Benchmark](http://mattmahoney.net/dc/text.html):
+the closest single-threaded CPU competitor (lstm-compress v3)
+runs at 10.6 KB/s, the closest CPU-only ratio competitor (CMIX
+v21) runs at 1.57 KB/s, and the GPU-accelerated ratio leader
+(NNCP v3.2) runs at 4 KB/s. **Geometric mean across the 12
+published-speed entries: ~22× wall-clock faster.** Most of that
+lead comes from being the only learned compressor with multi-core
+CPU parallelism (per-core single-thread, the lead shrinks to
+1.2-10.5×). The one learned compressor that beats us on absolute
+speed is Bellard's [ts_zip](https://bellard.org/ts_zip/) at
+~1 MB/s on an RTX 4090, which uses an 850× larger model and is
+GPU-only — different product category. Slower than classical
+codecs (gzip / xz / zstd) by ~30-130×, with 30-45% better ratio
+than zstd-22. See [`COMPARISON.md`](COMPARISON.md) for the full
+primary-source comparison and the math behind every number.
 
-This is a ratio-first tool. Reach for it when bytes-on-disk matter
-more than wall-clock — cold archive, compliance, scientific text
-corpora, log archival — and when you want a learned compressor that
-doesn't take all night to run.
+This is a ratio-first tool. Reach for it when bytes-on-disk
+matter more than wall-clock — cold archive, compliance,
+scientific text corpora, log archival — and when you want a
+learned compressor that doesn't take all night to run.
 
 ## Status
 
@@ -42,11 +53,13 @@ on this architecture is dominated by the head matvec and
 count — closes the door on cheap speed wins from architecture
 shrinking. See [`docs/phase_4e_findings.md`](docs/phase_4e_findings.md).
 
-Combined with NNCP / CMIX shipping at 1-3 KB/s on CPU (see the
-[learned compressor table](#vs-other-learned-compressors)), the
-honest read is that **131 KB/s is at or near the physical
-ceiling for single-stream neural compression on CPU at this
-ratio band**. The runtime is done. What remains is making it
+Combined with NNCP v3.2 at 4 KB/s, CMIX v21 at 1.57 KB/s, and
+the rest of the LTCB neural / PAQ field below 14 KB/s
+wall-clock (see [`COMPARISON.md`](COMPARISON.md)), the honest
+read is that **~150 KB/s is at or near the practical ceiling
+for single-stream learned compression on CPU at this ratio
+band**, and l3tc-prod 200K is sitting on it. The runtime is
+done. What remains is making it
 shippable: Phase 5 (RWKV-v7 architecture upgrade, ratio bet),
 Phase 6 (multi-platform release builds), Phase 7 (cross-platform
 numeric determinism), Phase 9 (fuzzing + input caps), Phase 10
@@ -177,38 +190,73 @@ misleading picture.
 
 ### vs other learned compressors
 
-This is the comparison that matters for what l3tc-prod actually is.
-Numbers for NNCP / CMIX / paper L3TC are taken from
-[Bellard's NNCP v2 paper](https://bellard.org/nncp/nncp_v2.pdf) and
-the L3TC paper; they're measured on enwik9, single-thread CPU. Our
-own enwik8 number (the closest equivalent we have data for) is
-shown alongside.
+This is the comparison that matters for what l3tc-prod actually
+is. Numbers below are pulled from the
+[Large Text Compression Benchmark](http://mattmahoney.net/dc/text.html)
+(updated 2026-03-25), with LTCB's `ns/B` units converted to
+wall-clock KB/s via `KB/s = 976,562 ÷ (ns/B)` for human
+readability. LTCB time is CPU-time-summed-across-cores; for the
+single-threaded entries (every row except l3tc-prod) that equals
+wall-clock. l3tc-prod numbers are our own measurements on Apple
+M-series. Corpus is enwik9 unless noted; l3tc-prod numbers are
+enwik6 / enwik8 because we don't have an enwik9 measurement yet
+(speed should be similar; ratio improves slightly on larger
+corpora).
 
-| Compressor | Model class | Ratio | Compress KB/s | Notes |
-|---|---|---:|---:|---|
-| **l3tc-rust 200K (default)** | RWKV-v4 200K | **~0.179** (enwik8) | **~114** (enwik8, all-cores) | this project |
-| **l3tc-rust 3.2M (opt-in)** | RWKV-v4 3.2M | **~0.13** (enwik8 extrap.) | **~26** (all-cores) | this project |
-| NNCP v2 | Transformer ~few M | 0.114 (enwik9) | 3.25 (1-core) | Bellard, LibNC |
-| CMIX v18 | PAQ ensemble (~0 neural) | 0.116 (enwik9) | 1.66 (1-core) | Knoll |
-| NNCP v1 | LSTM ~few M | 0.119 (enwik9) | 1.05 (1-core) | Bellard |
-| Python L3TC-200K (paper) | RWKV-v4 200K | 0.166 (entropy bound, enwik6) | 13 (1-core) | reference |
+| Compressor | Year | Architecture | bpb | KB/s wall-clock | Hardware | Threading |
+|---|---|---|---:|---:|---|---|
+| nncp v3.2 | 2023 | Transformer | 0.857 | 4.04 | RTX 3090 GPU | 1 |
+| nncp v3.3 | 2024-06 | Transformer | 0.853 | not published | not published | unknown |
+| cmix v21 | 2024-09 | PAQ | 0.866 | 1.57 | CPU | 1 |
+| jax-compress | 2026 | LSTM | 0.907 | 8.88 | TPU | 1 |
+| tensorflow-compress v4 | 2022 | LSTM | 0.909 | 3.35 | A100 GPU | 1 |
+| cmix-hp v1 | 2021 | PAQ | 0.911 | 5.16 | CPU | 1 |
+| starlit | 2021 | PAQ | 0.921 | 5.61 | CPU | 1 |
+| phda9 1.8 | 2019 | PAQ | 0.934 | 11.33 | CPU | 1 |
+| gmix v1 | 2024 | PAQ | 0.980 | 13.20 | CPU | 1 |
+| paq8px_v206fix1 | 2022 | PAQ + LSTM | 1.002 | 3.35 | CPU | 1 |
+| lstm-compress v3 | 2020 | LSTM | ~1.39 | 10.58 | CPU | 1 |
+| **l3tc-prod 3.2M (opt-in)** | **2026** | **RWKV-v4 3.2M** | **~1.07 (enwik8)** | **26** | **Apple M-series CPU** | **8 (rayon)** |
+| **l3tc-prod 200K (default)** | **2026** | **RWKV-v4 200K** | **~1.43 (enwik8)** | **131 (enwik6) / 114 (enwik8)** | **Apple M-series CPU** | **8 (rayon)** |
+| ts_zip (Bellard) | 2024-03 | RWKV-169M | 1.106 (enwik8) | ~1024 | RTX 4090 GPU | 1 GPU stream |
 
-**l3tc-rust 200K is the speed leader of the entire learned-compression
-category by a factor of 35–125×** depending on the row, at a ratio
-~50% worse than the frontier (NNCP v2). That's a deliberate operating
-point, not a failure to reach the frontier — we picked the smallest
-recurrent model that hits a useful ratio specifically because nobody
-else was sitting in that part of the curve. The 3.2M opt-in tier
-pushes the ratio close to NNCP/CMIX while still running ~8× faster
-than they do.
+**Read this table carefully — there are two different things
+going on at once.**
 
-The "1-core" annotation matters: NNCP and CMIX are single-thread by
-design. l3tc-prod's headline 131 KB/s is across all ~8 cores via
-segment-level parallelism (the project's biggest single speed win,
-~5× over single-thread). On a like-for-like single-core comparison
-the gap is still ~5×, and on parallel-vs-parallel the gap is what
-the table shows. Either way, **nobody else is shipping interactive
-learned compression at this speed**.
+1. **On the speed axis:** l3tc-prod 200K at 131 KB/s wall-clock
+   is 9.9-83× faster than every CPU and GPU learned-compression
+   entry on the LTCB except ts_zip. Geometric mean across the
+   12 published-speed entries: ~22×. The closest single-threaded
+   CPU competitor (lstm-compress v3) runs at 10.6 KB/s — l3tc-prod
+   is 12.4× faster wall-clock there. **Most of that lead is the
+   parallelism win:** l3tc-prod is the only learned compressor on
+   the LTCB that uses more than one core. NNCP, CMIX, and the PAQ
+   family are architecturally single-stream and cannot be
+   parallelized. Per-core single-thread, l3tc-prod's lead shrinks
+   to 1.2-10.5× depending on competitor. The wall-clock 22× gap
+   is the parallelism win, not raw kernel-level engineering.
+
+2. **On the ratio axis:** l3tc-prod 200K at ~1.43 bpb is ~67%
+   behind the ratio frontier (NNCP v3.2 at 0.857 bpb, CMIX v21
+   at 0.866). The 3.2M opt-in tier closes most of that to ~1.07
+   bpb, ~24% behind, while still running 16× faster than NNCP
+   v3.2 wall-clock. We picked these operating points
+   deliberately — they sit in a corner of the speed/ratio curve
+   nobody else has shipped a tool for.
+
+**The one learned compressor that beats us on absolute speed:**
+[ts_zip](https://bellard.org/ts_zip/) at ~1 MB/s on an RTX 4090.
+It uses an RWKV-169M model (~850× our parameter count), is
+GPU-only (4 GB VRAM minimum), and ships only as a closed-source
+binary. Better ratio (1.106 vs ~1.43), much more hardware. It's
+in a different product category — GPU service, not CLI tool —
+so we don't directly compete with it, but it's worth knowing
+about.
+
+For the full primary-source comparison including LLMZip,
+Llamazip, Nacrith, the L3TC paper's batched-inference numbers,
+the per-core single-thread normalization math, and the
+methodology caveats, see [`COMPARISON.md`](COMPARISON.md).
 
 ### vs classical compressors (enwik6, 1 MB, round-trip verified)
 
@@ -302,22 +350,32 @@ same band as everything else.
 This project closes that single-stream gap. By rewriting the
 inference path in Rust, hand-rolling NEON kernels for the hot
 matvecs, INT8-quantizing the head, and parallelizing across
-segments via rayon, l3tc-prod runs the same model at **131 KB/s on
-enwik6** — about **10× faster than the reference Python**, **40×
-faster than NNCP v2**, and **80× faster than CMIX**. The ratio is
-slightly worse than NNCP/CMIX (~50% behind the frontier) because
-we deliberately chose a smaller model to fit a faster operating
-point. The 3.2M opt-in tier closes most of that ratio gap while
-still running ~8× faster than NNCP.
+segments via rayon, l3tc-prod runs the same model at **131 KB/s
+on enwik6** on a current Apple Silicon machine. That's roughly
+**10× faster than the reference Python implementation**, and
+**9.9–83× faster wall-clock than every other shipped learned
+compressor on the LTCB** (geometric mean ~22×, closest CPU
+single-thread competitor ~12×). Most of that lead comes from
+being the only learned compressor with multi-core CPU
+parallelism — per-core single-thread, the gap shrinks to
+1.2-10.5×. The full primary-source breakdown, including the
+ratio gap (we sit ~67% behind NNCP v3.2 at the frontier; the
+3.2M opt-in tier closes that to ~24%), is in
+[`COMPARISON.md`](COMPARISON.md).
 
 We did not become a zstd alternative. The original target in
-ANALYSIS.md was ≥10 MB/s single-stream CPU; the actual ceiling
-turned out to be ~150 KB/s for *anyone* trying to do learned
-compression at this ratio band on CPU, including Bellard. That's
-a category-error in the original target-setting, not an execution
-failure — and it leaves us with what we actually built: the speed
-leader of the entire learned-compression category, by a factor of
-40-80×, occupying a band nobody else has ever shipped a tool for.
+ANALYSIS.md was ≥10 MB/s single-stream CPU; that target was
+calibrated against classical compressors without checking what
+was actually achievable in the learned class. After Phase 4 we
+have strong evidence — Bellard's NNCP at 4 KB/s wall-clock,
+CMIX v21 at 1.6 KB/s, the entire LTCB neural / PAQ field below
+14 KB/s — that single-stream CPU learned compression at this
+ratio band is physically capped well below the MB/s range. The
+≥10 MB/s target was a category error in target-setting, not an
+execution failure. What we actually built is the first shipped
+CPU-only learned compressor with multi-core parallelism, in a
+speed/ratio band that no other shipped tool occupies. That's a
+narrower claim than "zstd alternative" but it's a real one.
 
 The work that remains is not "make it faster than zstd" (impossible
 on CPU at this model class) but "make it shippable as an open source
@@ -334,6 +392,7 @@ compressor.
 l3tc-prod/
 ├── README.md              this file
 ├── CLAUDE.md              the two project goals + regression gates
+├── COMPARISON.md          primary-source compressor landscape + math
 ├── ANALYSIS.md            original project thinking document
 ├── DECISIONS.md           architectural decision log
 ├── PHASE_0.md .. PHASE_11.md
