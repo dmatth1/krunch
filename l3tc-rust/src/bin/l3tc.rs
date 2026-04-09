@@ -32,8 +32,9 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use l3tc::{
-    audit_compress, decode_writer, decompress_bytes, encode_reader, profile_compress,
-    AuditStats, Checkpoint, Model, ProfileStats, Tokenizer, DEFAULT_SEGMENT_BYTES,
+    audit_compress, decode_writer, decompress_bytes, dump_teacher, encode_reader,
+    profile_compress, AuditStats, Checkpoint, Model, ProfileStats, Tokenizer,
+    DEFAULT_SEGMENT_BYTES,
 };
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -202,6 +203,41 @@ enum Command {
         #[arg(long, default_value_t = DEFAULT_SEGMENT_BYTES)]
         segment_bytes: usize,
     },
+    /// Phase 4e: dump top-K softmax distributions from a model
+    /// running over an input file. Used to generate training
+    /// data for knowledge distillation — the student model
+    /// minimizes KL divergence against these distributions.
+    ///
+    /// Format documented at `codec::dump_teacher`. For L3TC-3.2M
+    /// on enwik8 with top_k=64, the output is ~140 MB.
+    DumpTeacher {
+        /// Input text file (typically enwik8 for training).
+        #[arg(long)]
+        input: PathBuf,
+        /// Path to the converted L3TC model binary (typically
+        /// the teacher, e.g. checkpoints/l3tc_3m2.bin).
+        #[arg(long)]
+        model: PathBuf,
+        /// Path to the SentencePiece tokenizer model.
+        #[arg(
+            long,
+            default_value = "../vendor/L3TC/dictionary/vocab_enwik8_bpe_16384_0.999/spm_enwik8_bpe_16384_0.999.model"
+        )]
+        tokenizer: PathBuf,
+        /// Output file for the dumped distributions.
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Segment length in bytes. Match the training
+        /// configuration (L3TC reference uses 2048).
+        #[arg(long, default_value_t = 2048)]
+        segment_bytes: usize,
+        /// Number of top probabilities to keep per step. The
+        /// long tail is reconstructed at training time as a
+        /// uniform floor. 64 is typical; use 128 for a
+        /// higher-fidelity dump at 2× the storage cost.
+        #[arg(long, default_value_t = 64)]
+        top_k: usize,
+    },
     /// Print version information.
     Version,
 }
@@ -256,6 +292,21 @@ fn main() -> ExitCode {
             tokenizer,
             segment_bytes,
         } => run_profile(&input, &model, &tokenizer, segment_bytes),
+        Command::DumpTeacher {
+            input,
+            model,
+            tokenizer,
+            output,
+            segment_bytes,
+            top_k,
+        } => run_dump_teacher(
+            &input,
+            &model,
+            &tokenizer,
+            &output,
+            segment_bytes,
+            top_k,
+        ),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -723,6 +774,68 @@ fn run_profile(
     };
     println!("throughput:          {:.2} KB/s (single-thread, no rayon)", kb_s);
 
+    Ok(())
+}
+
+/// Phase 4e entry: run a model over an input file and dump
+/// top-K teacher softmax distributions for distillation
+/// training.
+fn run_dump_teacher(
+    input: &Path,
+    model_path: &Path,
+    tokenizer_path: &Path,
+    output: &Path,
+    segment_bytes: usize,
+    top_k: usize,
+) -> Result<()> {
+    let model = load_model(model_path)?;
+    let tokenizer = Tokenizer::load(tokenizer_path)
+        .with_context(|| format!("loading tokenizer {tokenizer_path:?}"))?;
+
+    let text = std::fs::read_to_string(input)
+        .with_context(|| format!("reading input {input:?}"))?;
+
+    println!(
+        "dumping top-{top_k} teacher distributions: {} -> {}",
+        input.display(),
+        output.display()
+    );
+    println!("  model:       {}", model_path.display());
+    println!(
+        "  hidden_size: {}   intermediate: {}   layers: {}",
+        model.hidden_size,
+        model.intermediate_size,
+        model.num_layers()
+    );
+    println!("  input bytes: {}", text.len());
+    println!("  segment_bytes: {segment_bytes}");
+
+    let out_file = std::fs::File::create(output)
+        .with_context(|| format!("creating {output:?}"))?;
+    let mut buf = std::io::BufWriter::new(out_file);
+
+    let t0 = Instant::now();
+    let n_steps = dump_teacher(&text, &tokenizer, &model, segment_bytes, top_k, &mut buf)
+        .with_context(|| "dump_teacher failed")?;
+    use std::io::Write;
+    buf.flush().with_context(|| "flushing output")?;
+    drop(buf);
+    let elapsed = t0.elapsed();
+
+    let out_bytes = std::fs::metadata(output)
+        .with_context(|| "stat output")?
+        .len();
+    let kb_s = (text.len() as f64 / 1024.0) / elapsed.as_secs_f64();
+
+    println!();
+    println!("  predict steps dumped: {n_steps}");
+    println!("  output bytes:         {out_bytes}");
+    println!(
+        "  per-step cost:        {:.1} bytes",
+        out_bytes as f64 / n_steps.max(1) as f64
+    );
+    println!("  wall-clock:           {:?}", elapsed);
+    println!("  throughput:           {kb_s:.2} KB/s");
     Ok(())
 }
 
