@@ -9,6 +9,14 @@ because Phase 3's main work (file format hardening, streaming,
 binary input support) is more user-facing and Phase 4's ratio
 work is higher value per unit time.
 
+**Hard prerequisite: Phase 7** (cross-platform numeric contract).
+Multi-platform release builds are pointless if a file compressed
+on macOS-arm64 doesn't decompress identically on x86_64-linux.
+Our current forward pass uses libm `f32::exp` and has no
+guarantees about cross-target bit-identity. Phase 7 is the
+numerics work that makes the on-disk format actually portable.
+Do not ship 6 until 7 lands.
+
 ---
 
 ## Tasks

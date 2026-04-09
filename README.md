@@ -36,12 +36,56 @@ use.
   autovectorization and the top-K approach carries too much ratio
   risk for the now-shrunk upside. Final: **116 KB/s compress, 7.4×
   Python**, ratio 0.2061 (essentially unchanged).
-- 🚧 **Phase 3 — File format, stream API, Silesia benchmarks, full
-  enwik8/enwik9 measurements.**
+- ✅ **Phase 3 — File format, streaming, binary input support.** v3
+  format with magic bytes + CRC32 integrity trailer, streaming
+  encode, streaming decode for raw-store, `FLAG_RAW_STORE` for
+  non-UTF-8 input, full enwik8 baseline (0.2166, 110.65 KB/s).
+- ✅ **Phase 4a — Implementation diff vs Python.** Proved our
+  forward pass is bit-identical to Python's (max L_inf 3.81e-05),
+  matched the paper's entropy bound (we hit 0.1632 at seg 4096 vs
+  Python's reported 0.1665). Discovered the paper's reported
+  ratio is the theoretical entropy bound, not actual coded bytes.
+- ✅ **Phase 4b1-2 — Varint headers + unk extraction.** File format
+  v4 with LEB128 segment headers (−1.13 pp), binary-search unk
+  extraction replaced raw-fallback subdivision entirely (−2.48 pp).
+  enwik6 actual coded ratio **0.1699 at 119 KB/s** — 86% of the
+  gap to the entropy bound closed, speed budget intact, 0 raw-
+  fallback segments remaining on enwik6.
+- 🚧 **Phase 4b remaining polish:** hybrid classical fallback for
+  OOD inputs (webster, binaries), enwik8 confirmation,
+  `docs/phase_4b_findings.md` writeup.
+- ⏳ **Phase 5 — Broader training corpus.** Retrain L3TC-200K on
+  a broader or customer-specific corpus for better OOD handling
+  and lower gap-to-bound on non-Wikipedia data.
+- ⏳ **Phase 6 — Multi-platform release builds.** macOS-arm64,
+  macOS-x86_64, linux-x86_64 release artifacts + GitHub Actions.
+  Requires Phase 7.
+- ⏳ **Phase 7 — Cross-platform numeric contract.** Deterministic
+  integer-only or locked-f32 forward pass so that the same input
+  compressed on any target produces byte-identical output.
+  Prerequisite for Phase 6 and for a portable on-disk format.
+- ⏳ **Phase 8 — Multi-model dispatch + specialist registry.**
+  Ship several small specialist models (prose / code / JSON /
+  logs / markup) and dispatch per file or per segment. Structural
+  fix for the OOD trap.
+- ⏳ **Phase 9 — Production hardening.** Decoder fuzzing, unsafe
+  NEON audit, panic-free hot path, input-validation caps,
+  CI matrix with sanitizers. Turns "clean research runtime" into
+  "safe to run on untrusted input".
+- ⏳ **Phase 10 — Distribution and language bindings.** C ABI,
+  Python wheel, Node module, Homebrew / apt / rpm packages,
+  docker image, cargo crate on crates.io. The "how do users
+  actually get this" layer.
 
-See [`PHASE_0.md`](PHASE_0.md), [`PHASE_1.md`](PHASE_1.md),
-[`PHASE_2.md`](PHASE_2.md), and [`PHASE_2_5.md`](PHASE_2_5.md) for the
-detailed plans. See [`ANALYSIS.md`](ANALYSIS.md) for the full project
+Plus [`STORAGE_SERVICE_VISION.md`](STORAGE_SERVICE_VISION.md) —
+exploratory writeup of a managed-storage-service productization
+path that dodges most of the client-side deployment problems.
+Back-burner reference, not an active phase.
+
+See [`PHASE_0.md`](PHASE_0.md) through
+[`PHASE_10.md`](PHASE_10.md) for detailed per-phase plans. See
+[`CLAUDE.md`](CLAUDE.md) for the two project goals and regression
+gates. See [`ANALYSIS.md`](ANALYSIS.md) for the full project
 thinking. See [`DECISIONS.md`](DECISIONS.md) for the architectural
 decision log (including what we tried and reversed). See
 [`docs/`](docs/) for per-phase findings.
