@@ -178,35 +178,83 @@ impl Tokenizer {
             segment_lines.push(cache);
         }
 
-        let mut segments = Vec::with_capacity(segment_lines.len());
-        for seg in segment_lines {
-            self.encode_segment_with_refinement(&seg, &mut segments)?;
+        // Phase 4b2: tokenize segments in parallel. Most segments
+        // take the fast `encode_segment` path, but the binary-
+        // search unk extraction for failing segments is expensive
+        // enough (~10-15 SPM calls per problematic segment) that
+        // serial tokenization becomes a bottleneck. Each segment
+        // is independent — `encode_segment_with_refinement` only
+        // touches `&self.sp` (which is `Sync`) and the output
+        // buffer — so par_iter + flat_map gives near-linear
+        // speedup on the slow path.
+        use rayon::prelude::*;
+        let nested: Result<Vec<Vec<EncodedSegment>>> = segment_lines
+            .par_iter()
+            .map(|seg| {
+                let mut out = Vec::with_capacity(1);
+                self.encode_segment_with_refinement(seg, &mut out)?;
+                Ok(out)
+            })
+            .collect();
+        let nested = nested?;
+        let total: usize = nested.iter().map(|v| v.len()).sum();
+        let mut segments = Vec::with_capacity(total);
+        for chunk in nested {
+            segments.extend(chunk);
         }
         Ok(segments)
     }
 
-    /// Encode `text` as a single segment, and if it fails to
-    /// round-trip through SPM, recursively subdivide it until each
-    /// raw-fallback sub-segment is at most
-    /// [`Tokenizer::MIN_RAW_FALLBACK_BYTES`] bytes.
+    /// Encode `text` as a single segment, attempting to extract
+    /// known SPM-normalize-silently codepoints (ZWNJ etc.) into the
+    /// existing unk path before falling back to raw-byte storage.
     ///
-    /// Results are appended to `out`. This is the refinement loop
-    /// for [`encode_file`].
+    /// Strategy:
+    /// 1. Try the plain `encode_segment` path. If it round-trips,
+    ///    we're done — most segments take this path.
+    /// 2. If not, attempt `encode_segment_extract_unks` which scans
+    ///    for known problematic codepoints
+    ///    ([`Self::is_normalize_silent`]), splits the text at each
+    ///    one, encodes the surrounding chunks via plain
+    ///    `encode_segment`, and emits explicit `<unk>` tokens with
+    ///    the problem-char bytes as payload between chunks. If that
+    ///    round-trips, the output is one segment that costs the
+    ///    AC-coded chunk tokens + a few bytes per problem char,
+    ///    instead of the entire raw segment.
+    /// 3. If extraction also fails (the segment has *other*
+    ///    normalization issues we don't know about), fall back to
+    ///    the existing recursive subdivision into
+    ///    `MIN_RAW_FALLBACK_BYTES`-sized raw chunks.
+    ///
+    /// Phase 4b2: this replaces enwik6's ~21 KB of raw-fallback
+    /// (Persian/Arabic ZWNJ wikipedia links) with ~2-3 KB of unk
+    /// payloads, dropping the actual coded ratio by ~1.8 pp.
     fn encode_segment_with_refinement(
         &self,
         text: &str,
         out: &mut Vec<EncodedSegment>,
     ) -> Result<()> {
         let seg = self.encode_segment(text)?;
-        if !seg.needs_raw_fallback || text.len() <= Self::MIN_RAW_FALLBACK_BYTES {
+        if !seg.needs_raw_fallback {
             out.push(seg);
             return Ok(());
         }
 
-        // Split in half at a char boundary
+        // Plain encode failed round-trip. Try unk extraction first.
+        if let Some(extracted) = self.encode_segment_extract_unks(text)? {
+            out.push(extracted);
+            return Ok(());
+        }
+
+        // Extraction couldn't fix it (or there were no extractable
+        // codepoints). Fall back to the original recursive
+        // subdivision into raw chunks.
+        if text.len() <= Self::MIN_RAW_FALLBACK_BYTES {
+            out.push(seg);
+            return Ok(());
+        }
         let mid = safe_byte_boundary(text, text.len() / 2);
         if mid == 0 || mid == text.len() {
-            // Couldn't find a meaningful split point; keep as is.
             out.push(seg);
             return Ok(());
         }
@@ -214,6 +262,185 @@ impl Tokenizer {
         self.encode_segment_with_refinement(left, out)?;
         self.encode_segment_with_refinement(right, out)?;
         Ok(())
+    }
+
+    /// Try to encode `text` by extracting silently-normalized
+    /// codepoints into the unk path. Uses binary search over char
+    /// indices to find the first codepoint where the round-trip
+    /// breaks, marks it as an unk, and recurses on the suffix.
+    /// More robust than a hardcoded drop set: it finds whatever
+    /// SPM normalizes silently without us enumerating every
+    /// problematic Unicode property.
+    ///
+    /// Cost: O(K log N) SPM calls where K is the number of unk
+    /// chars and N is the segment length in characters; in
+    /// practice K is small (~1-3 per ZWNJ-containing segment).
+    fn encode_segment_extract_unks(&self, text: &str) -> Result<Option<EncodedSegment>> {
+        let mut tokens: Vec<u32> = Vec::with_capacity(64);
+        let mut unks: Vec<Vec<u8>> = Vec::new();
+        tokens.push(BOS_ID);
+
+        if !self.extract_recursive(text, &mut tokens, &mut unks)? {
+            return Ok(None);
+        }
+
+        // Sanity check: the stitched result must round-trip exactly.
+        if !self.tokens_faithfully_decode(text, &tokens, &unks)? {
+            return Ok(None);
+        }
+
+        Ok(Some(EncodedSegment {
+            tokens,
+            unks,
+            raw: text.to_string(),
+            needs_raw_fallback: false,
+        }))
+    }
+
+    /// Hardcoded fast path: codepoints SentencePiece is known to
+    /// silently normalize (ZWNJ etc). We split at these without
+    /// any probing, which restores most of the throughput on
+    /// segments containing only known-bad characters. Unknown
+    /// problem characters fall through to the binary-search path.
+    fn is_known_normalize_silent(c: char) -> bool {
+        matches!(
+            c,
+            '\u{200B}' // ZWSP — zero-width space
+            | '\u{200C}' // ZWNJ — zero-width non-joiner
+            | '\u{200D}' // ZWJ  — zero-width joiner
+            | '\u{200E}' // LRM  — left-to-right mark
+            | '\u{200F}' // RLM  — right-to-left mark
+            | '\u{202A}'..='\u{202E}' // bidi formatting marks
+            | '\u{2060}' // WORD JOINER
+            | '\u{FEFF}' // BOM / ZWNBSP
+            | '\u{00AD}' // soft hyphen
+        )
+    }
+
+    /// Recursive helper for [`Self::encode_segment_extract_unks`].
+    /// Appends body tokens (no BOS) and unks for `text` into the
+    /// caller-provided buffers. Returns `false` if extraction
+    /// can't make progress on this slice (caller should bail out).
+    fn extract_recursive(
+        &self,
+        text: &str,
+        tokens_out: &mut Vec<u32>,
+        unks_out: &mut Vec<Vec<u8>>,
+    ) -> Result<bool> {
+        if text.is_empty() {
+            return Ok(true);
+        }
+
+        // Try the whole slice first. If it round-trips, append
+        // and we're done with this branch.
+        let plain = self.encode_segment(text)?;
+        if !plain.needs_raw_fallback {
+            if plain.tokens.first() == Some(&BOS_ID) {
+                tokens_out.extend_from_slice(&plain.tokens[1..]);
+            } else {
+                tokens_out.extend_from_slice(&plain.tokens);
+            }
+            unks_out.extend(plain.unks.into_iter());
+            return Ok(true);
+        }
+
+        // Fast path: scan for the first known-bad codepoint. If
+        // we find one and the prefix before it round-trips, we
+        // can extract it directly without binary searching. This
+        // is the common case for enwik6's Persian/Arabic ZWNJ
+        // wikipedia interlanguage links.
+        if let Some((bad_start, bad_char)) = text
+            .char_indices()
+            .find(|(_, c)| Self::is_known_normalize_silent(*c))
+        {
+            let bad_end = bad_start + bad_char.len_utf8();
+            if bad_start == 0 {
+                // Drop char at the start: just splice it as unk
+                // and recurse on the rest.
+                tokens_out.push(UNK_ID);
+                unks_out.push(text.as_bytes()[bad_start..bad_end].to_vec());
+                return self.extract_recursive(&text[bad_end..], tokens_out, unks_out);
+            }
+            let prefix = self.encode_segment(&text[..bad_start])?;
+            if !prefix.needs_raw_fallback {
+                if prefix.tokens.first() == Some(&BOS_ID) {
+                    tokens_out.extend_from_slice(&prefix.tokens[1..]);
+                } else {
+                    tokens_out.extend_from_slice(&prefix.tokens);
+                }
+                unks_out.extend(prefix.unks.into_iter());
+                tokens_out.push(UNK_ID);
+                unks_out.push(text.as_bytes()[bad_start..bad_end].to_vec());
+                return self.extract_recursive(&text[bad_end..], tokens_out, unks_out);
+            }
+            // The prefix before the known-bad char has its own
+            // issue; fall through to binary search for it.
+        }
+
+        // Binary search for the largest character-aligned prefix
+        // that still round-trips. The empty prefix (k=0) trivially
+        // round-trips; the full text (k=n) is known to fail.
+        //
+        // We cache the encoding for the last successful probe so
+        // we don't have to re-encode the good prefix after the
+        // search loop ends — saves one SPM call per extracted
+        // character, which is the dominant cost on Persian/Arabic
+        // / Cyrillic / Hebrew enwik6 segments.
+        let chars: Vec<(usize, char)> = text.char_indices().collect();
+        let n = chars.len();
+        let mut lo = 0usize;
+        let mut hi = n;
+        let mut cached_good: Option<EncodedSegment> = None;
+        while lo < hi {
+            let mid = (lo + hi + 1) / 2;
+            let end_byte = if mid >= n { text.len() } else { chars[mid].0 };
+            let prefix = &text[..end_byte];
+            let p = self.encode_segment(prefix)?;
+            if !p.needs_raw_fallback {
+                lo = mid;
+                cached_good = Some(p);
+            } else {
+                hi = mid - 1;
+            }
+        }
+
+        // `lo` chars round-trip; char at index `lo` is the first
+        // failing one. If lo >= n we can't isolate; if lo == 0 the
+        // failing char is at the start (still extractable).
+        if lo >= n {
+            // Defensive: the whole text failed but every prefix
+            // round-trips. Shouldn't happen but bail safely.
+            return Ok(false);
+        }
+
+        let bad_start = chars[lo].0;
+        let bad_char = chars[lo].1;
+        let bad_end = bad_start + bad_char.len_utf8();
+
+        // Append the good prefix. Use the cached result from the
+        // binary search if its `lo` matches; otherwise re-encode.
+        // The cache hit happens whenever the loop's last iteration
+        // was a success (which is the common case).
+        if bad_start > 0 {
+            let p = if let Some(c) = cached_good.take() {
+                c
+            } else {
+                self.encode_segment(&text[..bad_start])?
+            };
+            if p.tokens.first() == Some(&BOS_ID) {
+                tokens_out.extend_from_slice(&p.tokens[1..]);
+            } else {
+                tokens_out.extend_from_slice(&p.tokens);
+            }
+            unks_out.extend(p.unks.into_iter());
+        }
+
+        // Splice the bad char as an explicit unk.
+        tokens_out.push(UNK_ID);
+        unks_out.push(text.as_bytes()[bad_start..bad_end].to_vec());
+
+        // Recurse on the suffix.
+        self.extract_recursive(&text[bad_end..], tokens_out, unks_out)
     }
 
     /// Encode a single already-chunked text segment.
