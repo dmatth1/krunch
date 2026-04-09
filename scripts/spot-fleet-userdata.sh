@@ -92,8 +92,20 @@ pip install --upgrade pip -q
 # CUDA-PyTorch matching the host CUDA. Deep Learning Base AMI ships with
 # a recent CUDA; install the matching wheel index.
 pip install torch --index-url https://download.pytorch.org/whl/cu121 -q
-# L3TC's pinned requirements
-pip install -r requirements.txt -q
+# Pre-install numpy explicitly. L3TC's requirements.txt includes pkuseg
+# (Chinese word segmentation, only needed for Chinese SPM training, not
+# for our English enwik9 use case). pkuseg has an old setup.py that
+# imports numpy at the top before build_requires can install it, so it
+# breaks the whole `pip install -r requirements.txt` step. Two fixes
+# applied:
+#   1. Install numpy first so any other package that does the same
+#      thing has it available.
+#   2. Filter pkuseg out of the requirements file. We don't need it.
+pip install numpy -q
+grep -vE '^(pkuseg|openpyxl|yapf)\b' requirements.txt > /tmp/l3tc-req-trimmed.txt
+echo "trimmed L3TC requirements:"
+cat /tmp/l3tc-req-trimmed.txt
+pip install -r /tmp/l3tc-req-trimmed.txt -q
 # Sanity check GPU and L3TC's CUDA WKV kernel
 python -c "
 import torch
