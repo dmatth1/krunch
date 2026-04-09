@@ -109,6 +109,235 @@ corpus, production logs, markdown docs, code comments, emails
 Wikipedia-trained LM struggles. Broader training corpora are
 the standard fix.
 
+## Current progress
+
+**Status as of 2026-04-09:** Phase 11 cloud training infrastructure
+landed. Pass 1 (enwik9 sanity check) is ready to launch; Pass 2
+(Pile dedup broader corpus) requires the corpus build step before
+it can run. No training has been kicked off yet — the next action
+is human review of this section, then `./scripts/launch-spot-fleet.sh
+pass1`.
+
+### Why cloud, not the MacBook
+
+Phase 4e3 measured ~27 minutes for 5 MB × 2 epochs of L3TC training
+on Apple Silicon MPS via the pure-PyTorch WKV monkey-patch in
+`scripts/distill_l3tc.py`. Linear extrapolation:
+
+| corpus | 2 epochs on MacBook MPS |
+|---|---:|
+| 5 MB (Phase 4e3) | 27 min ✅ done |
+| 100 MB (enwik8) | ~9 hours |
+| 1 GB (enwik9) | ~90 hours (~4 days) |
+| 50 GB (Pile dedup, the actual Phase 11 target) | **~190 days** |
+
+The bottleneck is structural: our WKV kernel is a `for t in range(T)`
+Python loop because L3TC's CUDA WKV is GPU-only and we don't have a
+custom MPS Metal kernel. That loop is the entire forward pass for
+the recurrent dimension and there's no way to vectorize it across
+the time axis without changing the WKV math. **Local training is
+fine for distillation experiments on tens of MB; it is not fine for
+training from scratch on tens of GB.**
+
+On a single CUDA GPU using L3TC's native CUDA WKV kernel, the same
+training runs ~50-100× faster (one fused CUDA op instead of 2048
+Python iterations, fp16 mixed precision works, data loading
+parallelizes). At 200K params and an A10G/L40S, the run is dominated
+by data loading and the sequential time dimension, not raw compute.
+A single GPU is plenty.
+
+### Cost and wall-clock budget
+
+| GPU | spot $/hr | Pass 1 (enwik9, 1 GB × 15 epochs) | Pass 2 (Pile, 50 GB × 10 epochs) |
+|---|---:|---|---|
+| g5.xlarge (A10G 24GB) | ~$0.40-0.80 | ~1-2 hours, **~$1-2** | ~6-10 hours, **~$3-8** |
+| g6e.xlarge (L40S 48GB) | ~$0.80-1.30 | ~30-60 min, **~$1** | ~3-5 hours, **~$3-7** |
+
+We default to **g6e.xlarge** for consistency with the bnn spot
+fleet pattern (same instance type, same launcher pattern, same
+IAM/SG/key). 200K params at L40S is overkill but the cost
+difference is negligible at this scale and the consistency saves
+infrastructure work. Total Phase 11 cloud spend including debug
+iterations should land **under $20**.
+
+### Infrastructure landed
+
+Two scripts forked from the bnn pattern, adapted for L3TC training:
+
+- **`scripts/launch-spot-fleet.sh`** — adapted from
+  `bnn/scripts/launch-spot-fleet.sh`. Maintains 1 g6e.xlarge spot
+  instance, self-healing on reclaim. Reuses the existing bnn AWS
+  infrastructure verbatim:
+  - Region: `us-east-1`
+  - Key pair: `swarm-ec2`
+  - Security group: `sg-0af8b62d12cf4272c` (`bnn-training`)
+  - Instance profile: `bnn-s3-access` (already has access to the
+    bucket via `s3://dmatth1-bnn-checkpoints/*`)
+  - S3 path: **`s3://dmatth1-bnn-checkpoints/l3tc/<RUN_ID>/`** —
+    we share the bnn bucket with an `l3tc/` prefix instead of
+    creating a parallel bucket. The IAM role's wildcard policy
+    transparently covers it. No new infrastructure required.
+  - Tags: `l3tc-phase11-<RUN_ID>`, `l3tc-run-id`, `l3tc-pass`
+  - Usage: `L3TC_GITHUB_PAT=ghp_... ./scripts/launch-spot-fleet.sh pass1 [RUN_ID]`
+
+- **`scripts/spot-fleet-userdata.sh`** — instance bootstrap.
+  Stateless: every fresh instance OR replacement after spot
+  reclaim runs the same script. It clones l3tc-prod, runs
+  `scripts/setup.sh` to clone vendor/L3TC + RWKV-LM, sets up the
+  L3TC venv with CUDA-PyTorch, downloads the corpus from S3,
+  tokenizes it with the existing SPM tokenizer (vocab 16384, the
+  enwik8-trained one), checks for an existing `.pth` checkpoint
+  for the run ID and resumes if present, then runs
+  `vendor/L3TC/main.py` with the standard `config/l3tc/l3tc_200k.py`
+  config and a `train_file=...` override pointing at our
+  preprocessed corpus. Background loop uploads checkpoints + logs
+  to S3 every 5 minutes so we can monitor and resume.
+
+### Secret handling
+
+The bnn userdata script has the GitHub PAT hardcoded into the
+file (`GITHUB_PAT="github_pat_..."` at line 14 of
+`bnn/scripts/spot-fleet-userdata.sh`). That works but means the
+PAT is committed to git. **For l3tc-prod we do not commit the
+PAT.** Instead, the launcher reads it from the
+`L3TC_GITHUB_PAT` environment variable at launch time and
+substitutes it into the userdata via `sed` before base64-encoding
+into the EC2 user data. The userdata script ships with the
+literal placeholder string `PLACEHOLDER_GITHUB_PAT`, never a real
+secret.
+
+To launch:
+
+```bash
+# One-time: create a fine-grained GitHub PAT scoped to dmatth1/l3tc-prod
+# with read-only contents access. Save it somewhere local:
+echo 'ghp_yourtokenhere' > ~/.l3tc-pat
+chmod 600 ~/.l3tc-pat
+
+# Per-launch:
+export L3TC_GITHUB_PAT=$(cat ~/.l3tc-pat)
+./scripts/launch-spot-fleet.sh pass1
+```
+
+### Pass 1 — enwik9 sanity check (READY TO LAUNCH)
+
+**Goal:** verify the cloud training pipeline end-to-end on the
+simplest possible corpus before touching the broader-corpus
+experiment. enwik9 is 1 GB of the same source as enwik8 (Wikipedia
+XML, March 2006 dump); training on it is "more in-distribution
+data" with no other variables changed. Expected outcome: a
+checkpoint that produces a slightly better enwik6 ratio than the
+current default (more training data → marginally better fit) and
+identical speed.
+
+**Pre-launch checklist:**
+
+- [x] Launcher + userdata scripts written
+- [x] Reusing bnn AWS infrastructure verified (same IAM, SG,
+      key pair, bucket; just `l3tc/` prefix)
+- [x] Secret handling: GitHub PAT not committed to repo;
+      injected at launch via env var
+- [ ] enwik9 uploaded to
+      `s3://dmatth1-bnn-checkpoints/l3tc/corpora/enwik9.xz`
+      (one-time, do this once before first launch — see
+      "Corpus upload" below)
+- [ ] `L3TC_GITHUB_PAT` env var set in the launching shell
+- [ ] Spot fleet quota verified (g6e.xlarge in us-east-1)
+
+**Corpus upload (one-time, before first launch):**
+
+```bash
+# Local machine. enwik9 is 1 GB raw, ~322 MB xz-compressed.
+curl -O http://mattmahoney.net/dc/enwik9.zip
+unzip enwik9.zip
+xz -9 enwik9
+aws s3 cp enwik9.xz s3://dmatth1-bnn-checkpoints/l3tc/corpora/enwik9.xz
+```
+
+**Launch:**
+
+```bash
+export L3TC_GITHUB_PAT=$(cat ~/.l3tc-pat)
+./scripts/launch-spot-fleet.sh pass1
+# Captures FLEET_ID, RUN_ID, S3 paths, monitoring commands.
+```
+
+**Monitor:**
+
+```bash
+RUN_ID=phase11_pass1_<timestamp>
+# Bootstrap log (instance setup, before training starts):
+aws s3 cp s3://dmatth1-bnn-checkpoints/l3tc/${RUN_ID}/bootstrap.log - | tail -50
+# Training log (after training starts):
+aws s3 cp s3://dmatth1-bnn-checkpoints/l3tc/${RUN_ID}/train.log - | tail -50
+# Latest checkpoint pulled back to local for inspection:
+aws s3 sync s3://dmatth1-bnn-checkpoints/l3tc/${RUN_ID}/ ./checkpoints-pass1/ --exclude "*" --include "checkpoint*.pth"
+```
+
+**Pass 1 success criteria** (gate before Pass 2):
+
+1. Bootstrap completes without errors (corpus downloaded,
+   tokenized, training started). Reproducible on a fresh instance.
+2. Training runs for the full 15 epochs without OOM or NaN loss.
+3. Final `.pth` exists in S3 and converts cleanly via
+   `l3tc-rust/scripts/convert_checkpoint.py` to a `.bin` that
+   the existing Rust runtime loads.
+4. Round-trip enwik6 with the new `.bin`: byte-identical, ratio
+   within ±0.005 of the existing model (we expect a small
+   improvement, but anything in that band confirms the pipeline
+   produces a usable model). Speed within ±5% of 131 KB/s.
+
+If all four hold, the pipeline is verified and we move to Pass 2.
+If any fail, debug Pass 1 before spending Pass 2's compute.
+
+### Pass 2 — Pile dedup broader corpus (NOT YET READY)
+
+**Blocker:** corpus build step. Pass 2 needs a single concatenated
+text file of the Pile dedup subset (~50 GB) uploaded to
+`s3://dmatth1-bnn-checkpoints/l3tc/corpora/pile_dedup_50gb.tar`.
+Building it requires:
+
+1. A `scripts/build_pile_corpus.py` (not yet written) that pulls
+   the Pile deduplicated subset from HuggingFace datasets,
+   selects ~50 GB of well-distributed shards, concatenates them
+   with newline separators into a single text file, and uploads
+   it to S3.
+2. ~30-60 GB of local or instance disk for the build.
+3. ~30-60 min of HuggingFace download time on a fast connection.
+
+This step is intentionally deferred until Pass 1 succeeds — no
+point assembling the Pile if the cloud training pipeline doesn't
+work for enwik9 first.
+
+Once Pass 1 succeeds, the Pass 2 work list is:
+
+- [ ] Write `scripts/build_pile_corpus.py`
+- [ ] Run it locally or on a one-off EC2 instance to assemble
+      `pile_dedup_50gb.tar` and upload to S3
+- [ ] Pin the corpus composition in `docs/phase_11_findings.md`
+      (which Pile shards, dedup version, ordering, total bytes)
+- [ ] Launch Pass 2: `./scripts/launch-spot-fleet.sh pass2`
+- [ ] Monitor, pull checkpoint, run the ratio matrix benchmark
+      (the eight corpora in §"Success criteria"), apply the hard
+      floors, write `docs/phase_11_findings.md`
+
+### What's NOT done yet
+
+- Pass 1 has not been launched. Awaiting human review of
+  this section + the launcher/userdata scripts.
+- Pass 2 corpus build script not written.
+- enwik9 not yet uploaded to S3 (one-time prereq for Pass 1).
+- The ratio matrix benchmark harness (which corpora, how
+  measured, where committed) is described in §"Success
+  criteria" but not yet wired into a script. We can run the
+  Rust runtime's `entropy-bound` and full-compress paths
+  manually for the first iteration; if Phase 11 produces
+  multiple candidate checkpoints we'll script it.
+- No CI integration. Phase 11 is a one-shot research run, not
+  a recurring training job.
+
+---
+
 ## Corpus candidates
 
 Listed in rough order from "safe incremental" to "big leap":
