@@ -105,10 +105,31 @@ pip install --upgrade pip -q
 #      turns out to be needed at runtime we'll add it back with
 #      --no-deps.
 pip install numpy -q
-grep -vE '^(pkuseg|openpyxl|yapf|transformers)\b' requirements.txt > /tmp/l3tc-req-trimmed.txt
+# Trim the L3TC requirements: drop pkuseg (broken setup.py we work around
+# below), openpyxl (not used), and transformers (pulls CPU torch). KEEP
+# yapf -- L3TC's util/slconfig.py imports it at module load via
+# `from yapf.yapflib.yapf_api import FormatCode`, so it's a hard
+# runtime dep, not a dev tool.
+grep -vE '^(pkuseg|openpyxl|transformers)\b' requirements.txt > /tmp/l3tc-req-trimmed.txt
 echo "trimmed L3TC requirements:"
 cat /tmp/l3tc-req-trimmed.txt
 pip install -r /tmp/l3tc-req-trimmed.txt -q
+
+# pkuseg workaround: L3TC's three dataset files (enwik_dataset.py,
+# enwik_ascii_dataset.py, dataset.py) all do `import pkuseg` at the
+# top of the module, but NONE of them actually call any pkuseg
+# function. We confirmed this by grepping the source. The import is
+# vestigial. pkuseg's own setup.py is broken (imports numpy before
+# build_requires installs it), so installing it is painful even with
+# the workaround. The clean fix is to write an empty pkuseg/__init__.py
+# into site-packages so the import succeeds and immediately yields a
+# do-nothing module. Since L3TC never calls pkuseg.<anything>, this
+# is functionally equivalent to having pkuseg installed.
+SITE_PKGS=$(python -c "import sysconfig; print(sysconfig.get_path('purelib'))")
+mkdir -p "${SITE_PKGS}/pkuseg"
+echo "# stub: real pkuseg not installed because L3TC's import is vestigial" \
+    > "${SITE_PKGS}/pkuseg/__init__.py"
+echo "stubbed pkuseg at ${SITE_PKGS}/pkuseg/__init__.py"
 
 # CUDA-PyTorch matching the host CUDA. Install AFTER the L3TC reqs so
 # that nothing in the dependency chain (transformers, tokenizers, etc.)
