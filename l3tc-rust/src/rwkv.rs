@@ -476,6 +476,12 @@ impl<'a> Session<'a> {
         // savings from multi-threading. Segment-level parallelism
         // (in codec.rs) is where the actual parallelism wins.
         // Within a segment's forward pass, serial is fastest.
+        // Phase 2.5b INT8 head with per-column scales. Phase 4a
+        // diff harness confirmed this is the right choice: the
+        // 0.20 logit L_inf vs Python is real but does NOT change
+        // the entropy bound or the actual-coded byte count
+        // measurably (ratio 0.2060 with INT8, 0.2059 with f32).
+        // The 4× lower memory traffic is worth ~19% throughput.
         tensor::matvec_col_major_int8(
             &self.model.head_q,
             &self.model.head_scales,

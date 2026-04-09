@@ -100,6 +100,64 @@ enum Command {
         #[arg(long)]
         time: bool,
     },
+    /// Phase 4a debug: dump per-token logits to a binary file for
+    /// numerical diff against the Python L3TC reference. Reads the
+    /// first `--max-tokens` of `--input` (after tokenizing the
+    /// first `--segment-bytes`) and writes a flat binary in the
+    /// same format as `scripts/dump_python_logits.py`.
+    DumpLogits {
+        /// Input text file to tokenize.
+        #[arg(long)]
+        input: PathBuf,
+        /// Path to the converted L3TC model binary.
+        #[arg(long, default_value = "checkpoints/l3tc_200k.bin")]
+        model: PathBuf,
+        /// Path to the SentencePiece tokenizer model.
+        #[arg(
+            long,
+            default_value = "../vendor/L3TC/dictionary/vocab_enwik8_bpe_16384_0.999/spm_enwik8_bpe_16384_0.999.model"
+        )]
+        tokenizer: PathBuf,
+        /// Bytes of input to tokenize before truncating to
+        /// `--max-tokens`. Should match the Python harness so
+        /// both implementations see the same input.
+        #[arg(long, default_value_t = 4096)]
+        segment_bytes: usize,
+        /// Maximum number of tokens (including BOS) to forward.
+        #[arg(long, default_value_t = 256)]
+        max_tokens: usize,
+        /// Output directory for `tokens.bin` and `logits.bin`.
+        #[arg(long, default_value = "/tmp/l3tc_rust_dump")]
+        out_dir: PathBuf,
+    },
+    /// Phase 4a debug: compute the *theoretical entropy bound* for
+    /// a file under our forward pass — for direct comparison with
+    /// Python L3TC's reported `entropy_sum / 8` ratio. Tokenizes
+    /// `input` at the given segment size, runs the model on every
+    /// segment, accumulates `-log2(softmax_p[next_token])` across
+    /// all positions, and prints the total bits + byte ratio. No
+    /// arithmetic coding, no segment headers, no file framing —
+    /// just the entropy lower bound.
+    EntropyBound {
+        /// Input text file.
+        #[arg(long)]
+        input: PathBuf,
+        /// Path to the converted L3TC model binary.
+        #[arg(long, default_value = "checkpoints/l3tc_200k.bin")]
+        model: PathBuf,
+        /// Path to the SentencePiece tokenizer model.
+        #[arg(
+            long,
+            default_value = "../vendor/L3TC/dictionary/vocab_enwik8_bpe_16384_0.999/spm_enwik8_bpe_16384_0.999.model"
+        )]
+        tokenizer: PathBuf,
+        /// Segment length in bytes. Defaults to 2048 to match the
+        /// Python L3TC reference's compressor.py default for
+        /// L3TC-200K, so the entropy numbers are directly
+        /// comparable.
+        #[arg(long, default_value_t = 2048)]
+        segment_bytes: usize,
+    },
     /// Print version information.
     Version,
 }
@@ -128,6 +186,20 @@ fn main() -> ExitCode {
             tokenizer,
             time,
         } => run_decompress(&input, output.as_deref(), &model, &tokenizer, time),
+        Command::DumpLogits {
+            input,
+            model,
+            tokenizer,
+            segment_bytes,
+            max_tokens,
+            out_dir,
+        } => run_dump_logits(&input, &model, &tokenizer, segment_bytes, max_tokens, &out_dir),
+        Command::EntropyBound {
+            input,
+            model,
+            tokenizer,
+            segment_bytes,
+        } => run_entropy_bound(&input, &model, &tokenizer, segment_bytes),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -309,8 +381,180 @@ fn run_decompress(
     Ok(())
 }
 
+/// Phase 4a debug entry: compute the entropy lower bound on a full
+/// file. Mirrors what Python L3TC's `compressor.py` reports as
+/// `total_bin_size_min = math.ceil(entropy_sum / 8)`. Each segment
+/// gets a fresh model state; for each (current_token, next_token)
+/// pair we accumulate `-log2(softmax(logits)[next_token])`.
+fn run_entropy_bound(
+    input: &Path,
+    model_path: &Path,
+    tokenizer_path: &Path,
+    segment_bytes: usize,
+) -> Result<()> {
+    use l3tc::Session;
+
+    let model = load_model(model_path)?;
+    let tokenizer = Tokenizer::load(tokenizer_path)
+        .with_context(|| format!("loading tokenizer {tokenizer_path:?}"))?;
+
+    let raw = std::fs::read(input)
+        .with_context(|| format!("reading input {input:?}"))?;
+    let total_input_bytes = raw.len();
+    let text = std::str::from_utf8(&raw)
+        .with_context(|| "input is not valid UTF-8")?;
+
+    let segments = tokenizer
+        .encode_file(text, segment_bytes)
+        .with_context(|| "tokenizing input")?;
+
+    let mut total_bits: f64 = 0.0;
+    let mut total_steps: u64 = 0;
+    let mut session = Session::new(&model);
+
+    let n_segs = segments.len();
+    for (si, seg) in segments.iter().enumerate() {
+        if seg.needs_raw_fallback {
+            // Skip raw-fallback segments — Python reference uses
+            // SPM round-trippable text only and falls back to a
+            // separate path. For entropy comparison we ignore
+            // these (they don't contribute model entropy).
+            continue;
+        }
+        session.reset();
+        // Forward through every (prev, next) pair in this segment.
+        for i in 1..seg.tokens.len() {
+            let prev = seg.tokens[i - 1];
+            let next = seg.tokens[i] as usize;
+            let logits = session.forward(prev);
+            // Numerically stable softmax + -log2(p[next]).
+            let mut max = f32::NEG_INFINITY;
+            for &l in logits {
+                if l > max {
+                    max = l;
+                }
+            }
+            let mut sum = 0.0f64;
+            for &l in logits {
+                sum += ((l - max) as f64).exp();
+            }
+            let target_logit = (logits[next] - max) as f64;
+            let log_p = target_logit - sum.ln();
+            // bits = -log2(p) = -log_p / ln(2)
+            total_bits += -log_p / std::f64::consts::LN_2;
+            total_steps += 1;
+        }
+
+        if (si + 1) % 32 == 0 || si == n_segs - 1 {
+            let bytes = total_bits / 8.0;
+            let ratio = bytes / total_input_bytes as f64;
+            eprintln!(
+                "  seg {}/{}: bits={:.0}, bytes={:.0}, running ratio={:.4}",
+                si + 1, n_segs, total_bits, bytes, ratio
+            );
+        }
+    }
+
+    let total_bytes_min = (total_bits / 8.0).ceil();
+    let ratio = total_bytes_min / total_input_bytes as f64;
+    println!();
+    println!("=== entropy bound ===");
+    println!("input bytes:        {}", total_input_bytes);
+    println!("segments:           {}", segments.len());
+    println!("predict steps:      {}", total_steps);
+    println!("total bits:         {:.2}", total_bits);
+    println!("total_bin_size_min: {}", total_bytes_min as u64);
+    println!("ratio:              {:.6}", ratio);
+    Ok(())
+}
+
 fn load_model(path: &Path) -> Result<Model> {
     let mut ckpt = Checkpoint::load(path)
         .with_context(|| format!("loading checkpoint {path:?}"))?;
     Model::from_checkpoint(&mut ckpt).with_context(|| "building model from checkpoint")
+}
+
+/// Phase 4a debug entry: tokenize a fixed slice of the input, forward
+/// each token through the model, and dump per-token logits to a binary
+/// file in the same format as `scripts/dump_python_logits.py`. The
+/// resulting `tokens.bin` and `logits.bin` can be diffed against the
+/// Python reference dump to localize where the forward pass diverges.
+fn run_dump_logits(
+    input: &Path,
+    model_path: &Path,
+    tokenizer_path: &Path,
+    segment_bytes: usize,
+    max_tokens: usize,
+    out_dir: &Path,
+) -> Result<()> {
+    use l3tc::Session;
+    use std::io::Write;
+
+    let model = load_model(model_path)?;
+    let tokenizer = Tokenizer::load(tokenizer_path)
+        .with_context(|| format!("loading tokenizer {tokenizer_path:?}"))?;
+
+    // Tokenize exactly the same prefix the Python harness sees:
+    // first `segment_bytes` of the input file as one segment.
+    let raw = std::fs::read(input)
+        .with_context(|| format!("reading input {input:?}"))?;
+    let take = raw.len().min(segment_bytes);
+    let text = std::str::from_utf8(&raw[..take])
+        .with_context(|| "input prefix is not valid UTF-8")?;
+    let seg = tokenizer
+        .encode_segment(text)
+        .with_context(|| "tokenizing input prefix")?;
+    let mut tokens: Vec<u32> = seg.tokens.clone();
+    if max_tokens > 0 && tokens.len() > max_tokens {
+        tokens.truncate(max_tokens);
+    }
+    println!("  tokens: {} (first 10: {:?})", tokens.len(), &tokens[..tokens.len().min(10)]);
+
+    std::fs::create_dir_all(out_dir)
+        .with_context(|| format!("mkdir {out_dir:?}"))?;
+
+    // Write tokens.bin
+    let tokens_path = out_dir.join("tokens.bin");
+    let mut tf = std::io::BufWriter::new(
+        std::fs::File::create(&tokens_path)
+            .with_context(|| format!("creating {tokens_path:?}"))?,
+    );
+    tf.write_all(&(tokens.len() as u32).to_le_bytes())
+        .with_context(|| "write n_tokens")?;
+    for &t in &tokens {
+        tf.write_all(&t.to_le_bytes())
+            .with_context(|| "write token")?;
+    }
+    tf.flush().with_context(|| "flush tokens.bin")?;
+    drop(tf);
+
+    // Forward each token, dump logits.
+    let mut session = Session::new(&model);
+    let logits_path = out_dir.join("logits.bin");
+    let mut lf = std::io::BufWriter::new(
+        std::fs::File::create(&logits_path)
+            .with_context(|| format!("creating {logits_path:?}"))?,
+    );
+    lf.write_all(&(tokens.len() as u32).to_le_bytes())
+        .with_context(|| "write n_tokens")?;
+    lf.write_all(&(model.vocab_size as u32).to_le_bytes())
+        .with_context(|| "write vocab")?;
+
+    for (i, &tok) in tokens.iter().enumerate() {
+        let logits = session.forward(tok);
+        // Write all logits as f32 LE.
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                logits.as_ptr() as *const u8,
+                logits.len() * std::mem::size_of::<f32>(),
+            )
+        };
+        lf.write_all(bytes).with_context(|| "write logits")?;
+        if (i + 1) % 32 == 0 || i == tokens.len() - 1 {
+            println!("  forward {}/{}", i + 1, tokens.len());
+        }
+    }
+    lf.flush().with_context(|| "flush logits.bin")?;
+    println!("wrote: {}", logits_path.display());
+    Ok(())
 }
