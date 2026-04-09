@@ -167,6 +167,17 @@ case "$PASS" in
         ;;
 esac
 
+# === Pull the SPM tokenizer model from S3 ===
+# The .model / .vocab / _vocab.json files were trained locally during
+# Phase 0 and are not in the L3TC GitHub repo. We packed them into
+# a small tar.gz and uploaded once to s3://.../l3tc/corpora/spm_enwik8.tar.gz.
+# Every cloud instance pulls them from there.
+echo "=== Pulling SPM tokenizer files from S3 ==="
+mkdir -p dictionary
+aws s3 cp "${S3_CORPUS_PATH}/spm_enwik8.tar.gz" /tmp/spm.tar.gz --quiet
+tar -xzf /tmp/spm.tar.gz -C dictionary/
+ls -lh dictionary/vocab_enwik8_bpe_16384_0.999/
+
 # === Tokenize corpus with the existing L3TC SPM tokenizer ===
 # We deliberately reuse the enwik8-trained SPM (vocab 16384, 0.999 coverage)
 # rather than retraining the tokenizer. Per Phase 11 hard constraint #1,
