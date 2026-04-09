@@ -31,7 +31,11 @@ set -euo pipefail
 # scipy/termcolor/ninja, then force-reinstall CUDA torch last so
 # nothing can overwrite it.
 phase11_install_python_deps() {
-    cd "$(dirname "$0")/../vendor/L3TC"
+    # Hardcoded path: the userdata always clones the repo to
+    # /home/ubuntu/l3tc-prod and setup.sh puts vendor/L3TC inside it.
+    # `$(dirname "$0")` doesn't work when this file is sourced because
+    # $0 reflects the parent script, not this file.
+    cd /home/ubuntu/l3tc-prod/vendor/L3TC
     python3 -m venv .venv
     source .venv/bin/activate
     pip install --upgrade pip -q
