@@ -113,16 +113,28 @@ const TRAILER: &[u8; 4] = b"!END";
 /// otherwise lose information (ZWNJ, combining marks, etc.).
 /// Format version this module writes.
 ///
-/// v3 adds a CRC32 of the entire payload (everything from the
-/// start of the file up to and including the trailer magic)
-/// appended as a u32 little-endian after the trailer. This gives
-/// the decoder a fast integrity check against bit flips in storage
-/// or transport. The reader accepts both v2 (no CRC) and v3 files
-/// for at least one release cycle so existing artifacts still
-/// decode.
-const VERSION: u8 = 3;
+/// **v4** (Phase 4b1) packs the per-segment header fields as
+/// LEB128 varints instead of fixed-width u32/u16. Typical token
+/// counts and ac-body lengths fit in 1-2 bytes each, dropping
+/// the per-segment header from 13 bytes to ~5 bytes (savings of
+/// ~9 KB / 0.9 pp on enwik6). Per-unk lengths and the raw_len
+/// field are also varints, saving another ~3 KB / 0.3 pp on
+/// enwik6 (mostly from the 355 raw-fallback segments). The
+/// file-level CRC32 trailer from v3 is unchanged.
+///
+/// v3 added the CRC32 of the entire payload appended as a u32
+/// little-endian after the trailer. The reader still accepts v3
+/// files (and v2 files without CRC) for at least one release
+/// cycle so existing artifacts decode.
+const VERSION: u8 = 4;
 
-/// Legacy version this decoder still accepts (without CRC).
+/// Previous format with v3 CRC32 trailer + fixed-width segment
+/// headers. Decoder accepts these as long as we can detect them
+/// from the version byte.
+const VERSION_V3_COMPAT: u8 = 3;
+
+/// Legacy version this decoder still accepts (no CRC, fixed
+/// segment headers).
 const VERSION_V2_COMPAT: u8 = 2;
 
 /// Sentinel value stored in the header `n_segments` field to signal
@@ -261,7 +273,7 @@ pub fn decompress_bytes(
     }
     let version = bytes[4];
     let body: &[u8] = match version {
-        VERSION => {
+        VERSION | VERSION_V3_COMPAT => {
             let (payload, crc_bytes) = bytes.split_at(bytes.len() - 4);
             let stored = LittleEndian::read_u32(crc_bytes);
             let computed = crc32fast::hash(payload);
@@ -326,9 +338,9 @@ pub fn decompress(bytes: &[u8], tokenizer: &Tokenizer, model: &Model) -> Result<
     }
     let version = bytes[4];
     let body: &[u8] = match version {
-        VERSION => {
+        VERSION | VERSION_V3_COMPAT => {
             if bytes.len() < 4 {
-                return Err(Error::BadCheckpoint("v3 file missing CRC trailer".into()));
+                return Err(Error::BadCheckpoint("v3+ file missing CRC trailer".into()));
             }
             let (payload, crc_bytes) = bytes.split_at(bytes.len() - 4);
             let stored_crc = LittleEndian::read_u32(crc_bytes);
@@ -347,6 +359,12 @@ pub fn decompress(bytes: &[u8], tokenizer: &Tokenizer, model: &Model) -> Result<
             )));
         }
     };
+
+    // v4 uses varint segment headers; v2/v3 use fixed-width.
+    // We branch via a bool inside the read loop because the
+    // segment readers are generic over `R: Read` and so can't be
+    // coerced to a concrete function pointer.
+    let varint_segments = version == VERSION;
 
     let mut cursor = std::io::Cursor::new(body);
     let (total_bytes, n_segments, flags) = read_header(&mut cursor)?;
@@ -394,13 +412,23 @@ pub fn decompress(bytes: &[u8], tokenizer: &Tokenizer, model: &Model) -> Result<
             if &body[pos..pos + 4] == TRAILER {
                 break;
             }
-            out.push(read_segment_meta(&mut cursor)?);
+            let seg = if varint_segments {
+                read_segment_meta(&mut cursor)?
+            } else {
+                read_segment_meta_v3(&mut cursor)?
+            };
+            out.push(seg);
         }
         out
     } else {
         let mut out = Vec::with_capacity(n_segments as usize);
         for _ in 0..n_segments {
-            out.push(read_segment_meta(&mut cursor)?);
+            let seg = if varint_segments {
+                read_segment_meta(&mut cursor)?
+            } else {
+                read_segment_meta_v3(&mut cursor)?
+            };
+            out.push(seg);
         }
         out
     };
@@ -633,24 +661,25 @@ pub fn decode_writer<R: Read, W: Write>(
         )));
     }
     let version = header[4];
-    if version != VERSION && version != VERSION_V2_COMPAT {
+    if version != VERSION && version != VERSION_V3_COMPAT && version != VERSION_V2_COMPAT {
         return Err(Error::BadCheckpoint(format!(
             "unsupported version: {version}"
         )));
     }
     let flags = header[5];
-    let v3 = version == VERSION;
+    // v3 introduced the CRC32 trailer; v4 keeps it. Only v2 lacks it.
+    let has_crc = version == VERSION || version == VERSION_V3_COMPAT;
 
     if flags & FLAG_RAW_STORE != 0 {
         // --- Raw-store streaming path ---
         //
-        // Layout: header(24) | raw(N) | trailer(4) | crc(4 if v3).
+        // Layout: header(20) | raw(N) | trailer(4) | crc(4 if v3+).
         // We've consumed the header. Hash it, then stream the body
         // with an 8-byte lookahead so we never write the trailer or
         // CRC to dst.
         let mut hasher = crc32fast::Hasher::new();
         hasher.update(&header);
-        let tail_size = if v3 { 8 } else { 4 };
+        let tail_size = if has_crc { 8 } else { 4 };
         let mut tail: Vec<u8> = Vec::with_capacity(tail_size + 64 * 1024);
         let mut buf = vec![0u8; 64 * 1024];
         let mut written: u64 = 0;
@@ -684,7 +713,7 @@ pub fn decode_writer<R: Read, W: Write>(
         }
         // Trailer bytes are part of the CRC payload.
         hasher.update(trailer_seen);
-        if v3 {
+        if has_crc {
             let stored_crc = LittleEndian::read_u32(&tail[4..8]);
             let computed = hasher.finalize();
             if stored_crc != computed {
@@ -836,19 +865,35 @@ pub fn audit_compress(
     let mut session = Session::new(model);
     let mut scratch = CodecScratch::new(model.vocab_size);
 
+    // Helper: byte length of LEB128-encoded value (matches
+    // `write_varint` exactly).
+    fn varint_len(mut v: u64) -> u64 {
+        let mut n = 1u64;
+        v >>= 7;
+        while v > 0 {
+            n += 1;
+            v >>= 7;
+        }
+        n
+    }
+
     for seg in &segments {
-        // Per-segment header bytes (matches `write_segment`):
-        //   n_tokens(4) + n_unks(4) + flags(1) + ac_len(4) = 13
-        //   plus per-unk:    unk_len(2) + payload          varies
-        //   plus raw-fallback: raw_len(4) + payload         varies
-        stats.segment_header_bytes += 13;
-        stats.segment_header_bytes += 2 * seg.unks.len() as u64;
+        // v4 per-segment header (matches `write_segment`):
+        //   varint(n_tokens) + varint(n_unks) + 1(flags) + varint(ac_len)
+        //   plus per-unk:    varint(unk_len) + payload
+        //   plus raw-fallback: varint(raw_len) + payload
+        stats.segment_header_bytes += varint_len(seg.tokens.len() as u64);
+        stats.segment_header_bytes += varint_len(seg.unks.len() as u64);
+        stats.segment_header_bytes += 1; // flags byte
+        // ac_len is filled in below once we know it.
         for unk in &seg.unks {
+            stats.segment_header_bytes += varint_len(unk.len() as u64);
             stats.unk_payload_bytes += unk.len() as u64;
         }
         if seg.needs_raw_fallback {
             stats.n_raw_fallback_segments += 1;
-            stats.segment_header_bytes += 4;
+            stats.segment_header_bytes += varint_len(0); // ac_len = 0
+            stats.segment_header_bytes += varint_len(seg.raw.len() as u64);
             stats.raw_fallback_bytes += seg.raw.len() as u64;
             stats.n_tokens += seg.tokens.len() as u64;
             continue;
@@ -894,6 +939,9 @@ pub fn audit_compress(
             enc.finish()?;
         }
         stats.ac_body_bytes += ac_bytes.len() as u64;
+        // varint(ac_len) — accounted for here once we know the body
+        // length. Mirrors the order in `write_segment`.
+        stats.segment_header_bytes += varint_len(ac_bytes.len() as u64);
         stats.n_tokens += seg.tokens.len() as u64;
     }
 
@@ -1162,7 +1210,7 @@ fn read_header<R: Read>(r: &mut R) -> Result<(u64, u32, u8)> {
         return Err(Error::BadCheckpoint(format!("bad magic: {magic:?}")));
     }
     let version = r.read_u8()?;
-    if version != VERSION && version != VERSION_V2_COMPAT {
+    if version != VERSION && version != VERSION_V3_COMPAT && version != VERSION_V2_COMPAT {
         return Err(Error::BadCheckpoint(format!(
             "unsupported version: {version}"
         )));
@@ -1192,36 +1240,112 @@ struct SegmentRead {
     raw_fallback: Option<Vec<u8>>,
 }
 
+/// LEB128 unsigned varint encoder. Each byte holds 7 bits of
+/// value plus a high "continuation" bit that's 1 if more bytes
+/// follow. Used by the v4 segment-header packing.
+///
+/// Typical sizes:
+///   value < 128       → 1 byte
+///   value < 16384     → 2 bytes
+///   value < 2097152   → 3 bytes
+fn write_varint<W: Write>(w: &mut W, mut value: u64) -> Result<()> {
+    loop {
+        let byte = (value & 0x7F) as u8;
+        value >>= 7;
+        if value == 0 {
+            w.write_u8(byte).map_err(Error::Io)?;
+            return Ok(());
+        }
+        w.write_u8(byte | 0x80).map_err(Error::Io)?;
+    }
+}
+
+/// LEB128 unsigned varint decoder. Reads up to 10 bytes (enough
+/// for any u64). Errors out on a malformed sequence longer than
+/// that.
+fn read_varint<R: Read>(r: &mut R) -> Result<u64> {
+    let mut result: u64 = 0;
+    let mut shift: u32 = 0;
+    for _ in 0..10 {
+        let byte = r.read_u8().map_err(Error::Io)?;
+        result |= ((byte & 0x7F) as u64) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(result);
+        }
+        shift += 7;
+    }
+    Err(Error::BadCheckpoint("varint too long".into()))
+}
+
+/// Write one segment in the **v4** format.
+///
+/// v3 used fixed-width u32/u16 fields totaling 13 bytes per
+/// segment header (plus per-unk u16 length and per-raw u32
+/// length). v4 packs all length fields as LEB128 varints, which
+/// drops a typical text-only segment header from 13 bytes to ~5
+/// bytes and a typical raw-fallback segment from 17 bytes to ~7
+/// bytes. The actual ac_body / unk payloads / raw payloads are
+/// unchanged.
 fn write_segment<W: Write>(w: &mut W, seg: &EncodedSegment, ac_body: &[u8]) -> Result<()> {
-    w.write_u32::<LittleEndian>(seg.tokens.len() as u32)?;
-    w.write_u32::<LittleEndian>(seg.unks.len() as u32)?;
+    write_varint(w, seg.tokens.len() as u64)?;
+    write_varint(w, seg.unks.len() as u64)?;
     let seg_flags = if seg.needs_raw_fallback {
         SEG_FLAG_RAW_FALLBACK
     } else {
         0
     };
-    w.write_u8(seg_flags)?;
-    w.write_u32::<LittleEndian>(ac_body.len() as u32)?;
-    w.write_all(ac_body)?;
+    w.write_u8(seg_flags).map_err(Error::Io)?;
+    write_varint(w, ac_body.len() as u64)?;
+    w.write_all(ac_body).map_err(Error::Io)?;
     for unk in &seg.unks {
-        if unk.len() > u16::MAX as usize {
-            return Err(Error::BadCheckpoint(format!(
-                "unk payload too large: {} bytes",
-                unk.len()
-            )));
-        }
-        w.write_u16::<LittleEndian>(unk.len() as u16)?;
-        w.write_all(unk)?;
+        write_varint(w, unk.len() as u64)?;
+        w.write_all(unk).map_err(Error::Io)?;
     }
     if seg.needs_raw_fallback {
         let raw_bytes = seg.raw.as_bytes();
-        w.write_u32::<LittleEndian>(raw_bytes.len() as u32)?;
-        w.write_all(raw_bytes)?;
+        write_varint(w, raw_bytes.len() as u64)?;
+        w.write_all(raw_bytes).map_err(Error::Io)?;
     }
     Ok(())
 }
 
+/// Read one segment in the **v4** format.
 fn read_segment_meta<R: Read>(r: &mut R) -> Result<SegmentRead> {
+    let n_tokens = read_varint(r)? as u32;
+    let n_unks = read_varint(r)? as usize;
+    let seg_flags = r.read_u8()?;
+    let ac_bytes_len = read_varint(r)? as usize;
+    let mut ac_body = vec![0u8; ac_bytes_len];
+    r.read_exact(&mut ac_body)?;
+    let mut unks = Vec::with_capacity(n_unks);
+    for _ in 0..n_unks {
+        let unk_len = read_varint(r)? as usize;
+        let mut buf = vec![0u8; unk_len];
+        r.read_exact(&mut buf)?;
+        unks.push(buf);
+    }
+    let raw_fallback = if seg_flags & SEG_FLAG_RAW_FALLBACK != 0 {
+        let raw_len = read_varint(r)? as usize;
+        let mut raw = vec![0u8; raw_len];
+        r.read_exact(&mut raw)?;
+        Some(raw)
+    } else {
+        None
+    };
+    Ok(SegmentRead {
+        n_tokens,
+        unks,
+        ac_body,
+        raw_fallback,
+    })
+}
+
+/// Read one segment in the **v2/v3 fixed-width** format.
+///
+/// Kept for back-compat: any v2 or v3 file produced before
+/// Phase 4b1 still decodes through this path. v4 readers should
+/// use [`read_segment_meta`] instead.
+fn read_segment_meta_v3<R: Read>(r: &mut R) -> Result<SegmentRead> {
     let n_tokens = r.read_u32::<LittleEndian>()?;
     let n_unks = r.read_u32::<LittleEndian>()?;
     let seg_flags = r.read_u8()?;
