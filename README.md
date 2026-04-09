@@ -133,9 +133,11 @@ release builds) are the remaining distribution blockers; Phases
 
 ### Other corpora
 
-- **enwik8 (100 MB):** ratio 0.2166, compress 110.65 KB/s,
-  decompress 117.50 KB/s (Phase 3 baseline; re-confirmation on
-  the Phase 4b2 binary is a pending step of this phase).
+- **enwik8 (100 MB, Phase 4b2 confirmation run):** ratio
+  **0.1793**, compress **113.77 KB/s**, decompress **113.13
+  KB/s**, round-trip byte-identical. Ratio dropped 3.73 pp vs
+  Phase 3's 0.2166, tracking the 3.61 pp enwik6 drop and
+  confirming the Phase 4b wins generalize to 100× scale.
 - **Silesia (heterogeneous):** mixed picture. Text files
   (dickens / webster / nci) vary from "wins like enwik6" to
   "loses to raw bytes" depending on distribution. Binary files

@@ -341,6 +341,42 @@ New code:
 - `l3tc dump-logits` CLI subcommand (Phase 4a, included here
   for completeness)
 
+## enwik8 confirmation (100 MB)
+
+The 4b wins generalize cleanly to the 100 MB enwik8 corpus:
+
+| metric | Phase 3 baseline | **Phase 4b2** | delta |
+|---|---:|---:|---:|
+| enwik8 ratio | 0.2166 | **0.1793** | **−3.73 pp** |
+| compress KB/s | 110.65 | **113.77** | +3 (noise) |
+| decompress KB/s | 117.50 | **113.13** | −4 (small) |
+| round-trip | OK | **OK** | byte-identical |
+
+The −3.73 pp on enwik8 tracks the −3.61 pp we saw on enwik6,
+confirming that 4b's wins are structural (varint framing + unk
+extraction) rather than corpus-specific artifacts. Speed is
+within noise on compress. Decompress dropped a small amount
+(117.50 → 113.13 KB/s) which is attributable to the extra
+`decode_segment` work for the unk splices that 4b2 added —
+still well above the 99 KB/s floor from CLAUDE.md, so no
+regression.
+
+Full 100 MB round trip is byte-identical.
+
+Enwik6 and enwik8 side-by-side after Phase 4b:
+
+| corpus | Phase 3 ratio | **Phase 4b2 ratio** | compress | decompress |
+|---|---:|---:|---:|---:|
+| enwik6 (1 MB) | 0.2060 | **0.1699** | 119 KB/s | 119 KB/s |
+| enwik8 (100 MB) | 0.2166 | **0.1793** | 113.77 KB/s | 113.13 KB/s |
+
+The enwik8 ratio is ~1 pp higher than enwik6 because enwik8 is
+a larger, more heterogeneous slice of the same Wikipedia dump —
+more template boilerplate, more cross-language content, more
+variety the 200K-param model fits less tightly. Both ratios
+are the lowest we've ever measured on these corpora and beat
+every classical compressor in the bench suite by a wide margin.
+
 ## Where Phase 4 stands
 
 After 4b, Phase 4's success criteria are all met:
