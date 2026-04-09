@@ -51,6 +51,7 @@ decision log (including what we tried and reversed). See
 | Compressor | Ratio | Compress MB/s | Decompress MB/s |
 |---|---:|---:|---:|
 | **l3tc-rust** (Phase 2.5) | **0.2061** | **0.116** | **0.121** |
+| **l3tc-rust** on enwik8 (100 MB) | **0.2166** | **0.111** | **0.118** |
 | Python L3TC-200K | 0.1665 | 0.013 | — |
 | bzip2-9 | 0.2813 | 16.67 | 35.09 |
 | xz-9e | 0.2907 | 3.77 | 52.39 |
