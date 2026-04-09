@@ -36,16 +36,28 @@ phase11_install_python_deps() {
     # `$(dirname "$0")` doesn't work when this file is sourced because
     # $0 reflects the parent script, not this file.
     cd /home/ubuntu/l3tc-prod/vendor/L3TC
+
+    # setup.sh already created vendor/L3TC/.venv and ran the broken
+    # `pip install -r requirements.txt` (which fails on pkuseg but
+    # successfully installs everything else AND a CPU torch wheel
+    # from the transformers dependency chain). Wipe it and start
+    # fresh so we don't fight pip's resolver against the leftover
+    # CPU torch + transformers state.
+    rm -rf .venv
     python3 -m venv .venv
     source .venv/bin/activate
-    pip install --upgrade pip -q
-    pip install numpy -q
+    pip install --upgrade pip
+    pip install numpy
     grep -vE '^(pkuseg|openpyxl|transformers)\b' requirements.txt > /tmp/l3tc-req-trimmed.txt
-    echo "trimmed L3TC requirements:"
+    echo "=== trimmed L3TC requirements ==="
     cat /tmp/l3tc-req-trimmed.txt
-    pip install -r /tmp/l3tc-req-trimmed.txt -q
-    pip install scipy termcolor ninja -q
-    pip install --force-reinstall torch --index-url https://download.pytorch.org/whl/cu121 -q
+    echo "=== installing trimmed L3TC requirements ==="
+    pip install -r /tmp/l3tc-req-trimmed.txt
+    echo "=== installing scipy termcolor ninja ==="
+    pip install scipy termcolor ninja
+    echo "=== force-reinstall torch CUDA (cu121) ==="
+    pip install --force-reinstall --no-cache-dir torch --index-url https://download.pytorch.org/whl/cu121
+    echo "=== python deps install complete ==="
 }
 
 # === Stub pkuseg + deepspeed in site-packages ===
