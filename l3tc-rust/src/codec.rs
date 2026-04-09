@@ -948,6 +948,97 @@ pub fn audit_compress(
     Ok(stats)
 }
 
+/// Per-phase timing breakdown for a compression run. Populated
+/// by [`profile_compress`]. Units: nanoseconds total across all
+/// predict steps. Divide by `n_predict_steps` for per-step cost.
+#[derive(Debug, Default, Clone)]
+pub struct ProfileStats {
+    /// Wall-clock ns spent in `Session::forward`.
+    pub forward_ns: u128,
+    /// Wall-clock ns spent in `logits_to_cum_freqs_scratch`.
+    pub cum_freqs_ns: u128,
+    /// Wall-clock ns spent in `ArithmeticEncoder::encode_symbol`.
+    pub ac_encode_ns: u128,
+    /// Wall-clock ns spent in everything else in the inner loop
+    /// (control flow, scratch indexing, segment bookkeeping).
+    pub other_ns: u128,
+    /// Total wall-clock ns spent in the inner loop.
+    pub total_ns: u128,
+    /// Total predict steps executed across all tokenized segments.
+    pub n_predict_steps: u64,
+    /// Total segments (including raw-fallback ones skipped).
+    pub n_segments: u64,
+    /// Total tokens produced by the tokenizer (including BOS).
+    pub n_tokens: u64,
+}
+
+/// Phase 4c debug: sequentially compress a file while timing each
+/// hot-path stage (forward pass, cum_freqs, AC encode) to measure
+/// where the remaining per-token time actually goes. Used to
+/// verify which of the 4c5 / later items is worth implementing.
+///
+/// Matches the in-memory `compress` except it runs segments
+/// serially (no rayon) so the per-phase timers accumulate cleanly.
+pub fn profile_compress(
+    text: &str,
+    tokenizer: &Tokenizer,
+    model: &Model,
+    segment_bytes: usize,
+) -> Result<ProfileStats> {
+    use std::time::Instant;
+
+    let segments = tokenizer.encode_file(text, segment_bytes)?;
+    let mut stats = ProfileStats {
+        n_segments: segments.len() as u64,
+        ..Default::default()
+    };
+
+    let mut session = Session::new(model);
+    let mut scratch = CodecScratch::new(model.vocab_size);
+
+    let outer = Instant::now();
+    for seg in &segments {
+        stats.n_tokens += seg.tokens.len() as u64;
+        if seg.needs_raw_fallback {
+            continue;
+        }
+        session.reset();
+        let mut ac_bytes = Vec::with_capacity(seg.tokens.len());
+        {
+            let mut enc = ArithmeticEncoder::new(&mut ac_bytes);
+            for i in 1..seg.tokens.len() {
+                let prev = seg.tokens[i - 1];
+                let tok = seg.tokens[i];
+
+                let t0 = Instant::now();
+                let logits = session.forward(prev);
+                let t1 = Instant::now();
+                logits_to_cum_freqs_scratch(
+                    logits,
+                    &mut scratch.cum,
+                    &mut scratch.exps,
+                    &mut scratch.freqs,
+                );
+                let t2 = Instant::now();
+                enc.encode_symbol(&scratch.cum, tok)?;
+                let t3 = Instant::now();
+
+                stats.forward_ns += (t1 - t0).as_nanos();
+                stats.cum_freqs_ns += (t2 - t1).as_nanos();
+                stats.ac_encode_ns += (t3 - t2).as_nanos();
+                stats.n_predict_steps += 1;
+            }
+            enc.finish()?;
+        }
+    }
+    stats.total_ns = outer.elapsed().as_nanos();
+    stats.other_ns = stats.total_ns.saturating_sub(
+        stats.forward_ns + stats.cum_freqs_ns + stats.ac_encode_ns,
+    );
+
+    Ok(stats)
+}
+
 // -------- per-segment codec -------- //
 
 fn compress_segment(
@@ -1028,10 +1119,13 @@ struct CodecScratch {
     ///
     /// Separate from `cum` so the scaling loop has no sequential
     /// dependency and the prefix-sum pass is a simple running-add
-    /// in a dedicated loop. The cost of splitting is one extra
-    /// 128 KB buffer per segment; the benefit is that the scaling
-    /// loop fully vectorizes.
-    freqs: Vec<u64>,
+    /// in a dedicated loop. Phase 4c3 changed this from `Vec<u64>`
+    /// to `Vec<u32>` because freqs never exceed `PYTHON_FREQ_TOTAL
+    /// + n ≈ 10M + 16k` — easily fits in u32, halves memory
+    /// bandwidth on the scale loop, and lets NEON's f32→u32
+    /// instruction produce the quantized values directly without
+    /// a second widening pass.
+    freqs: Vec<u32>,
 }
 
 impl CodecScratch {
@@ -1039,7 +1133,7 @@ impl CodecScratch {
         Self {
             cum: vec![0u64; vocab_size + 1],
             exps: vec![0.0f32; vocab_size],
-            freqs: vec![0u64; vocab_size],
+            freqs: vec![0u32; vocab_size],
         }
     }
 }
@@ -1049,7 +1143,7 @@ impl CodecScratch {
 #[doc(hidden)]
 pub fn logits_to_cum_freqs_public(logits: &[f32], cum: &mut [u64]) {
     let mut exps = vec![0.0f32; logits.len()];
-    let mut freqs = vec![0u64; logits.len()];
+    let mut freqs = vec![0u32; logits.len()];
     logits_to_cum_freqs_scratch(logits, cum, &mut exps, &mut freqs);
 }
 
@@ -1094,7 +1188,7 @@ fn logits_to_cum_freqs_scratch(
     logits: &[f32],
     cum: &mut [u64],
     exps: &mut [f32],
-    _freqs: &mut [u64],
+    freqs: &mut [u32],
 ) {
     debug_assert_eq!(cum.len(), logits.len() + 1);
     debug_assert_eq!(exps.len(), logits.len());
@@ -1140,16 +1234,22 @@ fn logits_to_cum_freqs_scratch(
 
     // --- Pass 3: round(p * 10M); max(1); accumulate cum ---
     //
-    // Mirror Python exactly: per-symbol freq is
-    // `max(1, round(prob * 10_000_000))`. No residual fixup.
+    // Split into (3a) a fused NEON quantize over exps that
+    // computes `freqs[i] = max(1, round(exps[i] * scale))` as
+    // u32, and (3b) a scalar cum-accumulator walk. 3a is fully
+    // vectorized; 3b is a short data-dependent scalar loop that
+    // widens u32 freqs to u64 cum. Phase 4c3 measured this
+    // split saves ~10-15 us per predict step on the cum_freqs
+    // hot loop vs the prior single-pass scalar version.
     let inv_sum = 1.0f32 / sum;
+    let scale = inv_sum * PYTHON_FREQ_TOTAL as f32;
+    let freqs: &mut [u32] = freqs;
+    tensor::quantize_exps_to_freqs(exps, scale, freqs);
+
     cum[0] = 0;
     let mut total: u64 = 0;
     for i in 0..n {
-        let prob = exps[i] * inv_sum;
-        let scaled = (prob * PYTHON_FREQ_TOTAL as f32).round() as i64;
-        let freq = scaled.max(1) as u64;
-        total += freq;
+        total += freqs[i] as u64;
         cum[i + 1] = total;
     }
 
@@ -1413,7 +1513,7 @@ mod tests {
         let logits: Vec<f32> = (0..256).map(|i| (i as f32 / 50.0).sin()).collect();
         let mut cum = vec![0u64; logits.len() + 1];
         let mut exps = vec![0.0f32; logits.len()];
-        let mut freqs = vec![0u64; logits.len()];
+        let mut freqs = vec![0u32; logits.len()];
         logits_to_cum_freqs_scratch(&logits, &mut cum, &mut exps, &mut freqs);
         assert_eq!(cum[0], 0);
         // Total is bounded above by 10M + n (every freq could
@@ -1433,7 +1533,7 @@ mod tests {
         let logits = vec![f32::NAN; 16];
         let mut cum = vec![0u64; logits.len() + 1];
         let mut exps = vec![0.0f32; logits.len()];
-        let mut freqs = vec![0u64; logits.len()];
+        let mut freqs = vec![0u32; logits.len()];
         logits_to_cum_freqs_scratch(&logits, &mut cum, &mut exps, &mut freqs);
         // The uniform fallback still uses MAX_TOTAL because it
         // takes a different code path (for degenerate inputs).

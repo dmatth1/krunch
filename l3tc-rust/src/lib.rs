@@ -52,7 +52,7 @@ pub mod tokenizer;
 pub use checkpoint::{Checkpoint, Tensor};
 pub use codec::{
     audit_compress, compress, decode_writer, decompress, decompress_bytes, encode_reader,
-    AuditStats, DEFAULT_SEGMENT_BYTES,
+    profile_compress, AuditStats, ProfileStats, DEFAULT_SEGMENT_BYTES,
 };
 pub use error::{Error, Result};
 pub use rwkv::{Model, Session};

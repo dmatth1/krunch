@@ -377,6 +377,86 @@ unsafe fn softmax_shifted_exp_sum_neon(
     sum
 }
 
+/// Fused quantize kernel for the `cum_freqs` inner loop.
+///
+/// For each lane: `freqs[i] = max(1, round(exps[i] * scale))` as u32.
+///
+/// `scale` should be pre-computed as `inv_sum * PYTHON_FREQ_TOTAL`
+/// by the caller; this kernel multiplies each exp by scale,
+/// rounds to nearest u32, and clamps at 1.
+///
+/// Vectorized with NEON on aarch64: one f32x4 load, one mul, one
+/// round-to-nearest, one f32→u32 convert, one max-with-1, one
+/// u32x4 store per 4-element chunk. On L3TC-200K this runs once
+/// per token over the 16384-symbol vocab.
+pub fn quantize_exps_to_freqs(exps: &[f32], scale: f32, freqs: &mut [u32]) {
+    debug_assert_eq!(exps.len(), freqs.len());
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON mandatory on aarch64 Rust targets.
+        #[allow(unsafe_code)]
+        unsafe {
+            quantize_exps_to_freqs_neon(exps, scale, freqs);
+            return;
+        }
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        for i in 0..exps.len() {
+            let scaled = (exps[i] * scale).round();
+            let q = if scaled < 1.0 {
+                1
+            } else if scaled >= u32::MAX as f32 {
+                u32::MAX
+            } else {
+                scaled as u32
+            };
+            freqs[i] = q.max(1);
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(unsafe_code)]
+unsafe fn quantize_exps_to_freqs_neon(exps: &[f32], scale: f32, freqs: &mut [u32]) {
+    use std::arch::aarch64::*;
+
+    let n = exps.len();
+    let chunks = n / 4;
+    let scale_v = vdupq_n_f32(scale);
+    let one_v = vdupq_n_u32(1);
+
+    for i in 0..chunks {
+        let off = i * 4;
+        let e = vld1q_f32(exps.as_ptr().add(off));
+        let scaled = vmulq_f32(e, scale_v);
+        // Round to nearest, ties to even — matches Python's
+        // `torch.round()` and the Phase 4a
+        // `round(p * 10_000_000)` scheme.
+        let rounded = vrndnq_f32(scaled);
+        // f32 → u32 saturating: negatives become 0, overflow
+        // clamps to u32::MAX. `max(1)` promotes the 0s.
+        let q = vcvtq_u32_f32(rounded);
+        let clamped = vmaxq_u32(q, one_v);
+        vst1q_u32(freqs.as_mut_ptr().add(off), clamped);
+    }
+
+    for i in (chunks * 4)..n {
+        let scaled = (exps[i] * scale).round();
+        let q = if scaled < 1.0 {
+            1
+        } else if scaled >= u32::MAX as f32 {
+            u32::MAX
+        } else {
+            scaled as u32
+        };
+        freqs[i] = q.max(1);
+    }
+}
+
 /// Parallel version of [`matvec_col_major`] for very tall matrices.
 ///
 /// Splits the output rows into contiguous chunks and computes each

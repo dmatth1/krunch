@@ -32,8 +32,8 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use l3tc::{
-    audit_compress, decode_writer, decompress_bytes, encode_reader, AuditStats, Checkpoint,
-    Model, Tokenizer, DEFAULT_SEGMENT_BYTES,
+    audit_compress, decode_writer, decompress_bytes, encode_reader, profile_compress,
+    AuditStats, Checkpoint, Model, ProfileStats, Tokenizer, DEFAULT_SEGMENT_BYTES,
 };
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -181,6 +181,27 @@ enum Command {
         #[arg(long, default_value_t = DEFAULT_SEGMENT_BYTES)]
         segment_bytes: usize,
     },
+    /// Phase 4c debug: per-phase timing breakdown of the hot
+    /// loop. Sequentially compresses the input (no rayon) and
+    /// reports how much wall-clock time is spent in forward
+    /// pass vs cum_freqs vs AC encode vs everything else.
+    Profile {
+        /// Input text file.
+        #[arg(long)]
+        input: PathBuf,
+        /// Path to the converted L3TC model binary.
+        #[arg(long, default_value = "checkpoints/l3tc_200k.bin")]
+        model: PathBuf,
+        /// Path to the SentencePiece tokenizer model.
+        #[arg(
+            long,
+            default_value = "../vendor/L3TC/dictionary/vocab_enwik8_bpe_16384_0.999/spm_enwik8_bpe_16384_0.999.model"
+        )]
+        tokenizer: PathBuf,
+        /// Segment length in bytes.
+        #[arg(long, default_value_t = DEFAULT_SEGMENT_BYTES)]
+        segment_bytes: usize,
+    },
     /// Print version information.
     Version,
 }
@@ -229,6 +250,12 @@ fn main() -> ExitCode {
             tokenizer,
             segment_bytes,
         } => run_audit(&input, &model, &tokenizer, segment_bytes),
+        Command::Profile {
+            input,
+            model,
+            tokenizer,
+            segment_bytes,
+        } => run_profile(&input, &model, &tokenizer, segment_bytes),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -623,6 +650,78 @@ fn run_audit(
         100.0 * (total as f64 - bound as f64) / input_bytes.max(1) as f64,
         overhead
     );
+
+    Ok(())
+}
+
+/// Phase 4c debug: run a sequential compress with per-phase
+/// timing and print the breakdown.
+fn run_profile(
+    input: &Path,
+    model_path: &Path,
+    tokenizer_path: &Path,
+    segment_bytes: usize,
+) -> Result<()> {
+    let model = load_model(model_path)?;
+    let tokenizer = Tokenizer::load(tokenizer_path)
+        .with_context(|| format!("loading tokenizer {tokenizer_path:?}"))?;
+    let text = std::fs::read_to_string(input)
+        .with_context(|| format!("reading input {input:?}"))?;
+
+    let stats: ProfileStats = profile_compress(&text, &tokenizer, &model, segment_bytes)
+        .with_context(|| "profile_compress failed")?;
+
+    let total = stats.total_ns.max(1);
+    let pct = |x: u128| -> f64 { 100.0 * x as f64 / total as f64 };
+    let per_step = |x: u128| -> f64 {
+        if stats.n_predict_steps == 0 {
+            0.0
+        } else {
+            x as f64 / stats.n_predict_steps as f64 / 1000.0
+        }
+    };
+
+    println!("=== profile ===");
+    println!("input file:          {}", input.display());
+    println!("input bytes:         {}", text.len());
+    println!("segments:            {}", stats.n_segments);
+    println!("tokens (incl. BOS):  {}", stats.n_tokens);
+    println!("predict steps:       {}", stats.n_predict_steps);
+    println!();
+    println!(
+        "total wall-clock:    {:>10.3} ms",
+        stats.total_ns as f64 / 1_000_000.0
+    );
+    println!(
+        "forward pass:        {:>10.3} ms  ({:5.2}%)  {:6.2} us/step",
+        stats.forward_ns as f64 / 1_000_000.0,
+        pct(stats.forward_ns),
+        per_step(stats.forward_ns),
+    );
+    println!(
+        "cum_freqs:           {:>10.3} ms  ({:5.2}%)  {:6.2} us/step",
+        stats.cum_freqs_ns as f64 / 1_000_000.0,
+        pct(stats.cum_freqs_ns),
+        per_step(stats.cum_freqs_ns),
+    );
+    println!(
+        "AC encode:           {:>10.3} ms  ({:5.2}%)  {:6.2} us/step",
+        stats.ac_encode_ns as f64 / 1_000_000.0,
+        pct(stats.ac_encode_ns),
+        per_step(stats.ac_encode_ns),
+    );
+    println!(
+        "other (bookkeeping): {:>10.3} ms  ({:5.2}%)",
+        stats.other_ns as f64 / 1_000_000.0,
+        pct(stats.other_ns),
+    );
+    println!();
+    let kb_s = if stats.total_ns > 0 {
+        (text.len() as f64 / 1024.0) / (stats.total_ns as f64 / 1e9)
+    } else {
+        0.0
+    };
+    println!("throughput:          {:.2} KB/s (single-thread, no rayon)", kb_s);
 
     Ok(())
 }
