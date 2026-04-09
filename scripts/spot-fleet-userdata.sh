@@ -91,23 +91,27 @@ if [ "${SKIP_TOKENIZE:-0}" != "1" ]; then
     phase11_tokenize_corpus "data/raw_text_data/${CORPUS_NAME}" "${TRAIN_FILE}"
 fi
 
+# === Carve a held-out validation slice from the train file ===
+VAL_FILE="./data/val_data/val_${CORPUS_NAME}_bpe_16384_0.999.txt"
+phase11_make_val_split "${TRAIN_FILE}" "${VAL_FILE}" 100000
+
 # === Find latest checkpoint for this run (resume after spot reclaim) ===
+CKPT_DIR="checkpoint/phase11_${PASS}"
+mkdir -p "${CKPT_DIR}"
 RESUME_FLAG=""
-LATEST_CKPT=$(aws s3 ls "${S3_RUN_PATH}/" 2>/dev/null | grep -E "checkpoint.*\.pth" | sort | tail -1 || true)
+LATEST_CKPT=$(aws s3 ls "${S3_RUN_PATH}/" 2>/dev/null | grep -E "checkpoint_latest\.pth" | tail -1 || true)
 if [ -n "$LATEST_CKPT" ]; then
-    CKPT_NAME=$(echo "$LATEST_CKPT" | awk '{print $4}')
-    echo "Found checkpoint ${CKPT_NAME}, resuming"
-    mkdir -p checkpoint
-    aws s3 cp "${S3_RUN_PATH}/${CKPT_NAME}" "checkpoint/${CKPT_NAME}" --quiet
-    RESUME_FLAG="--resume checkpoint/${CKPT_NAME}"
+    echo "Found checkpoint_latest.pth in S3, resuming"
+    aws s3 cp "${S3_RUN_PATH}/checkpoint_latest.pth" "${CKPT_DIR}/checkpoint_latest.pth" --quiet
+    RESUME_FLAG="--resume ${CKPT_DIR}/checkpoint_latest.pth"
 fi
 
 # === Background checkpoint + log uploader ===
 (
     while true; do
-        sleep 300
-        if compgen -G "checkpoint/checkpoint*.pth" > /dev/null; then
-            for ckpt in checkpoint/checkpoint*.pth; do
+        sleep 120
+        if compgen -G "${CKPT_DIR}/checkpoint*.pth" > /dev/null; then
+            for ckpt in "${CKPT_DIR}"/checkpoint*.pth; do
                 aws s3 cp "$ckpt" "${S3_RUN_PATH}/$(basename "$ckpt")" --quiet 2>/dev/null || true
             done
         fi
@@ -117,15 +121,18 @@ fi
 TRAIN_UPLOAD_PID=$!
 kill ${BOOTSTRAP_LOG_PID} 2>/dev/null || true
 
-# === Run L3TC training ===
-echo "=== Starting L3TC training (pass ${PASS}, ${EPOCHS} epochs) ==="
+# === Run our Phase 11.5 trainer ===
+# Imports only RWKV_TC_HIRA from L3TC; bypasses main.py and all of
+# L3TC's dependency surface (yapf/termcolor/scipy/transformers/etc).
+echo "=== Starting train_l3tc_phase11.py (pass ${PASS}, ${EPOCHS} epochs) ==="
 date -u
 
-python main.py \
-    --config_file config/l3tc/l3tc_200k.py \
-    --output_dir checkpoint \
+python /home/ubuntu/l3tc-prod/scripts/train_l3tc_phase11.py \
+    --train-file "${TRAIN_FILE}" \
+    --val-file "${VAL_FILE}" \
+    --output-dir "${CKPT_DIR}" \
+    --epochs ${EPOCHS} \
     --device cuda \
-    --options train_file="${TRAIN_FILE}" epoch=${EPOCHS} \
     ${RESUME_FLAG} \
     2>&1 | tee train.log
 TRAIN_EXIT=${PIPESTATUS[0]}
@@ -134,12 +141,13 @@ echo "=== Training exited: ${TRAIN_EXIT} ==="
 date -u
 
 # Final upload
-if compgen -G "checkpoint/checkpoint*.pth" > /dev/null; then
-    for ckpt in checkpoint/checkpoint*.pth; do
+if compgen -G "${CKPT_DIR}/checkpoint*.pth" > /dev/null; then
+    for ckpt in "${CKPT_DIR}"/checkpoint*.pth; do
         aws s3 cp "$ckpt" "${S3_RUN_PATH}/$(basename "$ckpt")" --quiet
     done
 fi
 aws s3 cp train.log "${S3_RUN_PATH}/train.log" --quiet
+aws s3 cp "${CKPT_DIR}/log.txt" "${S3_RUN_PATH}/log.txt" --quiet 2>/dev/null || true
 kill ${TRAIN_UPLOAD_PID} 2>/dev/null || true
 
 echo "=== Done. Cancel the spot fleet manually when ready. ==="

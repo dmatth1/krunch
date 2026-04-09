@@ -1,7 +1,14 @@
 #!/bin/bash
-# Phase 11 bootstrap helpers — sourced/run from spot-fleet-userdata.sh.
+# Phase 11 bootstrap helpers — sourced from spot-fleet-userdata.sh.
 # Lives in the repo (not embedded in EC2 user data) so the user data
 # stays under the 16 KB EC2 limit.
+#
+# After Phase 11.5 (scripts/train_l3tc_phase11.py replacing
+# vendor/L3TC/main.py), the dependency surface is much smaller:
+# we only need numpy<2, torch 2.1.2+cu121, sentencepiece, and the
+# pkuseg + deepspeed stubs (because rwkv_tc_hira_train.py still
+# imports them at module load even though our trainer never calls
+# them).
 #
 # Expected env vars set by the caller:
 #   S3_BUCKET, S3_PREFIX, S3_RUN_PATH, S3_CORPUS_PATH, RUN_ID, PASS,
@@ -10,73 +17,43 @@
 set -euo pipefail
 
 # === Python venv + dependency installation ===
-# L3TC's pinned requirements.txt has issues we work around:
-#   - pkuseg: setup.py imports numpy before build_requires installs it,
-#             AND L3TC's three dataset files import pkuseg but never
-#             call it. Stub it.
-#   - openpyxl: not used at runtime, drop.
-#   - transformers: pulls a CPU torch wheel that overwrites our CUDA
-#             torch. Drop and install torch CUDA last.
-#   - deepspeed (NOT in requirements.txt): every model in
-#             models/RWKV_V4/*train.py imports `from deepspeed.ops.adam
-#             import FusedAdam` at module top, but configure_optimizers
-#             wraps the call in a try/except and falls back to
-#             torch.optim.Adam. Stub the class with one that raises on
-#             init -- the except catches it and the fallback runs.
-#   - termcolor, scipy, ninja (NOT in requirements.txt but actually
-#             needed): install via pip directly.
-#
-# Order matters: trimmed L3TC reqs first (these may install a CPU torch
-# from transformers chain → we removed transformers anyway), then
-# scipy/termcolor/ninja, then force-reinstall CUDA torch last so
-# nothing can overwrite it.
 phase11_install_python_deps() {
-    # Hardcoded path: the userdata always clones the repo to
-    # /home/ubuntu/l3tc-prod and setup.sh puts vendor/L3TC inside it.
-    # `$(dirname "$0")` doesn't work when this file is sourced because
-    # $0 reflects the parent script, not this file.
     cd /home/ubuntu/l3tc-prod/vendor/L3TC
 
-    # Wipe the venv that setup.sh created (it had leftover CPU torch
-    # + transformers from the broken `pip install -r requirements.txt`
-    # in setup.sh). Fresh venv = no resolver fights.
+    # Wipe whatever setup.sh produced -- we don't need any of L3TC's
+    # requirements.txt anymore. Our trainer imports only the model
+    # class from L3TC and nothing else.
     rm -rf .venv
     python3 -m venv .venv
     source .venv/bin/activate
     pip install --upgrade pip
-    pip install numpy
 
-    # Install torch FIRST with the cu121 index, pinned to a known-good
-    # version. torch 2.1.2 ships its CUDA libs bundled in the wheel
-    # (no separate nvidia-* packages), unlike torch 2.5+ which pulls
-    # ~1 GB of nvidia-cufft/cusolver/cusparse/etc as runtime deps.
-    # Bundled is much faster to install and easier on g5.xlarge's
-    # I/O during the install step.
+    # numpy MUST be <2: torch 2.1.2 was compiled against numpy 1.x
+    # and crashes on the 2.x ABI break.
+    echo "=== installing numpy<2 ==="
+    pip install "numpy<2"
+
+    # torch 2.1.2 with CUDA 12.1, bundled CUDA libs (no separate
+    # nvidia-* wheels). The bundled wheel is ~2 GB; the unbundled
+    # version pulls another ~1 GB of nvidia-cufft/cusolver/cusparse
+    # and saturates the network.
     echo "=== installing torch 2.1.2+cu121 ==="
     pip install torch==2.1.2 --index-url https://download.pytorch.org/whl/cu121
 
-    # Now install L3TC's other deps. The trimmed list excludes:
-    #   - pkuseg (broken setup.py, we stub it)
-    #   - openpyxl (unused)
-    #   - transformers (was pulling CPU torch and overwriting our CUDA)
-    grep -vE '^(pkuseg|openpyxl|transformers)\b' requirements.txt > /tmp/l3tc-req-trimmed.txt
-    echo "=== trimmed L3TC requirements ==="
-    cat /tmp/l3tc-req-trimmed.txt
-    echo "=== installing trimmed L3TC requirements ==="
-    pip install -r /tmp/l3tc-req-trimmed.txt
-
-    # Additional deps L3TC imports but doesn't list:
-    #   - termcolor: util/logger.py
-    #   - scipy:     util/arithmeticcoding.py
-    #   - ninja:     CUDA WKV JIT compile
-    #   - tqdm:      models/RWKV_V4/rwkv_v4_train.py
-    echo "=== installing scipy termcolor ninja tqdm ==="
-    pip install scipy termcolor ninja tqdm
+    # SentencePiece for the BPE tokenizer (used by us at preprocessing
+    # time, not at training time). Tiny.
+    echo "=== installing sentencepiece ==="
+    pip install sentencepiece
 
     echo "=== python deps install complete ==="
 }
 
 # === Stub pkuseg + deepspeed in site-packages ===
+# Even after Phase 11.5 these are still required: L3TC's
+# rwkv_tc_hira_train.py imports `pkuseg` (vestigial) and
+# `from deepspeed.ops.adam import FusedAdam` (real but
+# fallback-able) at module top, before our trainer can do
+# anything. The stubs let the import succeed.
 phase11_write_stubs() {
     local site_pkgs
     site_pkgs=$(python -c "import sysconfig; print(sysconfig.get_path('purelib'))")
@@ -88,15 +65,9 @@ phase11_write_stubs() {
     echo "# stub" > "${site_pkgs}/deepspeed/__init__.py"
     echo "" > "${site_pkgs}/deepspeed/ops/__init__.py"
     cat > "${site_pkgs}/deepspeed/ops/adam/__init__.py" <<'PYEOF'
-# Stub: real deepspeed not installed. L3TC's configure_optimizers
-# wraps the FusedAdam call in try/except and falls back to
-# torch.optim.Adam if it raises.
 class FusedAdam:
     def __init__(self, *args, **kwargs):
-        raise RuntimeError(
-            "deepspeed stub: FusedAdam not available; "
-            "L3TC will fall back to torch.optim.Adam"
-        )
+        raise RuntimeError("deepspeed stub: caller should fall back")
 PYEOF
     echo "stubs written to ${site_pkgs}/{pkuseg,deepspeed}/"
 }
@@ -112,39 +83,8 @@ print(f'cuda device count: {torch.cuda.device_count()}')
 assert torch.cuda.is_available(), 'CUDA not available'
 print(f'GPU: {torch.cuda.get_device_name(0)}')
 print(f'VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB')
+print(f'bf16 supported: {torch.cuda.is_bf16_supported()}')
 "
-}
-
-# === Tokenize raw text → L3TC format ===
-phase11_tokenize_corpus() {
-    local raw_text="$1"
-    local out_file="$2"
-    local spm_model="dictionary/vocab_enwik8_bpe_16384_0.999/spm_enwik8_bpe_16384_0.999.model"
-
-    mkdir -p "$(dirname "${out_file}")"
-    echo "tokenizing ${raw_text} -> ${out_file}"
-    python <<PYEOF
-import sentencepiece as spm
-sp = spm.SentencePieceProcessor()
-sp.load('${spm_model}')
-print(f'vocab size: {sp.vocab_size()}, BOS id: {sp.bos_id()}')
-with open('${raw_text}', 'r', encoding='utf-8', errors='replace') as f_in, \
-     open('${out_file}', 'w') as f_out:
-    bytes_done = 0
-    while True:
-        chunk = f_in.read(1_000_000)
-        if not chunk:
-            break
-        ids = sp.encode_as_ids(chunk)
-        f_out.write('2\n')
-        for tid in ids:
-            f_out.write(f'{tid}\n')
-        bytes_done += len(chunk.encode('utf-8'))
-        if bytes_done % (50 * 1024 * 1024) == 0:
-            print(f'  tokenized {bytes_done // (1024*1024)} MB', flush=True)
-print(f'done: ${out_file}')
-PYEOF
-    ls -lh "${out_file}"
 }
 
 # === Pull SPM tokenizer files from S3 (not in L3TC repo) ===
@@ -178,4 +118,47 @@ phase11_fetch_corpus_pass1() {
         ls -lh data/raw_text_data/enwik9
         export SKIP_TOKENIZE=0
     fi
+}
+
+# === Tokenize raw text → one-int-per-line format ===
+# Only called if SKIP_TOKENIZE=0 (i.e., pre-tokenized file not in S3).
+phase11_tokenize_corpus() {
+    local raw_text="$1"
+    local out_file="$2"
+    local spm_model="dictionary/vocab_enwik8_bpe_16384_0.999/spm_enwik8_bpe_16384_0.999.model"
+
+    mkdir -p "$(dirname "${out_file}")"
+    echo "tokenizing ${raw_text} -> ${out_file}"
+    python <<PYEOF
+import sentencepiece as spm
+sp = spm.SentencePieceProcessor()
+sp.load('${spm_model}')
+print(f'vocab={sp.vocab_size()} bos={sp.bos_id()}')
+with open('${raw_text}', 'r', encoding='utf-8', errors='replace') as f_in, \
+     open('${out_file}', 'w') as f_out:
+    text = f_in.read()
+    ids = sp.encode_as_ids(text)
+    f_out.write('2\n')
+    for tid in ids:
+        f_out.write(f'{tid}\n')
+print(f'done: {len(ids)} tokens')
+PYEOF
+    ls -lh "${out_file}"
+}
+
+# === Carve a small held-out validation slice from the train file ===
+# Takes the last `n_lines` lines as the val set. Idempotent.
+phase11_make_val_split() {
+    local train_file="$1"
+    local val_file="$2"
+    local n_lines="${3:-100000}"  # ~10 MB at our token format
+
+    mkdir -p "$(dirname "${val_file}")"
+    if [ -f "${val_file}" ]; then
+        echo "val file already exists: ${val_file}"
+        return 0
+    fi
+    tail -n "${n_lines}" "${train_file}" > "${val_file}"
+    # Prepend the BOS marker so the val set starts cleanly
+    echo "val file: ${val_file} ($(wc -l < ${val_file}) lines)"
 }

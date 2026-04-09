@@ -321,6 +321,102 @@ Once Pass 1 succeeds, the Pass 2 work list is:
       (the eight corpora in §"Success criteria"), apply the hard
       floors, write `docs/phase_11_findings.md`
 
+### Phase 11.5 — replace L3TC main.py with our own training script (followup)
+
+**Status:** queued. Triggered by Pass 1 bootstrap pain. Should
+run after Pass 1 ships and before Pass 2 starts.
+
+**Why:** Pass 1 ended up taking ~4 hours of cloud iteration
+instead of the ~30 minutes the training itself needed. Almost
+all of that time was spent debugging dependency issues in
+`vendor/L3TC/main.py`'s import chain. Each problem was a real
+bug in L3TC's environment that we got to discover one error at
+a time:
+
+| layer | what broke | fix |
+|---|---|---|
+| `pkuseg` | broken `setup.py` (numpy import before build_requires); also vestigial — imported but never called in L3TC's dataset files | stub `pkuseg/__init__.py` in site-packages |
+| `transformers` (pulled in by L3TC requirements) | resolver picked CPU torch wheel from PyPI, overwriting our CUDA torch | drop transformers from trimmed requirements |
+| `yapf` | listed as dev tool but L3TC's `util/slconfig.py` imports `yapf.yapflib.yapf_api` at config-load time | keep in trimmed requirements |
+| `termcolor` | not in `requirements.txt` but `util/logger.py` imports it | explicit pip install |
+| `scipy` | not in `requirements.txt` but `util/arithmeticcoding.py` imports `scipy.special` | explicit pip install |
+| `deepspeed` | not in `requirements.txt` but every `models/RWKV_V4/*train.py` imports `from deepspeed.ops.adam import FusedAdam` at module top — `configure_optimizers()` has a try/except fallback to torch.optim.Adam, so the symbol just needs to exist | stub `deepspeed/ops/adam/__init__.py` with a `FusedAdam` class that raises on init |
+| `ninja` | needed for `torch.utils.cpp_extension.load()` to JIT-compile L3TC's CUDA WKV kernel; not in `requirements.txt` | explicit pip install |
+| `tqdm` | not in `requirements.txt` but `models/RWKV_V4/rwkv_v4_train.py` imports it | explicit pip install |
+| `numpy 2.x` | torch 2.1.2 was compiled against numpy 1.x; numpy 2.x ABI break crashes torch import | pin `numpy<2` |
+| `torch.utils.cpp_extension.load` requires C++ extension JIT compile, which is heavy I/O | g5.xlarge (4 vCPU/16 GB RAM) sshd starves under the load | use g5.2xlarge (8 vCPU / 32 GB RAM) |
+| `--force-reinstall torch` with the cu121 index pulled ~1 GB of separate `nvidia-*` wheels (cufft, cusolver, cusparse, etc.) | download saturated the network and took the system down | pin `torch==2.1.2` which ships with bundled CUDA libs in the wheel |
+| L3TC main.py needs both `train_file` and `test_file` | Pass 1 only set `train_file` | symlink `test_enwik9_*.txt` → `train_enwik9_*.txt` for the sanity check; for Pass 2 we'll split off a real held-out chunk |
+
+Each one of those was a real fix, but the *meta* problem is
+that **none of them would have happened if we had written our
+own training script that imports only `RWKV_TC_HIRA` from
+L3TC and nothing else from the L3TC source tree.** This is
+exactly what `scripts/distill_l3tc.py` does for Phase 4e2 and
+why Phase 4e2 ran cleanly on MPS without any of these issues.
+
+**What 11.5 will do:**
+
+1. **Write `scripts/train_l3tc_phase11.py`**, a minimal training
+   loop in the same style as `scripts/distill_l3tc.py`:
+
+   - Import `RWKV_TC_HIRA` directly from
+     `vendor/L3TC/models/RWKV_V4/rwkv_tc_hira_train` (the same
+     model class L3TC uses; we don't reimplement the model).
+   - Implement our own `EnWikDataset` that reads the
+     pre-tokenized text file format (one int per line, with
+     BOS markers between segments). ~30 lines.
+   - Implement our own training loop: AdamW optimizer, linear
+     warmup + cosine decay LR schedule, gradient clipping,
+     mixed precision (fp16) training. ~50 lines. Patterns we
+     already understand from `bnn`.
+   - Save checkpoints every N steps in the same `.pth` format
+     L3TC produces (so `convert_checkpoint.py` keeps working
+     with no changes).
+   - Periodic eval on a held-out chunk: compute average CE
+     and perplexity, print to log.
+
+2. **Cut the dependency surface to the minimum.** The new
+   training script imports only:
+   - `torch` (CUDA, from cu121 index)
+   - `numpy` (pinned to <2 to match torch 2.1.x ABI)
+   - `sentencepiece` (for the BPE tokenizer)
+   - `tqdm` (for the progress bar — strictly optional, can be
+     dropped if even this becomes painful)
+   - `RWKV_TC_HIRA` from L3TC's `rwkv_tc_hira_train.py`
+   - The pkuseg + deepspeed stubs are still needed because
+     `rwkv_tc_hira_train.py` imports them at module load.
+     But that's the entire stub list — no yapf, no termcolor,
+     no scipy, no ninja, no transformers, no L3TC `util/`
+     module at all.
+
+3. **Replace `phase11_install_python_deps`** in
+   `scripts/phase11_bootstrap_helpers.sh` with a much shorter
+   version: pre-install numpy<2, install torch 2.1.2+cu121,
+   install sentencepiece + tqdm, write the two stubs, done.
+   No L3TC `requirements.txt` involvement at all. Bootstrap
+   should drop from ~10 min to ~3 min.
+
+4. **Replace the `python main.py ...` line** in the userdata
+   with `python /home/ubuntu/l3tc-prod/scripts/train_l3tc_phase11.py
+   --train-file ... --epochs ... --output-dir ...`.
+
+5. **Bake the dependencies into a custom AMI** as the second
+   speed win. After 11.5 lands, snapshot a working instance
+   into a private AMI so future Pass-N runs skip the dep
+   install entirely. Bootstrap drops to ~30 sec (just clone +
+   download corpus + start training). This is the right move
+   if we expect to run more than one or two more training
+   experiments.
+
+**Cost of doing 11.5 properly:** ~2 hours of script writing
+plus ~30 min of cloud verification on a small corpus before
+running the real Pass 2 / Pass 11.x training. Saves multiples
+of that on every subsequent training run.
+
+**When to do it:** as the immediate followup to Pass 1.
+Before Pass 2.
+
 ### What's NOT done yet
 
 - Pass 1 has not been launched. Awaiting human review of

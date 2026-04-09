@@ -32,7 +32,12 @@ S3_PREFIX="l3tc"
 KEY_NAME="swarm-ec2"
 SG_ID="sg-0af8b62d12cf4272c"
 IAM_PROFILE_ARN="arn:aws:iam::584956668248:instance-profile/bnn-s3-access"
-INSTANCE_TYPE="g6e.xlarge"
+# Diversify across instance types to dodge per-AZ spot capacity drops.
+# All four are NVIDIA single-GPU spots in the 24-48 GB VRAM range and
+# all are massive overkill for a 200K-param model — capacityOptimized
+# picks whichever has stock at launch. The training script doesn't
+# care which we land on. Order is roughly cheapest-first.
+INSTANCE_TYPES=("g5.xlarge" "g6.xlarge" "g5.2xlarge" "g6e.xlarge")
 
 # === Validate inputs ===
 if [ -z "${L3TC_GITHUB_PAT:-}" ]; then
@@ -102,19 +107,16 @@ USERDATA=$(sed \
     -e "s|PLACEHOLDER_S3_PREFIX|${S3_PREFIX}|g" \
     "$USERDATA_SCRIPT" | base64)
 
-# === Create Spot Fleet request config ===
-FLEET_CONFIG=$(cat <<EOF
-{
-    "IamFleetRole": "arn:aws:iam::584956668248:role/aws-ec2-spot-fleet-tagging-role",
-    "TargetCapacity": 1,
-    "SpotPrice": "2.00",
-    "TerminateInstancesWithExpiration": false,
-    "Type": "maintain",
-    "AllocationStrategy": "capacityOptimized",
-    "LaunchSpecifications": [
+# === Build LaunchSpecifications: one per instance type for diversification ===
+LAUNCH_SPECS=""
+for itype in "${INSTANCE_TYPES[@]}"; do
+    if [ -n "$LAUNCH_SPECS" ]; then
+        LAUNCH_SPECS="${LAUNCH_SPECS},"
+    fi
+    LAUNCH_SPECS="${LAUNCH_SPECS}$(cat <<EOF
         {
             "ImageId": "${AMI}",
-            "InstanceType": "${INSTANCE_TYPE}",
+            "InstanceType": "${itype}",
             "KeyName": "${KEY_NAME}",
             "SecurityGroups": [{"GroupId": "${SG_ID}"}],
             "IamInstanceProfile": {"Arn": "${IAM_PROFILE_ARN}"},
@@ -140,6 +142,21 @@ FLEET_CONFIG=$(cat <<EOF
                 }
             ]
         }
+EOF
+)"
+done
+
+# === Create Spot Fleet request config ===
+FLEET_CONFIG=$(cat <<EOF
+{
+    "IamFleetRole": "arn:aws:iam::584956668248:role/aws-ec2-spot-fleet-tagging-role",
+    "TargetCapacity": 1,
+    "SpotPrice": "2.00",
+    "TerminateInstancesWithExpiration": false,
+    "Type": "maintain",
+    "AllocationStrategy": "capacityOptimized",
+    "LaunchSpecifications": [
+${LAUNCH_SPECS}
     ]
 }
 EOF
@@ -167,7 +184,7 @@ echo "============================================"
 echo "  Spot Fleet: ${FLEET_ID}"
 echo "  Run ID:     ${RUN_ID}"
 echo "  Pass:       ${PASS}"
-echo "  Instance:   ${INSTANCE_TYPE}"
+echo "  Instances:  ${INSTANCE_TYPES[*]} (capacityOptimized)"
 echo "  S3 path:    s3://${S3_BUCKET}/${S3_PREFIX}/${RUN_ID}/"
 echo ""
 echo "  Monitor training:"
