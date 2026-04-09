@@ -32,8 +32,8 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use l3tc::{
-    decode_writer, decompress_bytes, encode_reader, Checkpoint, Model, Tokenizer,
-    DEFAULT_SEGMENT_BYTES,
+    audit_compress, decode_writer, decompress_bytes, encode_reader, AuditStats, Checkpoint,
+    Model, Tokenizer, DEFAULT_SEGMENT_BYTES,
 };
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -158,6 +158,29 @@ enum Command {
         #[arg(long, default_value_t = 2048)]
         segment_bytes: usize,
     },
+    /// Phase 4b debug: compress a file and print a per-source byte
+    /// breakdown so we can localize where the gap between actual
+    /// coded bytes and the entropy bound goes. Reports input
+    /// bytes, entropy bound, AC body bytes, segment header bytes,
+    /// unk payload bytes, file framing, and the difference
+    /// accounting.
+    Audit {
+        /// Input text file.
+        #[arg(long)]
+        input: PathBuf,
+        /// Path to the converted L3TC model binary.
+        #[arg(long, default_value = "checkpoints/l3tc_200k.bin")]
+        model: PathBuf,
+        /// Path to the SentencePiece tokenizer model.
+        #[arg(
+            long,
+            default_value = "../vendor/L3TC/dictionary/vocab_enwik8_bpe_16384_0.999/spm_enwik8_bpe_16384_0.999.model"
+        )]
+        tokenizer: PathBuf,
+        /// Segment length in bytes.
+        #[arg(long, default_value_t = DEFAULT_SEGMENT_BYTES)]
+        segment_bytes: usize,
+    },
     /// Print version information.
     Version,
 }
@@ -200,6 +223,12 @@ fn main() -> ExitCode {
             tokenizer,
             segment_bytes,
         } => run_entropy_bound(&input, &model, &tokenizer, segment_bytes),
+        Command::Audit {
+            input,
+            model,
+            tokenizer,
+            segment_bytes,
+        } => run_audit(&input, &model, &tokenizer, segment_bytes),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -465,6 +494,136 @@ fn run_entropy_bound(
     println!("total bits:         {:.2}", total_bits);
     println!("total_bin_size_min: {}", total_bytes_min as u64);
     println!("ratio:              {:.6}", ratio);
+    Ok(())
+}
+
+/// Phase 4b debug entry: print a per-source byte breakdown of the
+/// gap between actual coded bytes and the entropy bound. This is
+/// the measurement that drives the Phase 4b optimization work.
+fn run_audit(
+    input: &Path,
+    model_path: &Path,
+    tokenizer_path: &Path,
+    segment_bytes: usize,
+) -> Result<()> {
+    let model = load_model(model_path)?;
+    let tokenizer = Tokenizer::load(tokenizer_path)
+        .with_context(|| format!("loading tokenizer {tokenizer_path:?}"))?;
+
+    let text = std::fs::read_to_string(input)
+        .with_context(|| format!("reading input {input:?}"))?;
+
+    let stats: AuditStats = audit_compress(&text, &tokenizer, &model, segment_bytes)
+        .with_context(|| "audit_compress failed")?;
+
+    let total = stats.total_compressed_bytes();
+    let bound = stats.entropy_bound_bytes();
+    let overhead = stats.overhead_bytes();
+    let input_bytes = stats.input_bytes;
+
+    fn pct_of(n: u64, denom: u64) -> f64 {
+        if denom == 0 {
+            0.0
+        } else {
+            100.0 * n as f64 / denom as f64
+        }
+    }
+
+    println!("=== audit ===");
+    println!("input file:                  {}", input.display());
+    println!("input bytes:                 {input_bytes}");
+    println!("segment_bytes:               {segment_bytes}");
+    println!("segments:                    {}", stats.n_segments);
+    println!(
+        "  raw-fallback segments:     {}",
+        stats.n_raw_fallback_segments
+    );
+    println!("tokens (incl. BOS):          {}", stats.n_tokens);
+    println!("predict steps (encoded):     {}", stats.n_predict_steps);
+    println!();
+
+    println!("entropy bound:");
+    println!("  bits:                      {:.2}", stats.entropy_bits);
+    println!(
+        "  bytes (ceil bits/8):       {bound}     ({:.4}% of input)",
+        pct_of(bound, input_bytes)
+    );
+    println!(
+        "  avg bits/predict step:     {:.4}",
+        if stats.n_predict_steps == 0 {
+            0.0
+        } else {
+            stats.entropy_bits / stats.n_predict_steps as f64
+        }
+    );
+    println!();
+
+    println!("actual coded bytes:");
+    println!(
+        "  AC body bytes:             {:>10}     ({:.4}% of input)",
+        stats.ac_body_bytes, pct_of(stats.ac_body_bytes, input_bytes)
+    );
+    println!(
+        "  segment header bytes:      {:>10}     ({:.4}% of input, {:.2} bytes/segment avg)",
+        stats.segment_header_bytes,
+        pct_of(stats.segment_header_bytes, input_bytes),
+        if stats.n_segments == 0 {
+            0.0
+        } else {
+            stats.segment_header_bytes as f64 / stats.n_segments as f64
+        }
+    );
+    println!(
+        "  unk payload bytes:         {:>10}     ({:.4}% of input)",
+        stats.unk_payload_bytes, pct_of(stats.unk_payload_bytes, input_bytes)
+    );
+    println!(
+        "  raw-fallback bytes:        {:>10}     ({:.4}% of input)",
+        stats.raw_fallback_bytes, pct_of(stats.raw_fallback_bytes, input_bytes)
+    );
+    println!(
+        "  file header:               {:>10}",
+        stats.file_header_bytes
+    );
+    println!(
+        "  file trailer:              {:>10}",
+        stats.file_trailer_bytes
+    );
+    println!(
+        "  file CRC32:                {:>10}",
+        stats.file_crc_bytes
+    );
+    println!(
+        "  TOTAL:                     {total}     ({:.4}% of input)",
+        pct_of(total, input_bytes)
+    );
+    println!();
+
+    println!("overhead vs entropy bound:");
+    println!(
+        "  AC tail bytes (body - bound): {} bytes  (avg {:.2} bytes/segment)",
+        stats.ac_body_bytes as i64 - bound as i64,
+        if stats.n_segments == 0 {
+            0.0
+        } else {
+            (stats.ac_body_bytes as f64 - bound as f64) / stats.n_segments as f64
+        }
+    );
+    println!("  framing overhead:           {} bytes", overhead);
+    println!(
+        "  ratio actual / input:       {:.6}",
+        total as f64 / input_bytes.max(1) as f64
+    );
+    println!(
+        "  ratio entropy / input:      {:.6}",
+        bound as f64 / input_bytes.max(1) as f64
+    );
+    println!(
+        "  gap to entropy:             {:.4} pp ({} bytes)",
+        100.0 * (total as f64 - bound as f64) / input_bytes.max(1) as f64,
+        overhead
+    );
+
     Ok(())
 }
 

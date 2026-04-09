@@ -202,47 +202,78 @@ work, not phantom — it lives in the AC framing, segment headers,
 end-of-stream flush bits, and (to a tiny extent) freq
 quantization rounding.
 
-**Estimated overhead breakdown** (1 MB enwik6, segment 4096,
-244 segments):
+**Measured overhead breakdown** (Phase 4b1, `l3tc audit` on
+enwik6 at segment_bytes=4096, 1135 segments):
 
-| source | est bytes | notes |
-|---|---:|---|
-| AC end-of-stream flush per segment | ~3-4 KB | Nayuki AC needs ~96-128 bits per finish() |
-| Per-segment header (13 bytes each) | ~3.2 KB | n_tokens(4) + n_unks(4) + flags(1) + ac_len(4) |
-| Freq quantization vs continuous | ~few hundred B | floor/round to integer |
-| File header + trailer + CRC | 28 B | constant |
-| Unk payloads (Persian/Arabic) | ~1-2 KB | ZWNJ raw fallback segments |
-| **Subtotal estimated** | ~7-10 KB | |
-| **Unexplained remainder** | ~30 KB | needs profiling — likely AC startup + body bookkeeping |
+| source | bytes | % of overhead | notes |
+|---|---:|---:|---|
+| **Raw-fallback bytes** (Persian/Arabic ZWNJ) | **21,354** | **50.0%** | 355 segments × ~60 B raw payload |
+| **Segment header bytes** (13 + 2×unks) | **17,373** | **40.7%** | 1135 × 15.31 B avg |
+| **Unk payload bytes** | 3,813 | 8.9% | tokenizer outliers |
+| **AC body bytes vs entropy bound** | **143** | **0.3%** | the AC is essentially optimal |
+| File header/trailer/CRC | 28 | 0.07% | constant |
+| **Total overhead** | **42,711** | 100% | **4.27 pp above entropy bound** |
 
-The unexplained ~30 KB is the most interesting target. Phase 4b
-starts with **measurement**: instrument `compress` to print
-per-segment AC body bytes, total AC bytes, total framing bytes,
-total unk bytes. Then attack the largest item.
+**The biggest finding:** the arithmetic coder is doing its job
+almost perfectly. Only 143 bytes of overhead vs the entropy
+bound across 1135 segment finishes — 0.13 bytes per `enc.finish()`
+on average. The "3-4 KB AC tail flush" estimate from before was
+wildly wrong; Nayuki's coder is far tighter than expected.
 
-**Concrete approaches in rough effort order:**
+The unexplained ~30 KB turned out to be **half raw-fallback,
+half segment headers**:
 
-1. **Bigger segments.** Doubling segment_bytes from 4096 to 8192
-   halves the per-segment overhead at the cost of ~half the
-   segment-level parallelism. Already tested in Phase 2 — best
-   ratio at the time was 4096 because parallelism mattered more
-   than overhead. Worth retesting now that we've isolated
-   overhead as the bottleneck. Expected gain: 1-2 pp.
-2. **Tighter segment header.** 13 bytes per segment is generous.
-   Pack `(n_tokens, n_unks, flags, ac_len)` into varints; could
-   shrink to ~6 bytes per segment. Expected gain: 0.7 pp.
-3. **Single-segment AC stream for short files.** For files under
-   ~32 KB, skip segment-level parallelism entirely and use one
-   long AC stream — eliminates per-segment overhead completely.
-   Expected gain: ~3 pp on small files, ~0 on large.
-4. **Investigate the unexplained 30 KB.** Profile per-segment
-   AC body sizes vs theoretical entropy for the same tokens.
-   The delta is what we want to attack. May reveal structural
-   inefficiency in the AC encode loop or the freq table layout.
-5. **Hybrid classical fallback** (was in old 4b, still useful)
-   for OOD inputs where the LM produces ratio > 1.0. Doesn't
-   improve enwik6 but caps the worst case at zstd's ratio.
-   Bundled here as 4c polish.
+- **Raw-fallback (50%):** enwik6 has Persian/Arabic Wikipedia
+  links containing ZWNJ (U+200C). SPM normalizes these in a way
+  that breaks round-trip, so we route them through the
+  raw-fallback path which stores the bytes verbatim. 355 of 1135
+  segments are raw-fallback chunks of ~60 bytes each. Each
+  raw-fallback segment costs 13 + 4 + ~60 = 77 bytes for ~60
+  bytes of content (28% framing overhead per chunk).
+
+- **Segment headers (41%):** the fixed 13 bytes per segment
+  (n_tokens(4) + n_unks(4) + flags(1) + ac_len(4)) plus 2 bytes
+  per unk. With 1135 segments and an average of 1.15 unks per
+  segment, that's 15.31 bytes/segment.
+
+**Bigger segments help only marginally**, because raw-fallback
+segments aren't subdivided by `segment_bytes` — they're already
+at the minimum (`MIN_RAW_FALLBACK_BYTES = 64`). Going from
+segment_bytes 4096 → 16384 only saves ~2 KB (0.2 pp). The
+realistic levers are elsewhere.
+
+**Concrete approaches in measured-impact order** (numbers from
+Phase 4b1 audit on enwik6 at segment 4096):
+
+1. **Eliminate raw-fallback for ZWNJ** — biggest single win,
+   ~21 KB / 2.1 pp on enwik6, but requires tokenizer surgery.
+   The L3TC paper handles ZWNJ via the outlier-aware tokenizer
+   (unk path), not a separate raw-fallback. Routing ZWNJ through
+   the existing unk path would let the AC encode the structure
+   while only the byte payload gets stored externally. Expected
+   net win on enwik6: ~15-18 KB after accounting for the unk
+   payload increase. **Phase 4b3.**
+2. **Varint segment headers** — second biggest, ~9 KB / 0.9 pp,
+   pure mechanical work. Pack `(n_tokens, n_unks, flags, ac_len)`
+   into varints: typical values fit in 1-2 bytes each, dropping
+   the 13-byte fixed header to ~5 bytes. Bumps file format
+   v3 → v4. Zero speed cost. **Phase 4b1.**
+3. **Tighter raw-fallback framing** — small but easy, ~3 KB /
+   0.3 pp. The 4-byte `raw_len` becomes a 1-2 byte varint.
+   Saves ~3 bytes per raw-fallback segment × 355 segments.
+   Bundled with 4b1's varint format change. **Phase 4b1.**
+4. **Bigger segments** — smallest, ~2 KB / 0.2 pp. Cost is half
+   the segment-level parallelism, so probably not worth it given
+   how small the win is post-varint. Skip unless profiling shows
+   header overhead is still material after 4b1. **Maybe.**
+5. **Hybrid classical fallback** for OOD inputs (webster,
+   reymont, xml). Doesn't help enwik6 but caps the worst case
+   at zstd's ratio. **Phase 4b4 polish, when convenient.**
+
+**Expected end state of Phase 4b** (if 4b1 + 4b3 land):
+enwik6 actual coded ratio **0.2060 → ~0.181** (closing >55% of
+the gap to the entropy bound 0.1632). Phase 4 success criterion
+of ≤0.180 is in reach.
 
 **Speed budget for 4b:** still ≥99 KB/s on enwik6. None of the
 approaches above should cost throughput; bigger segments and

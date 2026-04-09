@@ -747,6 +747,159 @@ impl<W: Write> Write for CrcWriter<W> {
     }
 }
 
+/// Per-source byte breakdown returned by [`audit_compress`].
+///
+/// Used by the `l3tc audit` CLI subcommand to figure out where the
+/// gap between actual coded bytes and the theoretical entropy bound
+/// actually goes. Phase 4b debugging only — not part of the stable
+/// API.
+#[derive(Debug, Default, Clone)]
+pub struct AuditStats {
+    /// Original input size in bytes.
+    pub input_bytes: u64,
+    /// Number of segments produced by the tokenizer.
+    pub n_segments: u64,
+    /// Number of segments that took the raw-fallback path.
+    pub n_raw_fallback_segments: u64,
+    /// Total token count across all segments (including BOS per
+    /// segment).
+    pub n_tokens: u64,
+    /// Number of (current_token, next_token) pairs the AC actually
+    /// encodes — i.e. excludes the BOS that opens each segment.
+    pub n_predict_steps: u64,
+    /// Theoretical entropy lower bound in bits, computed from the
+    /// raw softmax. `entropy_bits / 8` is the floor of what any AC
+    /// could possibly achieve.
+    pub entropy_bits: f64,
+    /// Sum of arithmetic-encoded body bytes across all segments.
+    pub ac_body_bytes: u64,
+    /// Sum of segment-header bytes (the fixed 13-byte struct per
+    /// segment + 2 bytes per unk).
+    pub segment_header_bytes: u64,
+    /// Sum of unk payload bytes across all segments.
+    pub unk_payload_bytes: u64,
+    /// Sum of raw-fallback payload bytes across all segments.
+    pub raw_fallback_bytes: u64,
+    /// File-level header (magic + version + flags + reserved +
+    /// total_bytes + n_segments).
+    pub file_header_bytes: u64,
+    /// File-level trailer magic.
+    pub file_trailer_bytes: u64,
+    /// File-level CRC32 trailer (v3).
+    pub file_crc_bytes: u64,
+}
+
+impl AuditStats {
+    /// Total bytes the compressor would actually emit if we ran the
+    /// full pipeline.
+    pub fn total_compressed_bytes(&self) -> u64 {
+        self.file_header_bytes
+            + self.file_trailer_bytes
+            + self.file_crc_bytes
+            + self.segment_header_bytes
+            + self.ac_body_bytes
+            + self.unk_payload_bytes
+            + self.raw_fallback_bytes
+    }
+
+    /// Theoretical entropy floor in bytes (`ceil(entropy_bits / 8)`).
+    pub fn entropy_bound_bytes(&self) -> u64 {
+        (self.entropy_bits / 8.0).ceil() as u64
+    }
+
+    /// Bytes that the AC + framing pays beyond the entropy bound.
+    /// This is what Phase 4b is trying to drive down.
+    pub fn overhead_bytes(&self) -> i64 {
+        self.total_compressed_bytes() as i64 - self.entropy_bound_bytes() as i64
+    }
+}
+
+/// Phase 4b debug: compress `text` with the per-source byte
+/// breakdown filled in. Mirrors [`compress`] sequentially (no rayon)
+/// so the per-segment counters can accumulate cleanly.
+pub fn audit_compress(
+    text: &str,
+    tokenizer: &Tokenizer,
+    model: &Model,
+    segment_bytes: usize,
+) -> Result<AuditStats> {
+    let segments = tokenizer.encode_file(text, segment_bytes)?;
+    let mut stats = AuditStats {
+        input_bytes: text.len() as u64,
+        n_segments: segments.len() as u64,
+        file_header_bytes: HEADER_SIZE as u64,
+        file_trailer_bytes: TRAILER.len() as u64,
+        file_crc_bytes: 4,
+        ..Default::default()
+    };
+
+    let mut session = Session::new(model);
+    let mut scratch = CodecScratch::new(model.vocab_size);
+
+    for seg in &segments {
+        // Per-segment header bytes (matches `write_segment`):
+        //   n_tokens(4) + n_unks(4) + flags(1) + ac_len(4) = 13
+        //   plus per-unk:    unk_len(2) + payload          varies
+        //   plus raw-fallback: raw_len(4) + payload         varies
+        stats.segment_header_bytes += 13;
+        stats.segment_header_bytes += 2 * seg.unks.len() as u64;
+        for unk in &seg.unks {
+            stats.unk_payload_bytes += unk.len() as u64;
+        }
+        if seg.needs_raw_fallback {
+            stats.n_raw_fallback_segments += 1;
+            stats.segment_header_bytes += 4;
+            stats.raw_fallback_bytes += seg.raw.len() as u64;
+            stats.n_tokens += seg.tokens.len() as u64;
+            continue;
+        }
+
+        // Walk the segment, accumulating entropy + encoding into
+        // a fresh AC. We run both passes inline so we can compare
+        // per-segment AC bytes to per-segment entropy bits later
+        // if we want to.
+        session.reset();
+        let mut ac_bytes = Vec::with_capacity(seg.tokens.len());
+        {
+            let mut enc = ArithmeticEncoder::new(&mut ac_bytes);
+            for i in 1..seg.tokens.len() {
+                let prev = seg.tokens[i - 1];
+                let tok = seg.tokens[i];
+                let logits = session.forward(prev);
+
+                // Entropy: -log2(softmax_p[tok]) computed in f64.
+                let mut max = f32::NEG_INFINITY;
+                for &l in logits {
+                    if l > max {
+                        max = l;
+                    }
+                }
+                let mut sum = 0.0f64;
+                for &l in logits {
+                    sum += ((l - max) as f64).exp();
+                }
+                let target = (logits[tok as usize] - max) as f64;
+                let log_p = target - sum.ln();
+                stats.entropy_bits += -log_p / std::f64::consts::LN_2;
+                stats.n_predict_steps += 1;
+
+                logits_to_cum_freqs_scratch(
+                    logits,
+                    &mut scratch.cum,
+                    &mut scratch.exps,
+                    &mut scratch.freqs,
+                );
+                enc.encode_symbol(&scratch.cum, tok)?;
+            }
+            enc.finish()?;
+        }
+        stats.ac_body_bytes += ac_bytes.len() as u64;
+        stats.n_tokens += seg.tokens.len() as u64;
+    }
+
+    Ok(stats)
+}
+
 // -------- per-segment codec -------- //
 
 fn compress_segment(
