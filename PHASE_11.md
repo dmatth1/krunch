@@ -1,10 +1,73 @@
 # Phase 11 — Broader training corpus
 
 **Goal:** retrain at the same parameter count (200K) on a
-broader corpus than enwik8, measure the tradeoff (lose a little
-on enwik6, win substantially on everything else), and decide
-whether the broader model becomes the default or ships
-alongside the enwik-trained specialist.
+broader corpus than enwik8, with the speed and architecture
+held constant, and measure whether a single broader-trained
+model can fix the OOD cliff (webster, dickens, code, logs)
+without giving up the in-distribution ratio that is the entire
+reason anyone would reach for a learned compressor in the first
+place.
+
+## Hard constraints (do not relax these without an explicit re-plan)
+
+These five constraints define what Phase 11 actually is. If a
+proposal in this phase changes any of them, it's not Phase 11
+anymore — it's a different phase that should be planned and
+named separately.
+
+1. **Same architecture.** RWKV-v4 + HiRA, 2 layers × 96 hidden,
+   intermediate 96, rwkv_rank 4, vocab 16384. Don't touch the
+   model class. If we want to test v7, that's Phase 5; mixing
+   "v4 → v7" with "enwik8 → broader corpus" confounds two
+   variables in one experiment.
+
+2. **Same parameter count: 200K, fixed.** Don't grow it. If a
+   broader corpus doesn't fit at 200K, **that is a real finding
+   that points at Phase 5b (bigger model) as a separate
+   experiment** — it is not a license to bump the param count
+   inside Phase 11. The variable under test is the corpus, not
+   the capacity. Bumping params would also break constraint #4.
+
+3. **Broader corpus, pinned upfront.** The corpus composition
+   (which datasets, in what proportions, how deduplicated) is
+   pinned before training starts and recorded in
+   `docs/phase_11_findings.md`. Reproducibility matters more
+   than picking the optimal mix on the first try. See
+   [Corpus candidates](#corpus-candidates) for the starting
+   point (The Pile dedup subset).
+
+4. **Same speed target.** The new 200K checkpoint must run at
+   the same wall-clock speed as the current default tier
+   (~131 KB/s on enwik6 on M-series CPU, ±5%). Same parameter
+   count + same architecture means same FLOPs per token, so
+   same speed. **If the new model is meaningfully slower
+   something is wrong with the conversion or the runtime, not
+   with the training** — investigate before shipping.
+
+5. **In-distribution ratio is a hard floor — this is the
+   blocker constraint.** Ratio is the entire benefit l3tc-prod
+   offers over classical compressors. If we trade enwik6 ratio
+   for OOD coverage and the result is "mediocre everywhere,"
+   we have lost the only thing that justifies the speed cost
+   versus zstd / xz / bzip2.
+
+   **The hard floor: enwik6 actual coded ratio must remain
+   ≤ 0.20** (current is 0.1699; this is roughly a 17% relative
+   regression budget). At 0.20 we are still ~33% better than
+   zstd-22 (0.30) and ~29% better than bzip2-9 (0.28), which
+   is a comfortable margin and preserves the value prop. At
+   0.22 the value prop weakens to "marginal ratio winner";
+   at 0.25 we are roughly tied with bzip2 and the project no
+   longer beats classical on the metric we care about.
+
+   **If a Phase 11 candidate model exceeds the 0.20 floor on
+   enwik6, the phase fails and the model does not ship**, even
+   if the OOD numbers are excellent. The fallback in that
+   case is to either (a) re-tune the corpus mix to give
+   enwik more weight, or (b) accept that 200K cannot cover the
+   broader distribution at acceptable in-distribution ratio
+   and escalate to Phase 5b (bigger model) or Phase 8
+   (specialist dispatch).
 
 **Status:** decision gate for Phase 8. Logically independent of
 Phase 5 (v4 or v7 both work as the underlying architecture)
@@ -135,55 +198,142 @@ Listed in rough order from "safe incremental" to "big leap":
 
 ## Expected outcomes
 
-Predictions before running (so we can check our intuition
-afterward):
+Predictions before running, so we can check our intuition
+afterward and so the decision criteria above aren't a moving
+target:
 
-| corpus | enwik8-trained | broader-trained | delta |
-|---|---:|---:|---|
-| enwik6 | 0.1699 | ~0.180 | -0.01 pp (small regression) |
-| enwik8 | ~0.2166 | ~0.220 | -0.005 pp |
-| Canterbury | ~0.30 | ~0.25 | +0.05 pp (win) |
-| webster (current 1.26) | 1.2613 | ~0.35 | +0.91 pp (huge win) |
-| dickens (was raw-store) | 1.0000 | ~0.30 | +0.70 pp (huge win) |
-| logs | never measured | ~0.25 | n/a |
+| corpus | current 200K | predicted Phase 11 200K | hard floor | comment |
+|---|---:|---:|---:|---|
+| enwik6 | 0.1699 | ~0.180–0.190 | **0.20** | small regression expected; must stay under floor |
+| enwik8 | 0.1793 | ~0.190–0.200 | **0.21** | tracks enwik6 |
+| Silesia/webster | 1.2613 | ~0.30–0.40 | — | the big win we're hoping for |
+| Silesia/dickens | ~1.0 (raw-store) | ~0.25–0.35 | — | the big win we're hoping for |
+| code (~10 MB) | not measured | ~0.30–0.45 | — | new ground |
+| logs (~10 MB) | not measured | ~0.25–0.40 | — | new ground |
 
-If these predictions hold, the broader model is worse on
-Wikipedia but MUCH better on everything else. That's the
-tradeoff we'd want to understand before deciding the default.
+If these predictions hold, the broader model is slightly worse
+on Wikipedia (within the 0.20 floor) and dramatically better on
+everything else. That's the trade Phase 11 is buying.
 
-If the broader model doesn't meaningfully close the gap on
-webster/dickens/logs, then the problem isn't the corpus — it's
-the parameter count. 200K is small. In that case Phase 11
-produces a negative result pointing at Phase 5b (bigger model)
-or Phase 8 (specialist dispatch, because no single model can
-fit the distribution zoo at this parameter budget).
+**If the broader model doesn't meaningfully close the gap on
+webster / dickens / logs / code, the problem isn't the corpus
+— it's the parameter count.** 200K is small. In that case
+Phase 11 produces a negative result pointing at Phase 5b
+(bigger model at the broader corpus, separate experiment) or
+Phase 8 (specialist dispatch, because no single 200K can fit
+the distribution zoo). Either escalation is fine; what's not
+fine is using Phase 11 as cover to silently bump the param
+count.
+
+**If the broader model closes the OOD gap but breaks the
+in-distribution floor**, the same escalation logic applies.
+Phase 11 has answered the question "can a single 200K model
+cover everything?" and the answer is no. That is a useful
+result. Don't ship it as Phase 11.
 
 ---
 
 ## Success criteria
 
+Phase 11 ships only if **all** of the following are true. The
+hard-constraint floor in §"Hard constraints" is the gate; the
+matrix below is the ship condition.
+
+### Engineering gates
+
 - A new L3TC-200K checkpoint exists, trained on a broader
   corpus, converted to our Rust binary format, and loadable
   via the existing checkpoint reader
-- Bench result in `bench/results/phase11-broader-corpus.md`
-  with direct comparison against the enwik8-trained model on
-  every corpus in the suite
-- `docs/phase_11_findings.md` documents the corpus choice, the
-  tokenizer decision, the training hyperparameters, the
-  per-corpus ratio deltas, and the "default or opt-in" decision
-- If the broader model ships as an alternative, the CLI's
-  `--model` flag accepts the new model name
+- Wall-clock compress speed on enwik6 is within ±5% of the
+  current default tier (~131 KB/s on M-series). If it isn't,
+  investigate the runtime or conversion before debugging the
+  training
+- All 40+ Rust unit tests pass; no regression in the existing
+  200K default tier (which stays in the repo as the
+  in-distribution specialist)
+
+### Ratio matrix — the actual ship gate
+
+Run the Rust runtime's `entropy-bound` and full-compress paths
+on every corpus in the matrix and record both numbers:
+
+| corpus | current 200K | Phase 11 200K | hard floor | win threshold |
+|---|---:|---:|---:|---|
+| enwik6 (1 MB) | 0.1699 | ? | **≤ 0.20** | unchanged |
+| enwik8 (100 MB) | 0.1793 | ? | **≤ 0.21** | unchanged |
+| Canterbury (mixed) | not measured cleanly | ? | — | meaningfully better |
+| Silesia/dickens | ~1.0 (raw-store) | ? | — | ≤ 0.40 |
+| Silesia/webster | 1.2613 | ? | — | ≤ 0.40 |
+| Silesia/nci | TBD | ? | — | meaningfully better |
+| code sample (~10 MB real source) | not measured | ? | — | ≤ 0.45 |
+| log sample (~10 MB real logs) | not measured | ? | — | ≤ 0.40 |
+
+**Phase 11 ships if:**
+
+1. **The two hard floors hold:** enwik6 ≤ 0.20 AND enwik8 ≤ 0.21.
+   These are non-negotiable. If either is exceeded, Phase 11
+   fails regardless of how good the OOD numbers are.
+2. **The OOD numbers improve substantially.** "Substantially"
+   means: webster, dickens, code, and logs all hit ≤ 0.45 (vs
+   current ≥ 1.0 on the ones we've measured) AND the
+   *geometric mean of the eight rows* is at least 30% better
+   than the current model's geomean across the same corpora.
+3. The bench result is committed to
+   `bench/results/phase11-broader-corpus.md` with the full
+   table and the comparison against the current default.
+4. `docs/phase_11_findings.md` documents the corpus mix, the
+   tokenizer decision, the training hyperparameters, the
+   per-corpus ratio deltas, the speed measurement, and the
+   "default vs opt-in" decision.
+
+### Possible outcomes and what each means
+
+- **Both floors hold AND OOD wins land:** ship as the new
+  default. The current 200K model becomes a "enwik specialist"
+  opt-in tier (kept around for users who only compress
+  Wikipedia-style text and want the absolute best ratio there).
+  Phase 8 becomes unnecessary.
+- **Floors hold but OOD wins are weak:** ship as an opt-in
+  "broader" tier alongside the current default. The OOD problem
+  is partially fixed; Phase 8 (specialist dispatch) is still
+  on the table for the cases the broader model didn't cover.
+- **Floors break (enwik6 > 0.20 or enwik8 > 0.21):** Phase 11
+  fails. The 200K capacity floor is too tight to cover both
+  Wikipedia and the broader distribution at our ratio
+  requirements. Decision: escalate to Phase 5b (bigger model
+  at the broader corpus) or Phase 8 (specialist dispatch with
+  the current 200K as the enwik specialist + a different
+  broader model as the generalist). Don't ship anything from
+  Phase 11 in this case.
+- **OOD wins land but floors break by a small margin** (e.g.,
+  enwik6 lands at 0.205): re-tune the corpus mix to give
+  enwik more weight and re-train once. If two re-tunes don't
+  recover the floor, escalate as above.
 
 ## Non-goals
 
+- **Increasing the parameter count above 200K.** This is the
+  most tempting drift in the phase and the one that would
+  silently invalidate the experiment. If the 200K model can't
+  cover the broader corpus, that's a finding — escalate it as
+  a separate Phase 5b experiment (bigger model at the broader
+  corpus) instead of bumping params inside Phase 11. See
+  constraint #2 in §"Hard constraints".
+- **Changing the architecture** (adding layers, changing
+  hidden, switching to v7, etc.). All of those confound the
+  experiment with "did the corpus help or did the architecture
+  help?" Phase 5 owns architecture changes; Phase 11 owns
+  corpus changes; we run them separately so we can attribute
+  the wins.
+- **Sacrificing the in-distribution ratio floor** (enwik6
+  > 0.20 or enwik8 > 0.21) in pursuit of OOD wins. This is
+  the blocker constraint and it's non-negotiable inside this
+  phase. See constraint #5 in §"Hard constraints".
 - Training on proprietary customer data (that's the service
   vision, not this phase)
 - Retraining the tokenizer from scratch on the broader corpus
   (defer unless Phase 11's first attempt shows the enwik8
   tokenizer is the bottleneck)
-- Models larger than 200K (those are Phase 5b territory —
-  bigger model at the same corpus, not broader corpus at the
-  same size)
 - Multilingual specialization beyond "include multilingual in
   the mix" (that's Phase 8 specialist dispatch)
 - Distillation from a bigger model into the 200K (interesting
