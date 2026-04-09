@@ -1,4 +1,9 @@
-# Phase 2 — Improve ratio and push speed further
+# Phase 2 — Improve ratio and push speed further  ✅ COMPLETE
+
+**Final result:** 89 KB/s compress, ratio 0.2060 on enwik6. 6.9×
+faster than Python L3TC-200K. Ratio and speed improvements were
+modest (the big wins required deeper changes deferred to Phase 2.5).
+See `docs/phase_2_findings.md` for what we tried and what worked.
 
 **Starting point (from Phase 1):**
 
@@ -12,6 +17,15 @@
 1. **Ratio: close the gap to Python** (0.21 → 0.17 or better on enwik6)
 2. **Speed: push further** (85 KB/s → 150-200 KB/s stretch goal)
 3. **Full enwik8 measurement** to see how we scale on a real-sized corpus
+
+**Achieved:**
+
+1. Ratio 0.2094 → 0.2060 (−1.6 pp, didn't hit the 0.17 stretch — the
+   deeper changes required for that are in Phase 2.5)
+2. Speed 85 → 89 KB/s (+5%, didn't hit the 150-200 stretch — same
+   reason)
+3. 10 MB enwik8 subset: 88 KB/s at 0.2216 ratio, confirming speed
+   scales cleanly on larger inputs
 
 ## Where the ratio gap comes from
 

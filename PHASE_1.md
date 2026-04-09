@@ -1,4 +1,8 @@
-# Phase 1 — Rust rewrite of the inference runtime
+# Phase 1 — Rust rewrite of the inference runtime  ✅ COMPLETE
+
+**Final result:** 85 KB/s compress, 6.43× faster than Python
+L3TC-200K on enwik6. See commit `4234d07` ("Phase 1 COMPLETE")
+for details.
 
 **Goal:** Replace L3TC's Python + PyTorch inference with a Rust
 implementation that preserves compression ratio, produces a working
@@ -8,6 +12,9 @@ and runs meaningfully faster single-stream on CPU.
 **Target metric:** Take L3TC-200K on enwik6 from **13.24 KB/s to ≥55
 KB/s** on the same machine. Stretch goal: 100-200 KB/s. Same hardware,
 same model, same input.
+
+**Achieved:** 85 KB/s (1.55× the target) with byte-identical round
+trip on the full 1 MB enwik6 corpus.
 
 ---
 

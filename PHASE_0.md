@@ -1,4 +1,11 @@
-# Phase 0 — Reproduce L3TC with solid engineering foundations
+# Phase 0 — Reproduce L3TC with solid engineering foundations  ✅ COMPLETE
+
+**Final result:** reproduced L3TC-200K at 13.24 KB/s / ratio 0.1665 on
+enwik6, and L3TC-3.2M at 10.76 KB/s / ratio 0.1309 on enwik6. Key
+empirical finding: L3TC-3.2M runs only 1.23× slower than L3TC-200K
+despite having 11× more compute — meaning framework overhead is ~97%
+of runtime on the 200K model. This motivated the Phase 1 Rust rewrite.
+See `docs/phase_0_findings.md` for the full analysis.
 
 **Goal:** Establish a rigorous, reproducible baseline for the entire project.
 We need to know, with hard numbers on identical hardware, how L3TC actually
