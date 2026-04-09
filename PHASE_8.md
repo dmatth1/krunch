@@ -54,25 +54,55 @@ would cover 90% of real workloads.
    `--model auto` enables dispatch; `--model text` / `--model
    code` / etc. forces a specific specialist for benchmarking.
 
-5. **Fallback cascade.** If no specialist fits well (measured by
-   a quick entropy estimate on the first few hundred tokens),
-   fall through to the classical fallback that Phase 4c ships.
-   Never silently use a bad specialist — always pick `min(best
-   specialist, classical)`.
+5. **Classical fallback cascade.** The last tier of the
+   dispatcher. This is the work that was originally scoped for
+   Phase 4 but moved here because it naturally belongs with the
+   dispatch infrastructure. Specifically:
+   - Add `zstd-rs` as a dependency.
+   - New `FLAG_CLASSICAL_FALLBACK` header flag (similar in shape
+     to `FLAG_RAW_STORE`).
+   - At compress time, if no specialist fits well (measured by
+     a quick entropy estimate on the first few hundred tokens,
+     or by running the selected specialist against a zstd probe
+     on the first segment), fall through to zstd-19 and set the
+     flag.
+   - At decompress time, the flag selects the zstd decode path.
+   - CLI `--no-fallback` switch forces the pure LM path for
+     ratio research / reproducibility.
+   - Guarantee: `final_size = min(specialist_size, zstd_size)`.
+     l3tc-rust never produces output larger than zstd's best
+     effort. Webster's 1.26 tokenized ratio becomes ~0.21;
+     binary blobs stop needing the raw-store path; reymont / xml
+     stop crashing the encoder.
 
-## Why Phase 8 not Phase 5
+## Relationship to Phases 5 and 11
 
-Phase 5 is "train one broader model on a bigger corpus" — same
-architecture, same inference path, one file instead of several.
-Phase 8 is "train N specialists and dispatch". They're
-complementary: Phase 5 improves the fallback specialist; Phase 8
-adds the dispatch infrastructure and the other specialists.
+Three orthogonal levers on the model side:
+
+- **Phase 5:** architecture upgrade (RWKV-v4-HiRA → RWKV-v7),
+  same enwik8 corpus, same 200K params. Apples-to-apples
+  architecture test.
+- **Phase 11:** broader training corpus (enwik8 → The Pile /
+  RedPajama / domain mix), whatever architecture Phase 5
+  produced, same 200K params. Does one broader model cover
+  enough distributions to be the new default?
+- **Phase 8 (this phase):** ship *several* small models each
+  trained on a specific data family and dispatch per file at
+  inference time. Dispatch infrastructure + specialist roster.
+
+These compose cleanly: Phase 8 is only worth doing if Phase 11
+shows that a single broader model *can't* cover the
+distribution zoo at 200K params. If Phase 11's broader model
+is good enough everywhere, ship that instead and Phase 8
+reduces to "the classical fallback cascade" alone.
 
 Phase 8 is higher engineering complexity but higher upside
-because specialist models on homogeneous corpora hit ratios that
-a broader model can't touch (this is the reason the service
-vision works — custom-trained models per customer get
-dramatically better ratios than general-purpose ones).
+because specialist models on homogeneous corpora hit ratios
+that a single general model (of any size) can't touch. This
+is the same reason the storage service vision works —
+custom-trained per-customer models beat general-purpose models
+dramatically. Phase 8 is the single-binary version of that
+idea.
 
 ## Success criteria
 

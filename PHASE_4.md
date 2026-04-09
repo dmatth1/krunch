@@ -40,83 +40,29 @@ required to close it.** That's a Phase 5+ concern.
 Phase 4 is therefore organized as:
 
 - **4a — Implementation diff: find and fix the divergence(s).**
-  The headline work. Instrument both Python and Rust to dump
-  per-token state on the first ~1000 tokens of enwik6, find the
-  first place they disagree, fix it, repeat until ratio matches.
-- **4b — Hybrid fallback to a classical compressor.** Polish.
-  Stops l3tc-rust from ever producing output *larger* than its
-  input on out-of-distribution corpora (e.g. webster's 1.26
-  ratio). Days of work. Ship whenever convenient — does not
-  block 4a.
+  Instrument both Python and Rust to dump per-token state on the
+  first ~1000 tokens of enwik6, find the first place they
+  disagree, fix it, repeat until ratio matches. ✅ Shipped.
+- **4b — Close the gap from actual coded bytes to the entropy
+  bound.** Varint segment headers (4b1) + unk extraction
+  replacing raw-fallback (4b2). ✅ Shipped.
+- **4b-polish — enwik8 confirmation + `docs/phase_4b_findings.md`
+  writeup.** The final sanity check at 100 MB scale and the
+  writeup that closes the phase.
 
-**Backburner (NOT in Phase 4):**
-- RWKV-v7 architecture upgrade — moved to a future phase. The
-  current architecture can match Python L3TC; switching to v7 is
-  a separate "push past Python" goal that we'll consider after
-  4a closes the implementation gap.
-- Training on a broader corpus (The Pile / RedPajama) — Phase 5.
-- Bigger model variants (3.2M / 12M) — Phase 5b or later.
-
----
-
-## 4b — Hybrid fallback to a classical compressor (polish)
-
-**Why:** Phase 3's Silesia run uncovered the OOD failure mode in
-its loudest form: webster (a 41 MB English dictionary) compresses
-to **52 MB** through l3tc-rust's text path — 27% *larger* than
-the original. The L3TC-200K model is trained on enwik8 prose, so
-the dictionary's idiosyncratic format is wildly out of
-distribution; the AC needs more bits per token than raw bytes
-have. This isn't a bug — it's the fundamental tradeoff of
-model-based compression — but a "compressor" that makes files
-larger is a non-starter for any default workflow.
-
-Shipping with classical fallback gives a strict lower bound:
-`final_size = min(l3tc_size, classical_size)`. Worst case becomes
-"as good as zstd"; best case stays "best ratio in the suite".
-
-**Approach:**
-
-1. Add `zstd-rs` as a dependency (the de facto Rust binding for
-   the zstd C library; Apache-2.0; widely audited).
-2. New `compress_with_fallback(...)` path:
-   - Run the LM-based encoder.
-   - Run zstd at level 19 in parallel on the same input.
-   - Pick whichever output is smaller.
-   - Record which one was used in a new header flag bit
-     (`FLAG_CLASSICAL_FALLBACK`).
-3. Decoder branches on the flag: if set, decompress via zstd; if
-   clear, take the existing tokenized path.
-4. CLI gets a `--no-fallback` switch for users who want the pure
-   LM path (e.g. for ratio research or to reproduce old numbers).
-
-**Sub-tasks rolled in (UTF-8 robustness gaps from Phase 3):**
-
-The 4b work also fixes two related Silesia gaps:
-- **Bug A** "stray byte poisons whole file" (dickens — 8 stray
-  high bytes in 10 MB ASCII send the entire file to raw-store).
-  Fix: per-segment UTF-8 detection, with invalid-byte regions
-  routed through the existing `needs_raw_fallback` segment path
-  rather than escalating to whole-file raw-store.
-- **Bug B** "mid-stream UTF-8 failure crashes encode_reader"
-  (reymont, xml — first batch passes UTF-8 but later bytes fail,
-  encode errors out partway with a half-written output file).
-  Fix: catch the mid-stream error inside encode_reader and either
-  fall back to the classical-compressor path or restart in
-  raw-store mode. Should never crash.
-
-**Success criteria:**
-
-- l3tc-rust output is never larger than the input + 28 bytes
-  on any corpus we test (enwik6/8/9, all of Silesia, Canterbury,
-  binary blobs).
-- enwik6 ratio is unchanged (0.2061) — the LM path wins on text.
-- Webster: 1.2613 → ≤ zstd's ratio (~0.21).
-- Reymont/xml: encode_reader no longer crashes; either uses LM
-  path with per-segment fallback or classical fallback, never
-  both errors.
-- All 36 unit tests pass + a new "fallback never makes things
-  bigger" property test that runs on a fuzzed input.
+**Deferred out of Phase 4 (moved to other phases):**
+- **Hybrid classical fallback for OOD inputs** — moved to
+  Phase 8 (multi-model dispatch), where it naturally fits as the
+  last tier of the dispatch cascade. Phase 4 doesn't need it:
+  enwik6 / enwik8 both compress well under the LM path, and the
+  OOD failure mode is a structural question separate from the
+  ratio-gap-to-entropy-bound question that Phase 4 is about.
+- **RWKV-v7 architecture upgrade** — Phase 5.
+- **Training on a broader corpus** (The Pile / RedPajama /
+  domain mix) — Phase 11.
+- **Bigger model variants** (3.2M / 12M) — rejected for default
+  use per CLAUDE.md's speed floor; may appear as an opt-in
+  "max-ratio" mode in Phase 5b or later.
 
 ---
 

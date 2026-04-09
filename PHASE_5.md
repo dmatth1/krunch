@@ -1,134 +1,207 @@
-# Phase 5 — Train on a broader corpus, optionally a bigger model
+# Phase 5 — RWKV-v7 architecture upgrade (still enwik8)
 
-**Goal:** improve l3tc-rust's *generalization* — its ratio on
-inputs that are not enwik8-style English Wikipedia prose. Phase 4
-caps the OOD downside via a classical fallback; Phase 5 raises
-the LM ceiling so the LM wins on more inputs in the first place.
+**Goal:** replace the RWKV-v4-with-HiRA forward pass with RWKV-v7
+at the same ~200K parameter budget, retrained from scratch on
+enwik8. Target a measurable ratio improvement over the current
+v4-based entropy bound (0.1632 at segment 4096) without giving
+up speed.
 
-**Starting point (assumed end of Phase 4):**
-- enwik6 ratio ≤ 0.1715 (≈ Python L3TC-200K)
-- enwik8 ratio ≤ 0.18
-- 116 KB/s compress on enwik6, 110 KB/s on enwik8
-- Hybrid classical fallback default-on, OOD inputs never larger
-  than zstd-19's output
+**Starting point (end of Phase 4b2):**
+- enwik6 actual ratio **0.1699** at segment 4096
+- enwik6 entropy bound **0.1632**
+- 119 KB/s compress, 119 KB/s decompress
+- Gap to entropy bound 0.61 pp (86% closed)
+- RWKV-v4 200K + HiRA, trained on enwik8
+- Forward pass bit-identical to Python reference
+- File format v4 (varint segments, CRC32 trailer)
+- 34 unit tests + 4 end-to-end integration tests passing
 
----
+**Why v7 now.** The Phase 4 diff harness proved the ratio lives
+in the *model*, not the codec. Our AC body is within 3 bytes of
+the entropy bound — we can't squeeze more ratio out of the coder
+side. The remaining lever on enwik6 is "can the same 200K
+parameter budget predict next tokens more accurately with a
+better architecture". RWKV-v7 is the natural candidate:
 
-## Why broader training matters
+- ~3 years newer than RWKV-v4 with several rounds of published
+  improvements
+- Known wins on standard language-modeling benchmarks at
+  comparable parameter counts
+- Still linear-time / constant-memory per token (no
+  quadratic attention), so the speed profile doesn't blow up
+- Training infrastructure exists in the upstream RWKV repo and
+  is relatively approachable
 
-The L3TC paper trains on enwik8. Our reproduction inherits that.
-The result is that the model is excellent on Wikipedia prose
-(0.16-0.21 ratios) and poor on:
-- Structured English with custom formats (webster: 1.26 on the
-  pre-fallback tokenized path)
-- Source code (Silesia samba, ooffice, mozilla — these all need
-  to fall back to classical today)
-- Markup and structured data (XML, JSON, YAML)
-- Non-English text
-- Logs and machine-generated streams
-
-A single model trained on a broader, well-curated corpus can
-match the enwik8 ratio on Wikipedia *and* reach competitive
-ratios on these other inputs without changing the runtime cost.
-
----
-
-## 5a — Broader training corpus
-
-**Candidates:**
-
-1. **The Pile (deduplicated subset)** — 200 GB+, mixed-domain,
-   well-known reference. Includes Wikipedia, books, GitHub code,
-   StackExchange, ArXiv, web crawl, legal text, more. License is
-   research-friendly. Used by every major open LM training run
-   2020-2023.
-2. **CommonCrawl-Text** (cleaned + deduplicated) — broader web
-   coverage than Pile but messier. Useful for robustness, not as
-   careful as Pile for quality.
-3. **A bespoke domain mix** — e.g. 40% Wikipedia + 20% GitHub
-   code + 20% books + 10% logs + 10% markup. Optimized for
-   l3tc-rust's likely workloads. Cleanest, most work to assemble.
-
-**Recommendation:** start with The Pile for the first run because
-the data and tokenizer infrastructure already exist. Move to a
-bespoke mix if Pile proves too noisy or too biased toward web
-text.
-
-**Tasks:**
-
-1. Set up a data pipeline that yields shuffled text shards in
-   the format L3TC's training script expects.
-2. Train a fresh L3TC-200K-architecture model from scratch on
-   the new corpus. Same tokenizer (SentencePiece BPE 16384) so
-   our existing inference path keeps working without changes.
-3. Convert the new checkpoint via `scripts/convert_checkpoint.py`
-   and drop it next to the existing one.
-4. Run the full bench suite (enwik6/8/9, Canterbury, Silesia text
-   files, Silesia binaries via raw-store + classical fallback)
-   against both the old and new checkpoints. Commit a side-by-side
-   `bench/results/phase5-corpus-comparison.md`.
-5. Measure how many Silesia files now win against zstd directly
-   (without needing the fallback). The headline number is "fraction
-   of files where l3tc-rust beats zstd-19".
-
-**Compute estimate:** training a 200K-parameter RWKV on a few
-billion tokens of The Pile is small enough to run on a single
-A100 in ~24-72 hours, or distributed across cheaper GPUs over a
-few days. Substantially less than the original L3TC paper
-training cost.
-
-**Success criteria:**
-
-- enwik6 ratio is within 1 pp of Phase 4 (we're allowed to lose
-  a little on the in-distribution case for general competence)
-- enwik8 ratio is within 1 pp of Phase 4
-- Webster tokenized ratio drops from 1.26 to ≤ 0.30
-- l3tc-rust beats zstd-19 directly on at least 8 of 12 Silesia
-  files (currently it beats zstd on enwik6/8 only)
+Important scope constraint from the user in the Phase 4b planning
+discussion: **stick with enwik8 as the training corpus for now.**
+Broader corpora (The Pile, RedPajama, customer-specific) are a
+separate question, deferred to the generalization phases (Phase 8
+specialist dispatch, or a future broader-training phase if the
+need arises). Phase 5 is an apples-to-apples architecture
+comparison: same data, same parameter count, different forward
+pass.
 
 ---
 
-## 5b — Optional: bigger model variants
+## What "upgrading to v7" actually involves
 
-L3TC ships 200K, 800K, 3.2M, and 12M parameter models. The Phase
-0 finding showed 3.2M is only 1.23× slower than 200K *in
-Python*, but in our hand-rolled Rust runtime the slowdown is
-roughly linear in parameter count: 16× more compute → ~16× lower
-throughput, so L3TC-3.2M would land at ~7 KB/s and L3TC-12M at
-~2 KB/s. Way below the speed budget for default use.
+RWKV-v7 is a meaningfully different forward pass than v4. The
+specifics have to be read from the upstream repo and the v7
+paper, but at a high level the changes we'll encounter:
 
-**If we ever want to ship a "max ratio" mode**, the path is:
+1. **Different time-mix semantics.** v4's
+   `x * mix_k + state_x * (1 - mix_k)` becomes a more elaborate
+   recurrence with per-head learned mixing and data-dependent
+   decays. The Rust `time_mix` op gets replaced with whatever v7
+   specifies; our `src/rwkv.rs::time_mix` needs a full rewrite.
 
-1. Wire the Rust runtime to load the L3TC-3.2M checkpoint (the
-   converter already supports it).
-2. Add a CLI `--ratio-mode` flag that opts in to the bigger model.
-3. Document the speed cost up front.
-4. Use it as a research tool for measuring what ratio the
-   architecture *can* achieve, separately from what we ship by
-   default.
+2. **Data-dependent decay** (`w_t` in v6/v7). v4's time_decay is
+   a learned per-channel constant. v7 makes decay a function of
+   the current input, which means more matmuls per token and
+   tighter integration between state update and the current
+   input.
 
-**Not on the critical path.** Skip unless 5a leaves a real
-quality gap that scaling parameters would close.
+3. **Channel mixing changes.** v7's FFN path is different from
+   v4's — possibly squared-relu or GLU variants, different
+   linear shapes.
+
+4. **New state layout.** v4's `(state_a, state_b, state_p,
+   state_x, state_ffn)` shape is specific to v4. v7 will have
+   its own state shape per layer.
+
+5. **No HiRA.** L3TC's HiRA reparameterization is a v4-specific
+   trick. v7 has its own parameterization story; we'd either
+   skip HiRA entirely or port it, depending on what the training
+   script demands.
+
+The net effect: the forward pass in `src/rwkv.rs` is essentially
+rewritten. `src/tensor.rs` may need additional ops (new element-
+wise functions, possibly new matvec shapes). `src/checkpoint.rs`
+needs a new loader for v7-shaped weights. `scripts/convert_check
+point.py` needs to handle the v7 checkpoint format.
+
+Phase 4's diff harness (`l3tc dump-logits`, `scripts/dump_python
+_logits.py`, `scripts/diff_logits.py`) carries over directly —
+we re-use it to validate the v7 Rust forward pass against a
+Python v7 reference implementation the same way we validated v4.
+That's the biggest leverage point: we already have the
+verification tooling.
 
 ---
+
+## 5a — Train RWKV-v7-200K on enwik8
+
+Before any Rust work, we need a trained checkpoint to port.
+
+Tasks:
+
+1. Clone upstream RWKV-LM (or the v7 training fork, whichever
+   is the canonical source).
+2. Configure a 200K-parameter model — match the shape of the
+   current L3TC-200K as closely as possible (2 layers, 96 hidden,
+   SPM tokenizer with vocab 16384).
+3. Point it at enwik8 + the existing SPM tokenizer model
+   (`vendor/L3TC/dictionary/vocab_enwik8_bpe_16384_0.999/...`).
+4. Train from scratch for comparable compute to the original
+   L3TC-200K training run (~20 epochs, batch 32, seq 2048 — or
+   whatever the v7 training script recommends).
+5. Evaluate at each epoch: measure training cross-entropy, and
+   every few epochs run the PyTorch forward pass on enwik6 and
+   compute the entropy bound. We want the v7 entropy bound to be
+   measurably lower than v4's 0.1632 before we bother porting.
+
+**Checkpoint:** if after 20 epochs v7-200K's entropy bound isn't
+at least 0.5 pp better than v4 on enwik6, **stop the phase**.
+Architecture choice didn't help at this parameter count; no
+point porting. (This is a real risk — small models don't always
+benefit from the architectural improvements that help big ones.)
+
+**Compute estimate:** 2 layers × 96 hidden × 200K params is
+tiny. Training on enwik8 for 20 epochs probably takes a few
+hours on a single A10G / L4. Call it $20-50 of cloud compute.
+Cheap enough to not worry about.
+
+## 5b — Port the v7 forward pass to Rust
+
+Only starts if 5a shows a ratio improvement.
+
+Tasks:
+
+1. **Convert the v7 checkpoint** to our Rust binary format.
+   Extend `scripts/convert_checkpoint.py` with a v7 path. May
+   need new tensor types if v7 has weights we don't currently
+   handle.
+
+2. **Rewrite `src/rwkv.rs::time_mix`** to match v7's attention /
+   WKV recurrence. Unit-test against a tiny reference on known
+   inputs before hooking up the full pipeline.
+
+3. **Rewrite `channel_mix`** if it changed (it did in v6, likely
+   did in v7 too).
+
+4. **Add any missing tensor ops** to `src/tensor.rs` — anything
+   new that v7 needs (e.g., data-dependent sigmoid or squared-
+   relu variants we haven't used).
+
+5. **Update `src/rwkv.rs::LayerState`** to match the v7 state
+   shape.
+
+6. **Validate via the diff harness.** Run
+   `l3tc dump-logits` against a Python v7 reference dump. Max
+   L_inf should be in the 1e-5 range (f32 ULP). Fix any
+   divergence before moving on.
+
+7. **Re-measure entropy bound and actual coded ratio** on enwik6
+   and enwik8. Commit only if both improve without regressing
+   speed >15%.
+
+---
+
+## Why NOT do this now
+
+- Phase 4b2 got the v4 architecture within 0.61 pp of its
+  entropy bound. Further ratio improvement from architecture
+  (v7) is maybe 0.5-1 pp at this parameter count, which is
+  smaller than the ~3 pp we just won from Phase 4b. Diminishing
+  returns.
+- v7 port is a multi-week engineering lift (rewrite forward
+  pass, retrain, validate) for a modest ratio win.
+- The bigger structural problems (OOD, cross-platform
+  determinism, distribution) aren't addressed by v7. A v7 model
+  would still crash on webster and still be non-portable.
+- If the eventual direction is the storage service vision, the
+  training-side work converges with v7 naturally: we'd be
+  training per-customer models anyway. Phase 5 becomes "start
+  training on v7 when we ship the service".
+
+Phase 5 is on the roadmap because the ratio lever exists and is
+worth documenting; it's not the next thing to work on.
+
+---
+
+## Success criteria
+
+- RWKV-v7-200K trained on enwik8, checkpoint saved
+- Python reference reports entropy bound ≤ 0.158 on enwik6
+  (at least 0.5 pp better than v4's 0.1632)
+- Rust v7 forward pass bit-identical to Python v7 (max L_inf
+  < 1e-4 on first 256 tokens of enwik6)
+- enwik6 actual coded ratio ≤ 0.165 (closing most of the v7
+  entropy gap)
+- Compress speed ≥ 99 KB/s on enwik6 (speed floor from
+  CLAUDE.md)
+- All unit tests pass; new tests for the v7 forward pass
+- `docs/phase_5_findings.md` documents the architecture delta,
+  ratio delta, speed delta, and any gotchas
 
 ## Non-goals
 
-- Training a brand new architecture (RWKV-v6, Mamba, etc.) —
-  separate, much larger work.
-- Online learning or per-file adaptation — interesting but
-  Phase 7+ at the earliest.
-- Multilingual tokenizer — the existing SentencePiece BPE 16384
-  is English-biased; a multilingual rebuild is its own subproject.
-- Distillation from a bigger model into a 200K — only if Phase
-  5a doesn't move the numbers enough.
-
-## Success criteria (Phase 5 exit)
-
-Phase 5 is done when:
-- A new L3TC-200K checkpoint exists, trained on a broader corpus
-- l3tc-rust beats zstd-19 on ≥ 8 of 12 Silesia files
-- enwik6/8 ratios stay within 1 pp of Phase 4
-- Throughput unchanged (same architecture, same parameters)
-- `docs/phase_5_findings.md` summarizes the corpus + training
-  setup and the per-corpus ratio deltas
+- Broader training corpora (enwik8 only — out of scope for
+  Phase 5)
+- Multi-model dispatch (Phase 8)
+- RWKV-7 at non-200K sizes (optionally measure but don't ship
+  as default — the speed budget rules out 3.2M+)
+- Training infrastructure productization (Phase 5 is a one-time
+  training run for research, not a pipeline)
+- Porting other modern architectures (Mamba, xLSTM, RetNet) —
+  could be a Phase 5b if v7 disappoints
