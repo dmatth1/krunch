@@ -32,7 +32,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use l3tc::{
-    decompress, encode_reader, Checkpoint, Model, Tokenizer, DEFAULT_SEGMENT_BYTES,
+    decompress_bytes, encode_reader, Checkpoint, Model, Tokenizer, DEFAULT_SEGMENT_BYTES,
 };
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -216,12 +216,12 @@ fn run_compress(
         let vt0 = Instant::now();
         let compressed = std::fs::read(output)
             .with_context(|| format!("verify: reading {output:?}"))?;
-        let text = std::fs::read_to_string(input)
+        let original = std::fs::read(input)
             .with_context(|| format!("verify: reading {input:?}"))?;
-        let decompressed = decompress(&compressed, &tokenizer, &model)
+        let decompressed = decompress_bytes(&compressed, &tokenizer, &model)
             .with_context(|| "verify: decompression failed")?;
         let verify_dt = vt0.elapsed();
-        if decompressed != text {
+        if decompressed != original {
             return Err(anyhow::anyhow!(
                 "verify: decompressed output differs from input"
             ));
@@ -266,16 +266,16 @@ fn run_decompress(
     let tok_load_dt = t0.elapsed();
 
     let t0 = Instant::now();
-    let text = decompress(&compressed, &tokenizer, &model)
+    let payload = decompress_bytes(&compressed, &tokenizer, &model)
         .with_context(|| "decompression failed")?;
     let decompress_dt = t0.elapsed();
 
     let t0 = Instant::now();
-    std::fs::write(output, &text)
+    std::fs::write(output, &payload)
         .with_context(|| format!("writing output {output:?}"))?;
     let write_dt = t0.elapsed();
 
-    let output_bytes = text.len();
+    let output_bytes = payload.len();
     let decompress_kb_s = (output_bytes as f64 / 1024.0) / decompress_dt.as_secs_f64();
 
     println!(

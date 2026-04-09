@@ -128,6 +128,23 @@ const VERSION_V2_COMPAT: u8 = 2;
 /// how many segments it will produce.
 const N_SEGMENTS_IMPLICIT: u32 = u32::MAX;
 
+/// File-level flag bit: "this file is stored verbatim, not
+/// tokenized".
+///
+/// Set on the header `flags` byte when [`encode_reader`] detects
+/// that the input isn't valid UTF-8 (binary files, mixed-encoding
+/// text, arbitrary data). The tokenizer and model path are
+/// bypassed entirely; the payload between the header and trailer
+/// is the exact original byte sequence, and the compressed file is
+/// therefore slightly *larger* than the original (by the header
+/// overhead of ~14 bytes plus the 4-byte CRC).
+///
+/// This is graceful degradation: it means l3tc-rust will produce
+/// a valid, round-trippable output for any input bytes, not just
+/// UTF-8 text. Downstream callers can check this flag to decide
+/// whether the compressor was actually useful for their input.
+const FLAG_RAW_STORE: u8 = 0x01;
+
 /// Per-segment flag bit: "raw fallback bytes follow the unks".
 ///
 /// When the encoder detects that `sp.decode(tokens) != original`
@@ -200,7 +217,7 @@ pub fn compress(
     // Serialize the header + each segment + trailer. This is
     // sequential but trivial — just byte copies.
     let mut out = Vec::with_capacity(text.len() / 8);
-    write_header(&mut out, total_bytes, segments.len() as u32)?;
+    write_header(&mut out, total_bytes, segments.len() as u32, 0)?;
     for (seg, body) in segments.iter().zip(segment_bodies.iter()) {
         write_segment(&mut out, seg, body)?;
     }
@@ -219,6 +236,78 @@ pub fn compress(
 /// arithmetic-coded body), so segment-level parallelism gives a
 /// near-linear speedup in the number of segments up to the core
 /// count.
+/// Decompress into a `Vec<u8>`.
+///
+/// Works for both text (tokenized) and raw-store (binary) files —
+/// the latter is the whole point of this entry point, since
+/// [`decompress`] requires UTF-8 output. For raw-store files, the
+/// tokenizer and model arguments are ignored (the payload is
+/// returned verbatim).
+pub fn decompress_bytes(
+    bytes: &[u8],
+    tokenizer: &Tokenizer,
+    model: &Model,
+) -> Result<Vec<u8>> {
+    // Peek the CRC + version the same way `decompress` does.
+    if bytes.len() < 5 {
+        return Err(Error::BadCheckpoint("file too short".into()));
+    }
+    if &bytes[..4] != MAGIC {
+        return Err(Error::BadCheckpoint(format!("bad magic: {:?}", &bytes[..4])));
+    }
+    let version = bytes[4];
+    let body: &[u8] = match version {
+        VERSION => {
+            let (payload, crc_bytes) = bytes.split_at(bytes.len() - 4);
+            let stored = LittleEndian::read_u32(crc_bytes);
+            let computed = crc32fast::hash(payload);
+            if stored != computed {
+                return Err(Error::BadCheckpoint(format!(
+                    "CRC32 mismatch: stored {stored:08x}, computed {computed:08x}"
+                )));
+            }
+            payload
+        }
+        VERSION_V2_COMPAT => bytes,
+        v => {
+            return Err(Error::BadCheckpoint(format!(
+                "unsupported version: {v}"
+            )));
+        }
+    };
+
+    // Peek the flags byte (offset 5) to decide raw-store vs
+    // tokenized path without running the full read_header parser.
+    let flags = body[5];
+    if flags & FLAG_RAW_STORE != 0 {
+        if body.len() < HEADER_SIZE + TRAILER.len() {
+            return Err(Error::BadCheckpoint(
+                "raw-store file truncated below minimum framing".into(),
+            ));
+        }
+        let raw_end = body.len() - TRAILER.len();
+        let raw = &body[HEADER_SIZE..raw_end];
+        let trailer_seen = &body[raw_end..];
+        if trailer_seen != TRAILER {
+            return Err(Error::BadCheckpoint(format!(
+                "bad trailer in raw-store file: {trailer_seen:?}"
+            )));
+        }
+        return Ok(raw.to_vec());
+    }
+
+    // Tokenized path: fall back to the UTF-8 decompress and
+    // re-convert. Cheap because the model/tokenizer work dominates.
+    let text = decompress(bytes, tokenizer, model)?;
+    Ok(text.into_bytes())
+}
+
+/// Decompress a blob produced by [`compress`] or [`encode_reader`]
+/// back to text.
+///
+/// Requires the output to be valid UTF-8. Use [`decompress_bytes`]
+/// for arbitrary-byte inputs (raw-store files produced from
+/// binary data).
 pub fn decompress(bytes: &[u8], tokenizer: &Tokenizer, model: &Model) -> Result<String> {
     use rayon::prelude::*;
 
@@ -256,7 +345,31 @@ pub fn decompress(bytes: &[u8], tokenizer: &Tokenizer, model: &Model) -> Result<
     };
 
     let mut cursor = std::io::Cursor::new(body);
-    let (total_bytes, n_segments) = read_header(&mut cursor)?;
+    let (total_bytes, n_segments, flags) = read_header(&mut cursor)?;
+
+    // Raw-store mode: the payload between header and trailer is
+    // the exact original bytes. Validate the trailer and return
+    // them (as a String, requiring UTF-8 — callers that need
+    // arbitrary bytes should use `decompress_bytes`).
+    if flags & FLAG_RAW_STORE != 0 {
+        // Body layout: header | raw | trailer. Raw length is
+        // body.len() - HEADER_SIZE - TRAILER.len().
+        if body.len() < HEADER_SIZE + TRAILER.len() {
+            return Err(Error::BadCheckpoint(
+                "raw-store file truncated below minimum framing".into(),
+            ));
+        }
+        let raw_end = body.len() - TRAILER.len();
+        let raw = &body[HEADER_SIZE..raw_end];
+        let trailer_seen = &body[raw_end..];
+        if trailer_seen != TRAILER {
+            return Err(Error::BadCheckpoint(format!(
+                "bad trailer in raw-store file: {trailer_seen:?}"
+            )));
+        }
+        return String::from_utf8(raw.to_vec())
+            .map_err(|e| Error::BadCheckpoint(format!("raw-store body is not utf-8: {e}")));
+    }
 
     // First pass: read all segment metadata + bodies sequentially.
     // This is I/O bound and very cheap (just byte copies).
@@ -355,13 +468,6 @@ pub fn encode_reader<R: Read, W: Write>(
     // bytes once and update the hash in step.
     let mut dst = CrcWriter::new(dst);
 
-    // --- Header with implicit segment count ---
-    // total_bytes is unknown until the stream ends; we write 0 as a
-    // placeholder. Consumers that need the exact count can derive
-    // it from the reconstructed output. The CLI's --time path
-    // doesn't rely on this field.
-    write_header(&mut dst, 0, N_SEGMENTS_IMPLICIT)?;
-
     // Byte accumulator straddling batch boundaries. We only split
     // on '\n' so the carry holds the tail of the current read that
     // didn't end on a newline.
@@ -370,9 +476,63 @@ pub fn encode_reader<R: Read, W: Write>(
     let mut total_in: u64 = 0;
     let mut eof = false;
 
-    while !eof {
+    // Fill the first batch before deciding text vs raw-store mode.
+    while carry.len() < BATCH_BYTES {
+        let n = src.read(&mut read_buf).map_err(Error::Io)?;
+        if n == 0 {
+            eof = true;
+            break;
+        }
+        carry.extend_from_slice(&read_buf[..n]);
+    }
+
+    // Probe the first batch for UTF-8 validity. If the batch is
+    // valid UTF-8, or it only ends mid-codepoint (a legal situation
+    // when the split happens inside a multi-byte char), we use the
+    // text path. Otherwise we fall back to raw-store mode.
+    let utf8_ok = match std::str::from_utf8(&carry) {
+        Ok(_) => true,
+        Err(e) => {
+            // Incomplete final codepoint is fine — the carry boundary
+            // will move when we read more. Real invalid bytes mean
+            // the input isn't text at all.
+            e.error_len().is_none()
+                && std::str::from_utf8(&carry[..e.valid_up_to()]).is_ok()
+        }
+    };
+
+    if !utf8_ok {
+        // --- Raw-store mode: stream bytes verbatim. ---
+        write_header(&mut dst, 0, 0, FLAG_RAW_STORE)?;
+        // Flush the already-buffered first batch.
+        dst.write_all(&carry).map_err(Error::Io)?;
+        total_in += carry.len() as u64;
+        // Pipe the rest of src straight through.
+        loop {
+            let n = src.read(&mut read_buf).map_err(Error::Io)?;
+            if n == 0 {
+                break;
+            }
+            dst.write_all(&read_buf[..n]).map_err(Error::Io)?;
+            total_in += n as u64;
+        }
+        write_trailer(&mut dst)?;
+        let (mut inner, crc) = dst.finish();
+        inner.write_u32::<LittleEndian>(crc).map_err(Error::Io)?;
+        return Ok(total_in);
+    }
+
+    // --- Text path: implicit-count streaming segments. ---
+    //
+    // total_bytes is unknown until the stream ends; we write 0 as a
+    // placeholder. Consumers that need the exact count can derive
+    // it from the reconstructed output. The CLI's --time path
+    // doesn't rely on this field.
+    write_header(&mut dst, 0, N_SEGMENTS_IMPLICIT, 0)?;
+
+    while !eof || !carry.is_empty() {
         // Fill carry to BATCH_BYTES (or until EOF).
-        while carry.len() < BATCH_BYTES {
+        while carry.len() < BATCH_BYTES && !eof {
             let n = src.read(&mut read_buf).map_err(Error::Io)?;
             if n == 0 {
                 eof = true;
@@ -785,17 +945,22 @@ fn uniform_fallback(n: usize, cum: &mut [u64]) {
 
 // -------- header / trailer I/O -------- //
 
-fn write_header<W: Write>(w: &mut W, total_bytes: u64, n_segments: u32) -> Result<()> {
+fn write_header<W: Write>(
+    w: &mut W,
+    total_bytes: u64,
+    n_segments: u32,
+    flags: u8,
+) -> Result<()> {
     w.write_all(MAGIC)?;
     w.write_u8(VERSION)?;
-    w.write_u8(0)?; // flags
+    w.write_u8(flags)?;
     w.write_u16::<LittleEndian>(0)?; // reserved
     w.write_u64::<LittleEndian>(total_bytes)?;
     w.write_u32::<LittleEndian>(n_segments)?;
     Ok(())
 }
 
-fn read_header<R: Read>(r: &mut R) -> Result<(u64, u32)> {
+fn read_header<R: Read>(r: &mut R) -> Result<(u64, u32, u8)> {
     let mut magic = [0u8; 4];
     r.read_exact(&mut magic)?;
     if &magic != MAGIC {
@@ -807,12 +972,16 @@ fn read_header<R: Read>(r: &mut R) -> Result<(u64, u32)> {
             "unsupported version: {version}"
         )));
     }
-    let _flags = r.read_u8()?;
+    let flags = r.read_u8()?;
     let _reserved = r.read_u16::<LittleEndian>()?;
     let total_bytes = r.read_u64::<LittleEndian>()?;
     let n_segments = r.read_u32::<LittleEndian>()?;
-    Ok((total_bytes, n_segments))
+    Ok((total_bytes, n_segments, flags))
 }
+
+/// Fixed size of the on-disk header, used by the decoder to
+/// locate the raw payload range for `FLAG_RAW_STORE` files.
+const HEADER_SIZE: usize = 4 + 1 + 1 + 2 + 8 + 4;
 
 /// Per-segment data read back from a compressed file.
 struct SegmentRead {
