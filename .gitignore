@@ -51,3 +51,5 @@ l3tc-rust/checkpoints/*.bin
 # scripts/distill_l3tc.py from the shipped L3TC checkpoint.
 # Regeneratable via the script, not worth storing in git.
 l3tc-rust/checkpoints/*_distilled.pth
+l3tc-rust/checkpoints/*_distilled.epoch*.pth
+l3tc-rust/checkpoints/l3tc_1l96h.bin

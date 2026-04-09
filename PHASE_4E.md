@@ -1,10 +1,15 @@
 # Phase 4e — Distillation for compression speed
 
-**Status:** In progress. Phase 4d delivered L3TC-3.2M as an
+**Status:** Closed (failed). Phase 4d delivered L3TC-3.2M as an
 opt-in "max ratio" tier (0.1337 ratio, 25.95 KB/s on enwik6).
-Phase 4e is the speed-oriented follow-on: **train a smaller
+Phase 4e was the speed-oriented follow-on: **train a smaller
 student architecture via distillation from the 3.2M teacher so
 we ship a faster default while keeping ratio acceptable**.
+The 4e3 experiment ran end-to-end cleanly but missed both
+targets (0.2871 ratio at 1.12× speedup vs the ≤0.195 / ≥2×
+bar). See [`docs/phase_4e_findings.md`](docs/phase_4e_findings.md)
+for the full writeup. The 200K stays as default, 3.2M as
+opt-in, and the project moves on to Phase 5/6/7 tooling work.
 
 **Goal:** produce a new default checkpoint that compresses
 **≥ 2× faster than L3TC-200K** (≥ 260 KB/s on enwik6) with a

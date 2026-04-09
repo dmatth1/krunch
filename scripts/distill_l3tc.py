@@ -146,11 +146,13 @@ def _run_cuda_cpu(B, T, C, w, u, k, v):
 # Monkey-patch L3TC's training module to use the CPU WKV.
 _rwkv_train_mod.RUN_CUDA = _run_cuda_cpu
 
-# L3TC-200K shape constants (from vendor/L3TC/config/l3tc/l3tc_200k.py)
-HIDDEN_SIZE = 96
-NUM_LAYERS = 2
-INTERMEDIATE_SIZE = 96
-RWKV_RANK = 4
+# Default student shape constants (L3TC-200K from
+# vendor/L3TC/config/l3tc/l3tc_200k.py). Override per run via CLI
+# flags for Phase 4e3 smaller-student experiments.
+DEFAULT_HIDDEN_SIZE = 96
+DEFAULT_NUM_LAYERS = 2
+DEFAULT_INTERMEDIATE_SIZE = 96
+DEFAULT_RWKV_RANK = 4
 VOCAB_SIZE = 16384
 CTX_LEN = 2048
 BOS_ID = 2
@@ -221,35 +223,57 @@ def load_teacher_dump(
 
 
 def load_student(
-    init_checkpoint: Path,
+    init_checkpoint: Path | None,
+    hidden_size: int,
+    num_layers: int,
+    intermediate_size: int,
+    rwkv_rank: int,
     device: torch.device,
 ) -> nn.Module:
-    """Instantiate the L3TC-200K training model and load the
-    shipped checkpoint into it."""
+    """Instantiate the student training model.
+
+    If `init_checkpoint` is provided, load weights from it (for
+    same-shape fine-tuning). Otherwise random-init — the Phase 4e3
+    path, where the student layer count differs from any shipped
+    checkpoint.
+    """
+    print(
+        f"building student: layers={num_layers} hidden={hidden_size} "
+        f"intermediate={intermediate_size} rank={rwkv_rank}"
+    )
     model = RWKV_TC_HIRA(
         vocab_size=VOCAB_SIZE,
-        hidden_size=HIDDEN_SIZE,
-        num_hidden_layers=NUM_LAYERS,
-        intermediate_size=INTERMEDIATE_SIZE,
-        rwkv_rank=RWKV_RANK,
+        hidden_size=hidden_size,
+        num_hidden_layers=num_layers,
+        intermediate_size=intermediate_size,
+        rwkv_rank=rwkv_rank,
         ctx_len=CTX_LEN,
         dropout_prob=0.0,
     )
-    print(f"loading student init: {init_checkpoint}")
-    raw = torch.load(init_checkpoint, map_location="cpu", weights_only=False)
-    sd = raw.get("model", raw)
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"  student params: {n_params:,}")
 
-    # Strip DDP prefix if present
-    cleaned = OrderedDict()
-    for k, v in sd.items():
-        cleaned[k[len("module.") :] if k.startswith("module.") else k] = v
+    if init_checkpoint is not None:
+        print(f"loading student init: {init_checkpoint}")
+        raw = torch.load(init_checkpoint, map_location="cpu", weights_only=False)
+        sd = raw.get("model", raw)
 
-    load_out = model.load_state_dict(cleaned, strict=False)
-    print(f"  load result: missing={len(load_out.missing_keys)}, unexpected={len(load_out.unexpected_keys)}")
-    if load_out.missing_keys:
-        print(f"  missing sample: {load_out.missing_keys[:5]}")
-    if load_out.unexpected_keys:
-        print(f"  unexpected sample: {load_out.unexpected_keys[:5]}")
+        # Strip DDP prefix if present
+        cleaned = OrderedDict()
+        for k, v in sd.items():
+            cleaned[k[len("module.") :] if k.startswith("module.") else k] = v
+
+        load_out = model.load_state_dict(cleaned, strict=False)
+        print(
+            f"  load result: missing={len(load_out.missing_keys)}, "
+            f"unexpected={len(load_out.unexpected_keys)}"
+        )
+        if load_out.missing_keys:
+            print(f"  missing sample: {load_out.missing_keys[:5]}")
+        if load_out.unexpected_keys:
+            print(f"  unexpected sample: {load_out.unexpected_keys[:5]}")
+    else:
+        print("  random init (no --init-checkpoint)")
 
     model = model.to(device)
     model.train()
@@ -374,7 +398,14 @@ def train(args: argparse.Namespace) -> None:
     aligned = segments_to_tensors(teacher_segments, max_segments=args.max_segments)
 
     # --- student init ---
-    student = load_student(args.init_checkpoint, device)
+    student = load_student(
+        args.init_checkpoint,
+        hidden_size=args.hidden_size,
+        num_layers=args.num_layers,
+        intermediate_size=args.intermediate_size,
+        rwkv_rank=args.rwkv_rank,
+        device=device,
+    )
     optimizer = torch.optim.Adam(
         student.parameters(), lr=args.lr, betas=(0.9, 0.99), eps=1e-8
     )
@@ -438,8 +469,13 @@ def train(args: argparse.Namespace) -> None:
             f"wall={time.time() - t0:.1f}s"
         )
 
-    # --- save fine-tuned checkpoint ---
-    print(f"saving fine-tuned checkpoint: {args.output}")
+        # Save a per-epoch checkpoint so we can pick the best later.
+        epoch_out = args.output.with_suffix(f".epoch{epoch}.pth")
+        print(f"  saving epoch checkpoint: {epoch_out}")
+        torch.save({"model": student.state_dict()}, epoch_out)
+
+    # --- save final checkpoint ---
+    print(f"saving final checkpoint: {args.output}")
     save_state = {"model": student.state_dict()}
     torch.save(save_state, args.output)
     print("done")
@@ -448,22 +484,34 @@ def train(args: argparse.Namespace) -> None:
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--teacher-dump", type=Path, required=True)
-    p.add_argument("--init-checkpoint", type=Path, required=True)
+    p.add_argument(
+        "--init-checkpoint",
+        type=Path,
+        default=None,
+        help="Optional same-shape .pth to warm-start from. Omit for "
+        "random init (Phase 4e3 smaller-student path).",
+    )
     p.add_argument("--output", type=Path, required=True)
     p.add_argument(
         "--max-segments",
         type=int,
         default=None,
-        help="Cap the number of training segments (for debug runs). "
-        "Does not truncate the input text — the text must be the "
-        "same one the teacher dump was produced from, for alignment.",
+        help="Cap the number of training segments (for debug runs).",
     )
+    # Student architecture — default to L3TC-200K shape.
+    p.add_argument("--num-layers", type=int, default=DEFAULT_NUM_LAYERS)
+    p.add_argument("--hidden-size", type=int, default=DEFAULT_HIDDEN_SIZE)
+    p.add_argument(
+        "--intermediate-size", type=int, default=DEFAULT_INTERMEDIATE_SIZE
+    )
+    p.add_argument("--rwkv-rank", type=int, default=DEFAULT_RWKV_RANK)
     p.add_argument("--segment-bytes", type=int, default=2048)
     p.add_argument("--epochs", type=int, default=2)
     p.add_argument("--batch-size", type=int, default=1)
-    p.add_argument("--lr", type=float, default=1e-5)
-    p.add_argument("--temperature", type=float, default=2.0)
-    p.add_argument("--alpha", type=float, default=0.7)
+    # Defaults tuned for Phase 4e3 from-scratch 1-layer distillation.
+    p.add_argument("--lr", type=float, default=2e-4)
+    p.add_argument("--temperature", type=float, default=1.5)
+    p.add_argument("--alpha", type=float, default=0.5)
     p.add_argument("--device", type=str, default="cpu")
     args = p.parse_args()
     train(args)

@@ -9,14 +9,24 @@ use.
 
 ## Status
 
-**Phase 4 nearly complete.** enwik6 actual coded ratio
-**0.1699** at **119 KB/s compress** — 86% of the gap to the
-theoretical entropy lower bound closed, forward pass
-bit-identical to Python L3TC. Remaining Phase 4 polish is an
-enwik8 confirmation run and the findings writeup; the hybrid
-classical fallback originally scoped for Phase 4 has been moved
-to Phase 8. The project's two goals in
-[`CLAUDE.md`](CLAUDE.md) have both been met on the enwik corpus.
+**Phase 4 complete; moving to Phase 5/6/7 (tooling + release).**
+Default tier: enwik6 actual coded ratio **0.1699** at **~131
+KB/s compress** (Phase 4c NEON polish). Opt-in high-ratio tier:
+L3TC-3.2M at **0.1337 ratio, 25.95 KB/s** (Phase 4d port, beats
+Python L3TC-3.2M's reported entropy bound 0.1309 at 0.1275).
+Forward pass bit-identical to Python L3TC; 86% of the 200K
+entropy-bound gap closed. Phase 4e (distillation for speed)
+was explored and closed as failed: the 1-layer 96-hidden
+student experiment cleared the pipeline end-to-end but missed
+both targets (0.2871 ratio at 1.12× speedup, not ≤0.195 at
+≥2×) — the structural speed ceiling at vocab 16384 × hidden 96
+turned out to be layer-independent. See
+[`docs/phase_4e_findings.md`](docs/phase_4e_findings.md). The
+hybrid classical fallback originally scoped for Phase 4 was
+moved to Phase 8. The project's two goals in
+[`CLAUDE.md`](CLAUDE.md) remain met on the enwik corpus and the
+focus shifts to turning the runtime into a shippable open
+source tool.
 
 - ✅ **Phase 0 — Reproduce L3TC with solid engineering foundations.**
   Built a Python benchmark harness, reproduced L3TC-200K and L3TC-3.2M on
@@ -58,9 +68,36 @@ to Phase 8. The project's two goals in
   enwik6 actual coded ratio **0.1699 at 119 KB/s** — 86% of the
   gap to the entropy bound closed, speed budget intact, 0 raw-
   fallback segments remaining on enwik6.
-- 🚧 **Phase 4 remaining polish:** enwik8 confirmation run +
-  `docs/phase_4b_findings.md` writeup. Hybrid classical fallback
-  moved to Phase 8.
+- ✅ **Phase 4b enwik8 confirmation.** 100 MB round trip at
+  ratio **0.1793**, **113.77 KB/s compress**, 113.13 KB/s
+  decompress. Phase 4b wins generalize to 100× scale. See
+  [`docs/phase_4b_findings.md`](docs/phase_4b_findings.md).
+- ✅ **Phase 4c — CPU speed polish.** NEON `exp_f32x4`,
+  FFN K/V matvecs on the NEON 96×96 kernel, and NEON
+  `quantize_exps_to_freqs`. +7% compress / +8% decompress over
+  4b2 → **126.8 / 128.2 KB/s** at unchanged ratio. Added
+  `profile` / `audit` / `entropy-bound` debug subcommands.
+- ✅ **Phase 4d — L3TC-3.2M port (opt-in tier).** Runtime made
+  dimension-agnostic (per-block `intermediate_size`), 3.2M
+  checkpoint loads end-to-end. Entropy bound **0.1275** (0.34 pp
+  better than Python's 0.1309), actual ratio **0.1337** at
+  **25.95 KB/s compress** — 2.4× faster than the Python 3.2M
+  reference, 5× slower than our 200K. Ships as an opt-in
+  high-ratio tier alongside 200K default. See
+  [`docs/phase_4d_findings.md`](docs/phase_4d_findings.md).
+- ❌ **Phase 4e — Distillation for compression speed (closed,
+  failed).** Built the full pipeline: `dump-teacher` CLI + v2
+  format + rayon-parallelized top-K softmax dumps,
+  `scripts/distill_l3tc.py` PyTorch training loop with
+  pure-PyTorch WKV monkey-patch for MPS/CPU. Ran 4e3: 1-layer
+  96-hidden student distilled from the 3.2M teacher on the
+  first 5 MB of enwik8, 2 epochs on MPS. Result: **ratio
+  0.2871 at 146 KB/s** — missed both decision criteria. The
+  structural ceiling: `cum_freqs` and the head matvec both
+  scale with vocab (16384), not with layers, so halving the
+  layer count only yielded 1.12× speedup, not 2×. The 200K
+  stays as default, the 3.2M stays as opt-in. See
+  [`docs/phase_4e_findings.md`](docs/phase_4e_findings.md).
 - ⏳ **Phase 5 — RWKV-v7 architecture upgrade (still enwik8).**
   Replace RWKV-v4-HiRA with RWKV-v7 at the same 200K parameter
   budget, same training corpus. Apples-to-apples architecture
@@ -108,7 +145,7 @@ decision log (including what we tried and reversed). See
 
 | Compressor | Ratio | Compress MB/s | Decompress MB/s |
 |---|---:|---:|---:|
-| **l3tc-rust 200K (default)** | **0.1699** | **0.131** | **0.132** |
+| **l3tc-rust 200K (default, Phase 4c)** | **0.1699** | **0.131** | **0.132** |
 | **l3tc-rust 3.2M (opt-in, Phase 4d)** | **0.1337** | **0.026** | **0.023** |
 | Python L3TC-200K (entropy bound) | 0.1665 | 0.013 | — |
 | Python L3TC-3.2M (entropy bound) | 0.1309 | 0.011 | — |
@@ -159,7 +196,9 @@ release builds) are the remaining distribution blockers; Phases
 | Phase 2.5 end | 0.2060 | 116 | NEON blocks + INT8 head |
 | Phase 4a end | 0.2060 | 117 | forward pass parity with Python |
 | Phase 4b1 | 0.1947 | 114 | file format v4 (varint segments) |
-| **Phase 4b2** | **0.1699** | **119** | **unk extraction + parallel tokenize** |
+| Phase 4b2 | 0.1699 | 119 | unk extraction + parallel tokenize |
+| **Phase 4c** | **0.1699** | **126.8** | **NEON exp + FFN KV matvec + NEON quantize** |
+| Phase 4d (opt-in 3.2M) | 0.1337 | 25.95 | L3TC-3.2M port, dimension-agnostic runtime |
 
 ## Why this project exists
 
@@ -190,8 +229,11 @@ l3tc-prod/
 ├── ANALYSIS.md            original project thinking document
 ├── DECISIONS.md           architectural decision log
 ├── PHASE_0.md .. PHASE_11.md
-│                          per-phase plans (0-4 done or nearly;
-│                          5-11 are the roadmap past Phase 4)
+│                          per-phase plans (0-4d done; 4e in
+│                          progress; 5-11 roadmap past Phase 4)
+├── PHASE_4C.md, PHASE_4D.md, PHASE_4E.md
+│                          Phase 4 speed polish / 3.2M port /
+│                          distillation plans
 ├── STORAGE_SERVICE_VISION.md
 │                          exploratory back-burner productization writeup
 ├── docs/
@@ -199,7 +241,9 @@ l3tc-prod/
 │   ├── phase_2_findings.md
 │   ├── phase_3_findings.md
 │   ├── phase_4a_findings.md
-│   └── phase_4b_findings.md
+│   ├── phase_4b_findings.md
+│   ├── phase_4d_findings.md
+│   └── phase_4e_findings.md
 ├── bench/                 Python benchmark harness (stdlib-only)
 │   ├── bench.py
 │   ├── compressors.py
@@ -226,7 +270,10 @@ l3tc-prod/
 ├── vendor/                (gitignored) cloned L3TC reference + RWKV-LM
 └── scripts/
     ├── setup.sh           clone L3TC + RWKV-LM, set up Python venv
-    └── download_corpora.sh  download enwik8, Canterbury, Silesia
+    ├── download_corpora.sh  download enwik8, Canterbury, Silesia
+    ├── distill_l3tc.py    Phase 4e PyTorch distillation training loop
+    ├── dump_python_logits.py  Phase 4a diff harness
+    └── diff_logits.py     Rust vs Python logit comparison
 ```
 
 ## Quick start
@@ -261,6 +308,13 @@ cargo test --release                          # 34 unit tests
 # Or explicit CLI
 ./target/release/l3tc compress /path/to/input.txt -o out.l3tc --verify --time
 ./target/release/l3tc decompress out.l3tc -o back.txt --time
+
+# Debug subcommands
+./target/release/l3tc entropy-bound --input enwik6 --segment-bytes 4096
+./target/release/l3tc audit --input enwik6         # per-source byte breakdown
+./target/release/l3tc profile --input enwik6       # per-phase timing breakdown
+./target/release/l3tc dump-logits --input enwik6 -o logits.bin
+./target/release/l3tc dump-teacher --input enwik6 -o teacher.bin --top-k 64
 ```
 
 ### Integration tests against the real checkpoint
