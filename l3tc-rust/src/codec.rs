@@ -855,16 +855,25 @@ impl AuditStats {
 ///
 /// ```text
 /// magic:            b"L3TD"           (4 bytes — L3TC Teacher Dump)
-/// version:          u32 (= 1)
+/// version:          u32 (= 2)
 /// vocab_size:       u32
 /// top_k:            u32
-/// n_segments:       u32
+/// n_segments:       u32                (only tokenized, not raw-fallback)
 /// n_predict_steps:  u64
+/// For each tokenized segment:
+///     seg_steps:    u32                (number of predict steps)
 /// For each predict step, in segment order:
-///     target_token_id: u32          (the ground-truth next token)
+///     input_token_id:  u32              (model input at this step)
+///     target_token_id: u32              (ground truth next token)
 ///     // top_k pairs of (token_id, prob) sorted by prob desc
 ///     top_k × { u32 token_id; f32 prob }
 /// ```
+///
+/// The input_token_id is redundant with segment boundaries +
+/// targets but we include it explicitly so the consumer can
+/// feed training inputs directly without reconstructing them
+/// from BOS + previous targets. Makes the Python distillation
+/// script trivial to align.
 ///
 /// At `top_k = 64`, per-step overhead is 4 + 64 × 8 = 516
 /// bytes. For enwik8 (~275k predict steps) the dump is ~140 MB.
@@ -888,17 +897,21 @@ pub fn dump_teacher<W: Write>(
     use rayon::prelude::*;
 
     let segments = tokenizer.encode_file(text, segment_bytes)?;
-    let n_segments = segments.len();
-    // Count predict steps upfront so we can write a stable header.
-    let n_predict_steps: u64 = segments
+    // Filter out raw-fallback segments; the teacher dump only
+    // covers segments that went through the LM path.
+    let tokenized: Vec<&EncodedSegment> = segments
         .iter()
         .filter(|s| !s.needs_raw_fallback)
+        .collect();
+    let n_segments = tokenized.len();
+    let n_predict_steps: u64 = tokenized
+        .iter()
         .map(|s| (s.tokens.len().saturating_sub(1)) as u64)
         .sum();
 
-    // --- header ---
+    // --- header (v2: adds per-segment step counts + inputs) ---
     dst.write_all(b"L3TD").map_err(Error::Io)?;
-    dst.write_u32::<LittleEndian>(1).map_err(Error::Io)?; // version
+    dst.write_u32::<LittleEndian>(2).map_err(Error::Io)?; // version
     dst.write_u32::<LittleEndian>(model.vocab_size as u32)
         .map_err(Error::Io)?;
     dst.write_u32::<LittleEndian>(top_k as u32).map_err(Error::Io)?;
@@ -906,18 +919,22 @@ pub fn dump_teacher<W: Write>(
         .map_err(Error::Io)?;
     dst.write_u64::<LittleEndian>(n_predict_steps)
         .map_err(Error::Io)?;
+    // Per-segment step counts (so the consumer can reconstruct
+    // segment boundaries without running the tokenizer again).
+    for seg in &tokenized {
+        let n_steps = seg.tokens.len().saturating_sub(1) as u32;
+        dst.write_u32::<LittleEndian>(n_steps).map_err(Error::Io)?;
+    }
 
     // Parallelize across segments. Each thread gets its own
     // Session and its own output buffer; we concatenate in
     // segment order at the end so the file layout is
     // deterministic. Same parallelism model as `compress`.
-    let bytes_per_step = 4 + top_k * 8;
-    let segment_buffers: Result<Vec<Vec<u8>>> = segments
+    // Per-step record is now input(4) + target(4) + K×(id(4) + prob(4)).
+    let bytes_per_step = 4 + 4 + top_k * 8;
+    let segment_buffers: Result<Vec<Vec<u8>>> = tokenized
         .par_iter()
         .map(|seg| -> Result<Vec<u8>> {
-            if seg.needs_raw_fallback {
-                return Ok(Vec::new());
-            }
             let n_steps = seg.tokens.len().saturating_sub(1);
             let mut out = Vec::with_capacity(n_steps * bytes_per_step);
             let mut session = Session::new(model);
@@ -928,9 +945,9 @@ pub fn dump_teacher<W: Write>(
                 Vec::with_capacity(model.vocab_size);
 
             for i in 1..seg.tokens.len() {
-                let prev = seg.tokens[i - 1];
+                let input = seg.tokens[i - 1];
                 let target = seg.tokens[i];
-                let logits = session.forward(prev);
+                let logits = session.forward(input);
 
                 // Numerically-stable softmax in f64.
                 let mut max = f32::NEG_INFINITY;
@@ -971,7 +988,8 @@ pub fn dump_teacher<W: Write>(
                         .unwrap_or(std::cmp::Ordering::Equal)
                 });
 
-                // Append target + top-K (token_id, prob) pairs.
+                // Append input + target + top-K (token_id, prob) pairs.
+                out.extend_from_slice(&input.to_le_bytes());
                 out.extend_from_slice(&target.to_le_bytes());
                 for &(prob, token_id) in head.iter() {
                     out.extend_from_slice(&token_id.to_le_bytes());

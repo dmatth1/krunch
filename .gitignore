@@ -47,3 +47,7 @@ Cargo.lock.bak
 # Converted checkpoint binaries — regeneratable from the .pth files
 # via scripts/convert_checkpoint.py; too big for git (~13 MB each)
 l3tc-rust/checkpoints/*.bin
+# Distillation fine-tuned checkpoints (Phase 4e) — produced by
+# scripts/distill_l3tc.py from the shipped L3TC checkpoint.
+# Regeneratable via the script, not worth storing in git.
+l3tc-rust/checkpoints/*_distilled.pth
