@@ -73,9 +73,9 @@ apt-get install -y -qq python3-venv python3-pip awscli xz-utils > /dev/null 2>&1
 ) &
 BOOTSTRAP_LOG_PID=$!
 
-# === Clone l3tc-prod ===
+# === Clone l3tc-prod (the GitHub repo is named "ltec", not "l3tc-prod") ===
 cd /home/ubuntu
-git clone "https://x-access-token:${GITHUB_PAT}@github.com/dmatth1/l3tc-prod.git"
+git clone "https://x-access-token:${GITHUB_PAT}@github.com/dmatth1/ltec.git" l3tc-prod
 cd l3tc-prod
 git log -1 --oneline
 chown -R ubuntu:ubuntu /home/ubuntu/l3tc-prod
