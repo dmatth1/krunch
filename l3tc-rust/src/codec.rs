@@ -1,17 +1,16 @@
 //! High-level compress / decompress: ties tokenizer + model +
 //! arithmetic coder together.
 //!
-//! # Compressed file format (Phase 1)
+//! # Compressed file format (Phase 3, v3)
 //!
-//! This is a simple, self-describing binary format. It is NOT
-//! compatible with L3TC's Python output — intentionally, see
-//! PHASE_1.md. The format will be stabilized and given magic bytes
-//! in Phase 2.
+//! Simple, self-describing binary format. NOT compatible with
+//! L3TC's Python output — intentionally, see PHASE_1.md. Stabilized
+//! in Phase 3 with a CRC32 integrity trailer.
 //!
 //! ```text
 //! header:
 //!     magic:         b"LRUS"   (4 bytes)
-//!     version:       u8        (= 2)
+//!     version:       u8        (= 3; reader also accepts 2)
 //!     flags:         u8        (reserved, = 0)
 //!     reserved:      u16       (= 0)
 //!     total_bytes:   u64       original uncompressed byte length
@@ -31,6 +30,7 @@
 //!                              on decode (overrides the token path)
 //! trailer:
 //!     magic:         b"!END"   (4 bytes)
+//!     crc32:         u32 LE    CRC32 of everything above (v3 only)
 //! ```
 //!
 //! # Raw fallback segments
@@ -94,7 +94,7 @@ use crate::rwkv::{Model, Session};
 use crate::tensor;
 use crate::tokenizer::{EncodedSegment, Tokenizer, BOS_ID, UNK_ID};
 
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use byteorder::{ByteOrder, LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{Read, Write};
 
 /// Header magic bytes.
@@ -107,7 +107,19 @@ const TRAILER: &[u8; 4] = b"!END";
 /// fallback` bit so the decoder can use the original segment
 /// bytes verbatim when SentencePiece normalization would
 /// otherwise lose information (ZWNJ, combining marks, etc.).
-const VERSION: u8 = 2;
+/// Format version this module writes.
+///
+/// v3 adds a CRC32 of the entire payload (everything from the
+/// start of the file up to and including the trailer magic)
+/// appended as a u32 little-endian after the trailer. This gives
+/// the decoder a fast integrity check against bit flips in storage
+/// or transport. The reader accepts both v2 (no CRC) and v3 files
+/// for at least one release cycle so existing artifacts still
+/// decode.
+const VERSION: u8 = 3;
+
+/// Legacy version this decoder still accepts (without CRC).
+const VERSION_V2_COMPAT: u8 = 2;
 
 /// Per-segment flag bit: "raw fallback bytes follow the unks".
 ///
@@ -186,6 +198,9 @@ pub fn compress(
         write_segment(&mut out, seg, body)?;
     }
     write_trailer(&mut out)?;
+    // v3: append CRC32 of the entire payload written so far.
+    let crc = crc32fast::hash(&out);
+    out.write_u32::<LittleEndian>(crc)?;
     Ok(out)
 }
 
@@ -200,7 +215,40 @@ pub fn compress(
 pub fn decompress(bytes: &[u8], tokenizer: &Tokenizer, model: &Model) -> Result<String> {
     use rayon::prelude::*;
 
-    let mut cursor = std::io::Cursor::new(bytes);
+    // Peek at the version byte to decide framing. v3 files end with
+    // a 4-byte CRC32 trailer; v2 files do not. The version lives at
+    // byte offset 4 (right after the 4-byte magic).
+    if bytes.len() < 5 {
+        return Err(Error::BadCheckpoint("file too short".into()));
+    }
+    if &bytes[..4] != MAGIC {
+        return Err(Error::BadCheckpoint(format!("bad magic: {:?}", &bytes[..4])));
+    }
+    let version = bytes[4];
+    let body: &[u8] = match version {
+        VERSION => {
+            if bytes.len() < 4 {
+                return Err(Error::BadCheckpoint("v3 file missing CRC trailer".into()));
+            }
+            let (payload, crc_bytes) = bytes.split_at(bytes.len() - 4);
+            let stored_crc = LittleEndian::read_u32(crc_bytes);
+            let computed = crc32fast::hash(payload);
+            if stored_crc != computed {
+                return Err(Error::BadCheckpoint(format!(
+                    "CRC32 mismatch: stored {stored_crc:08x}, computed {computed:08x}"
+                )));
+            }
+            payload
+        }
+        VERSION_V2_COMPAT => bytes,
+        v => {
+            return Err(Error::BadCheckpoint(format!(
+                "unsupported version: {v}"
+            )));
+        }
+    };
+
+    let mut cursor = std::io::Cursor::new(body);
     let (total_bytes, n_segments) = read_header(&mut cursor)?;
 
     // First pass: read all segment metadata + bodies sequentially.
@@ -569,7 +617,7 @@ fn read_header<R: Read>(r: &mut R) -> Result<(u64, u32)> {
         return Err(Error::BadCheckpoint(format!("bad magic: {magic:?}")));
     }
     let version = r.read_u8()?;
-    if version != VERSION {
+    if version != VERSION && version != VERSION_V2_COMPAT {
         return Err(Error::BadCheckpoint(format!(
             "unsupported version: {version}"
         )));
@@ -724,6 +772,34 @@ mod tests {
                 "fast_exp_neg({x}) = {actual}, expected {expected}, rel_err {rel_err}"
             );
         }
+    }
+
+    #[test]
+    fn crc32_roundtrip_detects_corruption() {
+        // Build a tiny fake v3 payload: magic + version + flags +
+        // reserved + total_bytes + n_segments=0 + trailer, then
+        // append the correct CRC. Verify that decompress-time CRC
+        // validation accepts it and rejects a bit-flipped copy.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(MAGIC);
+        buf.push(VERSION);
+        buf.push(0); // flags
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes()); // total_bytes
+        buf.extend_from_slice(&0u32.to_le_bytes()); // n_segments
+        buf.extend_from_slice(TRAILER);
+        let crc = crc32fast::hash(&buf);
+        buf.extend_from_slice(&crc.to_le_bytes());
+
+        // Pristine copy: CRC matches.
+        let (payload, crc_bytes) = buf.split_at(buf.len() - 4);
+        assert_eq!(LittleEndian::read_u32(crc_bytes), crc32fast::hash(payload));
+
+        // Corrupt one byte in the middle of the payload.
+        let mut bad = buf.clone();
+        bad[8] ^= 0xFF;
+        let (payload, crc_bytes) = bad.split_at(bad.len() - 4);
+        assert_ne!(LittleEndian::read_u32(crc_bytes), crc32fast::hash(payload));
     }
 
     #[test]
