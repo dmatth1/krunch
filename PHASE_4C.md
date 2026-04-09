@@ -1,4 +1,32 @@
-# Phase 4c — CPU speed polish
+# Phase 4c — CPU speed polish  ⚠️ LARGELY DONE (+7%/+8%)
+
+**Final state as of the last commit:** enwik6 compress
+**126.8 KB/s**, decompress **128.2 KB/s**, ratio 0.1699
+(unchanged). Cumulative gain over Phase 4b2's 119/119 baseline
+is roughly 7% compress and 8% decompress — below the original
+170-200 KB/s target but above the 99 KB/s speed floor.
+
+**Honest takeaway.** Apple Silicon + LLVM's aarch64 autovectorizer
+is aggressive enough that most hand-written NEON on short
+(≤96-element) f32 vectors is a wash. The clear wins came from
+pointing the code at existing NEON kernels that the compiler
+couldn't reach on its own (4c2: FFN matvecs to NEON 96×96) and
+from a fused vectorized quantize pass (4c3). The "replace libm
+exp with a polynomial" idea (4c1) is numerically correct but
+didn't move the needle because Apple's libm is already fast.
+
+**Items backburnered for later:**
+
+- **4c5 INT4 head quantization** — the only remaining CPU speed
+  item with a plausible 5-10% win (halving head memory traffic
+  on the biggest matmul). Not implemented in this phase because
+  (a) the engineering cost is 2-3 days with real ratio risk and
+  (b) the "different model" path (port L3TC-3.2M, then decide on
+  distillation) now looks like a higher-impact direction. If
+  that path stalls or we decide to come back for CPU polish,
+  4c5 is the next thing to try.
+
+
 
 **Goal:** extend our lead in single-stream CPU neural compression
 by reclaiming the per-token hot-loop time that Phase 4b's ratio

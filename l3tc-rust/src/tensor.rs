@@ -185,6 +185,32 @@ unsafe fn matvec_96x96_neon(mat: &[f32], x: &[f32], out: &mut [f32]) {
 /// The L3TC-200K block projections are exactly this shape, called
 /// 16 times per token. Callers in `rwkv.rs` should prefer this over
 /// the generic `matvec` for those specific calls.
+/// Square matvec dispatcher. Picks the fastest available kernel
+/// for the requested size `n`:
+///
+/// - `n == 96` → hand-tuned NEON `matvec_96x96` (Phase 2.5a)
+/// - otherwise → generic `matvec` (which itself dispatches to
+///   sgemm above the BLAS threshold and scalar below)
+///
+/// Used by `Session::forward` for the per-layer projections that
+/// are `(hidden_size, hidden_size)` regardless of model variant.
+/// `#[inline(always)]` to guarantee the dispatch collapses into
+/// the caller's code — without it the compiler would sometimes
+/// leave a function call around the dispatch that costs ~6% of
+/// forward-pass throughput on the 200K hot path.
+#[inline(always)]
+pub fn matvec_square(mat: &[f32], x: &[f32], out: &mut [f32], n: usize) {
+    if n == 96 {
+        matvec_96x96(mat, x, out);
+    } else {
+        matvec(mat, x, out);
+    }
+}
+
+/// Hand-tuned 96×96 matvec dispatcher. Callers should prefer
+/// [`matvec_square`] which picks the right kernel based on size;
+/// this entry point is retained for back-compat with benchmarks
+/// that measure the 96×96 kernel directly.
 #[inline]
 pub fn matvec_96x96(mat: &[f32], x: &[f32], out: &mut [f32]) {
     debug_assert_eq!(mat.len(), 96 * 96);

@@ -172,6 +172,10 @@ pub struct Model {
     pub vocab_size: usize,
     /// Hidden dimension.
     pub hidden_size: usize,
+    /// FFN intermediate dimension. Equal to `hidden_size` for
+    /// L3TC-200K; larger for bigger variants (e.g. 512 for the
+    /// 3.2M model where hidden_size=256, intermediate_size=512).
+    pub intermediate_size: usize,
     /// Top-level initial layer norm (moved from blocks.0.ln0).
     pub ln0: LayerNormParams,
     /// All blocks in order.
@@ -236,6 +240,21 @@ impl Model {
             bias: ckpt.take_shape("ln_out.bias", &[hidden_size])?.data,
         };
 
+        // Discover `intermediate_size` from the FFN key shape on
+        // block 0. The checkpoint layout is `(intermediate, hidden)`
+        // row-major. For L3TC-200K intermediate == hidden == 96;
+        // for L3TC-3.2M intermediate == 512, hidden == 256.
+        let intermediate_size = {
+            let t = ckpt.get("blocks.0.ffn.key.weight")?;
+            let (rows, cols) = t.as_matrix()?;
+            if cols != hidden_size {
+                return Err(Error::BadCheckpoint(format!(
+                    "blocks.0.ffn.key.weight has {cols} cols, expected {hidden_size}"
+                )));
+            }
+            rows
+        };
+
         // Count blocks by probing names. The converter emits
         // blocks.N.* for N in 0..n_layers.
         let mut num_layers = 0usize;
@@ -248,13 +267,14 @@ impl Model {
 
         let mut blocks = Vec::with_capacity(num_layers);
         for li in 0..num_layers {
-            blocks.push(Self::load_block(ckpt, li, hidden_size)?);
+            blocks.push(Self::load_block(ckpt, li, hidden_size, intermediate_size)?);
         }
 
         Ok(Self {
             emb,
             vocab_size,
             hidden_size,
+            intermediate_size,
             ln0,
             blocks,
             ln_out,
@@ -264,15 +284,28 @@ impl Model {
         })
     }
 
-    fn load_block(ckpt: &mut Checkpoint, li: usize, h: usize) -> Result<Block> {
+    fn load_block(
+        ckpt: &mut Checkpoint,
+        li: usize,
+        h: usize,
+        im: usize,
+    ) -> Result<Block> {
         let prefix = format!("blocks.{li}");
 
         let take_1d = |ckpt: &mut Checkpoint, suffix: &str| -> Result<Vec<f32>> {
             ckpt.take_shape(&format!("{prefix}.{suffix}"), &[h])
                 .map(|t| t.data)
         };
-        let take_2d = |ckpt: &mut Checkpoint, suffix: &str| -> Result<Vec<f32>> {
+        let take_2d_hh = |ckpt: &mut Checkpoint, suffix: &str| -> Result<Vec<f32>> {
             ckpt.take_shape(&format!("{prefix}.{suffix}"), &[h, h])
+                .map(|t| t.data)
+        };
+        let take_2d_imh = |ckpt: &mut Checkpoint, suffix: &str| -> Result<Vec<f32>> {
+            ckpt.take_shape(&format!("{prefix}.{suffix}"), &[im, h])
+                .map(|t| t.data)
+        };
+        let take_2d_him = |ckpt: &mut Checkpoint, suffix: &str| -> Result<Vec<f32>> {
+            ckpt.take_shape(&format!("{prefix}.{suffix}"), &[h, im])
                 .map(|t| t.data)
         };
 
@@ -291,10 +324,13 @@ impl Model {
             time_mix_k: take_1d(ckpt, "att.time_mix_k")?,
             time_mix_v: take_1d(ckpt, "att.time_mix_v")?,
             time_mix_r: take_1d(ckpt, "att.time_mix_r")?,
-            w_key: take_2d(ckpt, "att.key.weight")?,
-            w_value: take_2d(ckpt, "att.value.weight")?,
-            w_receptance: take_2d(ckpt, "att.receptance.weight")?,
-            w_output: take_2d(ckpt, "att.output.weight")?,
+            // Attention projections are all square (h, h) in every
+            // L3TC variant — the FFN is the only place the shape
+            // differs across model sizes.
+            w_key: take_2d_hh(ckpt, "att.key.weight")?,
+            w_value: take_2d_hh(ckpt, "att.value.weight")?,
+            w_receptance: take_2d_hh(ckpt, "att.receptance.weight")?,
+            w_output: take_2d_hh(ckpt, "att.output.weight")?,
         };
 
         // time_mix_g exists in the checkpoint but is never used by
@@ -304,12 +340,15 @@ impl Model {
         let ffn = ChannelMixParams {
             time_mix_k: take_1d(ckpt, "ffn.time_mix_k")?,
             time_mix_r: take_1d(ckpt, "ffn.time_mix_r")?,
-            w_key: take_2d(ckpt, "ffn.key.weight")?,
-            w_value: take_2d(ckpt, "ffn.value.weight")?,
-            w_receptance: take_2d(ckpt, "ffn.receptance.weight")?,
+            // FFN key:   (intermediate, hidden) -- expands h → im
+            // FFN value: (hidden, intermediate) -- projects im → h
+            // FFN receptance: (hidden, hidden) -- square gate
+            w_key: take_2d_imh(ckpt, "ffn.key.weight")?,
+            w_value: take_2d_him(ckpt, "ffn.value.weight")?,
+            w_receptance: take_2d_hh(ckpt, "ffn.receptance.weight")?,
         };
 
-        let w_short = take_2d(ckpt, "short.weight")?;
+        let w_short = take_2d_hh(ckpt, "short.weight")?;
 
         Ok(Block {
             ln1,
@@ -349,28 +388,34 @@ struct Scratch {
 }
 
 impl Scratch {
-    fn new(hidden_size: usize) -> Self {
-        let z = || vec![0.0f32; hidden_size];
+    fn new(hidden_size: usize, intermediate_size: usize) -> Self {
+        let h = || vec![0.0f32; hidden_size];
+        // `k` is the only scratch buffer that can hold either a
+        // hidden-sized vector (in att's time-mix path) OR an
+        // intermediate-sized vector (the FFN key output post-relu,
+        // before the value matvec projects back to hidden). Size
+        // it on the max so both fit.
+        let im_or_h = std::cmp::max(hidden_size, intermediate_size);
         Self {
-            x: z(),
-            residual: z(),
-            short: z(),
-            normed: z(),
-            xk: z(),
-            xv: z(),
-            xr: z(),
-            k: z(),
-            v: z(),
-            r: z(),
-            ww: z(),
-            p: z(),
-            e1: z(),
-            e2: z(),
-            a: z(),
-            b: z(),
-            rwkv: z(),
-            out_proj: z(),
-            ffn_out: z(),
+            x: h(),
+            residual: h(),
+            short: h(),
+            normed: h(),
+            xk: h(),
+            xv: h(),
+            xr: h(),
+            k: vec![0.0f32; im_or_h],
+            v: h(),
+            r: h(),
+            ww: h(),
+            p: h(),
+            e1: h(),
+            e2: h(),
+            a: h(),
+            b: h(),
+            rwkv: h(),
+            out_proj: h(),
+            ffn_out: h(),
         }
     }
 }
@@ -402,7 +447,7 @@ impl<'a> Session<'a> {
         Self {
             model,
             state,
-            scratch: Scratch::new(model.hidden_size),
+            scratch: Scratch::new(model.hidden_size, model.intermediate_size),
             logits: vec![0.0; model.vocab_size],
         }
     }
@@ -447,12 +492,15 @@ impl<'a> Session<'a> {
         }
 
         // Run each block
+        let h = self.model.hidden_size;
+        let im = self.model.intermediate_size;
         for (li, block) in self.model.blocks.iter().enumerate() {
             Self::forward_block(
                 block,
                 &mut self.state[li],
                 &mut self.scratch,
-                self.model.hidden_size,
+                h,
+                im,
             );
         }
 
@@ -499,9 +547,10 @@ impl<'a> Session<'a> {
         state: &mut LayerState,
         scratch: &mut Scratch,
         h: usize,
+        im: usize,
     ) {
         // short = relu(short_weight @ x)
-        tensor::matvec_96x96(&block.w_short, &scratch.x, &mut scratch.short);
+        tensor::matvec_square(&block.w_short, &scratch.x, &mut scratch.short, h);
         tensor::relu_inplace(&mut scratch.short);
 
         // residual = x
@@ -536,7 +585,7 @@ impl<'a> Session<'a> {
         );
 
         // Channel mix (FFN). Computes in scratch.ffn_out.
-        Self::channel_mix(block, state, scratch, h);
+        Self::channel_mix(block, state, scratch, h, im);
 
         // x = residual + ffn_out
         scratch.x.copy_from_slice(&scratch.residual);
@@ -559,12 +608,12 @@ impl<'a> Session<'a> {
         // Update state_x for next step
         state.state_x.copy_from_slice(&scratch.normed);
 
-        // k = key @ xk
-        tensor::matvec_96x96(&att.w_key, &scratch.xk, &mut scratch.k);
+        // k = key @ xk  (hidden → hidden square matvec)
+        tensor::matvec_square(&att.w_key, &scratch.xk, &mut scratch.k[..h], h);
         // v = value @ xv
-        tensor::matvec_96x96(&att.w_value, &scratch.xv, &mut scratch.v);
+        tensor::matvec_square(&att.w_value, &scratch.xv, &mut scratch.v, h);
         // r = sigmoid(receptance @ xr)
-        tensor::matvec_96x96(&att.w_receptance, &scratch.xr, &mut scratch.r);
+        tensor::matvec_square(&att.w_receptance, &scratch.xr, &mut scratch.r, h);
         tensor::sigmoid_inplace(&mut scratch.r);
 
         // ww = time_first + k
@@ -624,13 +673,19 @@ impl<'a> Session<'a> {
             scratch.rwkv[i] = scratch.r[i] * scratch.a[i] / scratch.b[i];
         }
         // Apply output projection -> scratch.out_proj then back to rwkv
-        tensor::matvec_96x96(&att.w_output, &scratch.rwkv, &mut scratch.out_proj);
+        tensor::matvec_square(&att.w_output, &scratch.rwkv, &mut scratch.out_proj, h);
         scratch.rwkv.copy_from_slice(&scratch.out_proj);
     }
 
     /// Channel mixing (FFN). Reads `scratch.normed` (post-ln2 input).
     /// Writes the output into `scratch.ffn_out`.
-    fn channel_mix(block: &Block, state: &mut LayerState, scratch: &mut Scratch, h: usize) {
+    fn channel_mix(
+        block: &Block,
+        state: &mut LayerState,
+        scratch: &mut Scratch,
+        h: usize,
+        im: usize,
+    ) {
         let ffn = &block.ffn;
 
         // xk = x * time_mix_k + state_ffn * (1 - time_mix_k)
@@ -641,26 +696,32 @@ impl<'a> Session<'a> {
         // state_ffn = x (the pre-mix input)
         state.state_ffn.copy_from_slice(&scratch.normed);
 
-        // r = sigmoid(receptance @ xr)
-        tensor::matvec_96x96(&ffn.w_receptance, &scratch.xr, &mut scratch.r);
+        // r = sigmoid(receptance @ xr)  (hidden → hidden square)
+        tensor::matvec_square(&ffn.w_receptance, &scratch.xr, &mut scratch.r, h);
         tensor::sigmoid_inplace(&mut scratch.r);
 
         // k = (relu(key @ xk))^2
         //
-        // Phase 4c2: for L3TC-200K `intermediate_size == hidden_size`
-        // (both 96), so these are 96×96 matvecs that should use the
-        // NEON kernel from Phase 2.5a, not the scalar fallback. The
-        // original 2.5a pass missed them because the attention
-        // matvecs were converted first and the FFN projections were
-        // overlooked. Bigger models (L3TC-800K / 3.2M / 12M) use
-        // different shapes and would need a different kernel; add
-        // shape-specific dispatch there if we ever target them.
-        tensor::matvec_96x96(&ffn.w_key, &scratch.xk, &mut scratch.k);
-        tensor::relu_inplace(&mut scratch.k);
-        tensor::square_inplace(&mut scratch.k);
+        // FFN key is (intermediate, hidden). For L3TC-200K where
+        // intermediate == hidden == 96 this is still a 96×96
+        // matvec and matvec_square dispatches to NEON. For bigger
+        // variants (e.g. 3.2M: 512×256) it's rectangular and
+        // falls through to the generic `matvec` path (scalar for
+        // modest sizes, sgemm above the BLAS threshold).
+        if im == h {
+            tensor::matvec_square(&ffn.w_key, &scratch.xk, &mut scratch.k[..h], h);
+        } else {
+            tensor::matvec(&ffn.w_key, &scratch.xk, &mut scratch.k[..im]);
+        }
+        tensor::relu_inplace(&mut scratch.k[..im]);
+        tensor::square_inplace(&mut scratch.k[..im]);
 
-        // kv = value @ k
-        tensor::matvec_96x96(&ffn.w_value, &scratch.k, &mut scratch.v);
+        // kv = value @ k  (FFN value projects intermediate → hidden)
+        if im == h {
+            tensor::matvec_square(&ffn.w_value, &scratch.k[..h], &mut scratch.v, h);
+        } else {
+            tensor::matvec(&ffn.w_value, &scratch.k[..im], &mut scratch.v);
+        }
 
         // ffn_out = r * kv
         for i in 0..h {
@@ -719,6 +780,11 @@ mod tests {
             emb: vec![0.1; vocab * hidden],
             vocab_size: vocab,
             hidden_size: hidden,
+            // tiny_model uses intermediate == hidden for simplicity.
+            // For models with a different expansion (e.g. L3TC-3.2M
+            // where im=512, h=256) the real from_checkpoint loader
+            // reads the shape from the FFN key tensor.
+            intermediate_size: hidden,
             ln0: LayerNormParams {
                 weight: vec![1.0; hidden],
                 bias: vec![0.0; hidden],

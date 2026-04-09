@@ -108,8 +108,10 @@ decision log (including what we tried and reversed). See
 
 | Compressor | Ratio | Compress MB/s | Decompress MB/s |
 |---|---:|---:|---:|
-| **l3tc-rust (Phase 4b2)** | **0.1699** | **0.119** | **0.119** |
+| **l3tc-rust 200K (default)** | **0.1699** | **0.131** | **0.132** |
+| **l3tc-rust 3.2M (opt-in, Phase 4d)** | **0.1337** | **0.026** | **0.023** |
 | Python L3TC-200K (entropy bound) | 0.1665 | 0.013 | — |
+| Python L3TC-3.2M (entropy bound) | 0.1309 | 0.011 | — |
 | bzip2-9 | 0.2813 | 16.67 | 35.09 |
 | xz-9e | 0.2907 | 3.77 | 52.39 |
 | zstd-22 | 0.3001 | 4.34 | 125.17 |
