@@ -121,7 +121,10 @@ pip install -r /tmp/l3tc-req-trimmed.txt -q
 # + dataset/.
 #   - termcolor: util/logger.py imports `from termcolor import colored`
 #   - scipy:     util/arithmeticcoding.py imports `scipy.special`
-pip install scipy termcolor -q
+#   - ninja:     L3TC's CUDA WKV kernel is JIT-compiled at module
+#                load via torch.utils.cpp_extension.load(...) which
+#                requires ninja as the build backend. Install via pip.
+pip install scipy termcolor ninja -q
 
 # pkuseg + deepspeed workarounds: L3TC's source has hard top-level
 # imports for both even though neither is in requirements.txt and
@@ -196,18 +199,33 @@ mkdir -p data/raw_text_data data/train_data data/test_data
 echo "=== Downloading corpus ${CORPUS_NAME} ==="
 case "$PASS" in
     pass1)
-        # enwik9: stored as xz-compressed (.xz) in S3 to keep transfer small
-        if ! aws s3 ls "${CORPUS_S3}" >/dev/null 2>&1; then
-            echo "ERROR: enwik9 not found at ${CORPUS_S3}"
-            echo "Upload it once from your local machine:"
-            echo "  aws s3 cp ~/.../enwik9.xz ${CORPUS_S3}"
-            echo "  (or download from http://mattmahoney.net/dc/enwik9.zip and re-pack as .xz)"
-            exit 1
+        # Prefer the pre-tokenized file if it exists in S3 — saves the
+        # ~13 min single-thread Python tokenization step on every retry.
+        # Generated once on the first successful run and uploaded with:
+        #   sudo aws s3 cp .../train_enwik9_bpe_16384_0.999.txt \
+        #       s3://dmatth1-bnn-checkpoints/l3tc/corpora/...
+        PRETOK_S3="${S3_CORPUS_PATH}/train_enwik9_bpe_16384_0.999.txt"
+        if aws s3 ls "${PRETOK_S3}" >/dev/null 2>&1; then
+            echo "=== Found pre-tokenized enwik9 in S3, downloading ==="
+            mkdir -p data/train_data
+            aws s3 cp "${PRETOK_S3}" "${TRAIN_FILE}" --quiet
+            ls -lh "${TRAIN_FILE}"
+            SKIP_TOKENIZE=1
+        else
+            echo "=== Pre-tokenized file not in S3, falling back to raw enwik9 ==="
+            if ! aws s3 ls "${CORPUS_S3}" >/dev/null 2>&1; then
+                echo "ERROR: enwik9 not found at ${CORPUS_S3}"
+                echo "Upload it once from your local machine:"
+                echo "  aws s3 cp ~/.../enwik9.xz ${CORPUS_S3}"
+                echo "  (or download from http://mattmahoney.net/dc/enwik9.zip and re-pack as .xz)"
+                exit 1
+            fi
+            aws s3 cp "${CORPUS_S3}" /tmp/enwik9.xz --quiet
+            xz -d /tmp/enwik9.xz
+            mv /tmp/enwik9 data/raw_text_data/enwik9
+            ls -lh data/raw_text_data/enwik9
+            SKIP_TOKENIZE=0
         fi
-        aws s3 cp "${CORPUS_S3}" /tmp/enwik9.xz --quiet
-        xz -d /tmp/enwik9.xz
-        mv /tmp/enwik9 data/raw_text_data/enwik9
-        ls -lh data/raw_text_data/enwik9
         ;;
     pass2)
         # Pile dedup: pre-extracted, pre-formatted single text file in S3.
@@ -227,6 +245,14 @@ case "$PASS" in
         ls -lh data/raw_text_data/
         ;;
 esac
+
+# === If we already have the pre-tokenized file, skip the SPM step ===
+if [ "${SKIP_TOKENIZE:-0}" = "1" ]; then
+    echo "=== Skipping tokenization (pre-tokenized file already in place) ==="
+    SKIP_BLOCK=1
+fi
+
+if [ "${SKIP_BLOCK:-0}" != "1" ]; then
 
 # === Pull the SPM tokenizer model from S3 ===
 # The .model / .vocab / _vocab.json files were trained locally during
@@ -285,6 +311,8 @@ with open('${RAW_TEXT}', 'r', encoding='utf-8', errors='replace') as f_in, \
 print(f'done: ${TRAIN_FILE}')
 "
 ls -lh "${TRAIN_FILE}"
+
+fi  # end SKIP_BLOCK guard
 
 # === Find latest checkpoint for this run (resume after spot reclaim) ===
 RESUME_FLAG=""
