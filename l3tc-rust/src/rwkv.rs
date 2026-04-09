@@ -646,12 +646,21 @@ impl<'a> Session<'a> {
         tensor::sigmoid_inplace(&mut scratch.r);
 
         // k = (relu(key @ xk))^2
-        tensor::matvec(&ffn.w_key, &scratch.xk, &mut scratch.k);
+        //
+        // Phase 4c2: for L3TC-200K `intermediate_size == hidden_size`
+        // (both 96), so these are 96×96 matvecs that should use the
+        // NEON kernel from Phase 2.5a, not the scalar fallback. The
+        // original 2.5a pass missed them because the attention
+        // matvecs were converted first and the FFN projections were
+        // overlooked. Bigger models (L3TC-800K / 3.2M / 12M) use
+        // different shapes and would need a different kernel; add
+        // shape-specific dispatch there if we ever target them.
+        tensor::matvec_96x96(&ffn.w_key, &scratch.xk, &mut scratch.k);
         tensor::relu_inplace(&mut scratch.k);
         tensor::square_inplace(&mut scratch.k);
 
         // kv = value @ k
-        tensor::matvec(&ffn.w_value, &scratch.k, &mut scratch.v);
+        tensor::matvec_96x96(&ffn.w_value, &scratch.k, &mut scratch.v);
 
         // ffn_out = r * kv
         for i in 0..h {

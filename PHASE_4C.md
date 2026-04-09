@@ -67,48 +67,41 @@ revert. Round trip must stay byte-identical.
 **Expected gain:** ~30-45 us/token saved → ~+15-20% end-to-end
 throughput. **Target: 119 → ~140 KB/s.**
 
-### 4c2 — Fused K/V/R 288×96 matvec in time_mix
+### 4c2 — Switch FFN matvecs to the existing NEON 96×96 kernel
 
-**What:** stack `w_key`, `w_value`, `w_receptance` into a single
-`(288, 96)` weight matrix. Do one matvec that reads the input
-vector `scratch.normed` *once* and writes three output chunks
-`[k; v; r]` in one pass. Same total arithmetic, better memory
-reuse on the input.
+**What happened:** the original plan called this "fused K/V/R
+288×96 matvec" in time_mix — but investigating the code for
+4c3 surfaced a bigger and simpler finding: the FFN key and
+value matvecs in `channel_mix` were still using the scalar
+`tensor::matvec` fallback, not the NEON `matvec_96x96` kernel
+from Phase 2.5a. Phase 2.5a converted the attention K/V/R/out
+matvecs but missed the two FFN matvecs of the same shape. A
+two-line fix.
 
-**Why:** currently we do three separate `matvec_96x96_neon`
-calls on the same input. Each call re-broadcasts x into
-registers, so the input vector is effectively loaded from L1
-three times. Fusing into one matvec keeps x in registers
-across all three projections.
+**Why it's 96×96 and not 96×384:** the original 4c3 plan
+assumed `intermediate_size > hidden_size` (the standard
+transformer FFN expansion ratio). But L3TC-200K's config sets
+`intermediate_size == hidden_size == 96`, so the FFN key and
+value are *also* 96×96. No new kernel needed — just call the
+existing one. Bigger L3TC variants (800K / 3.2M / 12M) have
+different shapes and would need proper expansion-ratio
+kernels, but we don't ship those today.
 
-**Regression gate:** ratio unchanged, tests pass.
+**Result on enwik6:**
+  compress: 119 -> 124.3 KB/s  (+4% over 4b2)
+  decompress: 119 -> 125.6 KB/s  (+5%)
+  ratio: 0.1699 -> 0.1699  (169869 -> 169876, +7 bytes from
+    4c1's NEON exp slightly shifting a few freq-quantization
+    boundaries; well within the ±0.0005 gate)
 
-**Expected gain:** ~8-12 us/token → ~+4% throughput. **Target:
-140 → ~145 KB/s.**
+### ~~4c3 — NEON FFN matvecs (96×384 and 384×96)~~  OBSOLETE
 
-### 4c3 — NEON FFN matvecs (96×384 and 384×96)
-
-**What:** two new NEON kernels:
-- `matvec_96_to_384_neon` for `ffn.w_key` (shape 384 rows × 96
-  cols — output is 384, input is 96). This is four stacked
-  96×96 blocks; reuse the register-preload pattern from
-  `matvec_96x96_neon`.
-- `matvec_384_to_96_neon` for `ffn.w_value` (shape 96 rows × 384
-  cols). Single 384-element AXPY across 96 output accumulators,
-  or equivalently 96 dot products of length 384.
-
-Both are copy-paste variants of the existing NEON 96×96 code
-with different loop bounds and register allocation.
-
-**Why:** the FFN K and V matvecs are currently using plain
-scalar `matvec` (non-NEON). They're 384 * 96 = 36864 MACs each,
-so ~35 us combined per token — bigger than the 12 block 96×96
-matvecs put together. Lowest-hanging NEON fruit after cum_freqs.
-
-**Regression gate:** ratio unchanged, round trip byte-identical.
-
-**Expected gain:** ~25 us/token → ~+10% throughput. **Target:
-145 → ~160 KB/s.**
+Originally scoped assuming `intermediate_size > hidden_size`.
+For L3TC-200K that's false: FFN matvecs are 96×96 and already
+covered by 4c2 above. This item becomes relevant only if we
+ever target the bigger L3TC variants, at which point we'd
+write the proper expansion-ratio NEON kernels. For the 200K
+model ship path, 4c3 is a no-op.
 
 ### 4c4 — NEON layer norm + fused element-wise time mix
 
