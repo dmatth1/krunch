@@ -37,28 +37,42 @@ phase11_install_python_deps() {
     # $0 reflects the parent script, not this file.
     cd /home/ubuntu/l3tc-prod/vendor/L3TC
 
-    # setup.sh already created vendor/L3TC/.venv and ran the broken
-    # `pip install -r requirements.txt` (which fails on pkuseg but
-    # successfully installs everything else AND a CPU torch wheel
-    # from the transformers dependency chain). Wipe it and start
-    # fresh so we don't fight pip's resolver against the leftover
-    # CPU torch + transformers state.
+    # Wipe the venv that setup.sh created (it had leftover CPU torch
+    # + transformers from the broken `pip install -r requirements.txt`
+    # in setup.sh). Fresh venv = no resolver fights.
     rm -rf .venv
     python3 -m venv .venv
     source .venv/bin/activate
     pip install --upgrade pip
     pip install numpy
+
+    # Install torch FIRST with the cu121 index, pinned to a known-good
+    # version. torch 2.1.2 ships its CUDA libs bundled in the wheel
+    # (no separate nvidia-* packages), unlike torch 2.5+ which pulls
+    # ~1 GB of nvidia-cufft/cusolver/cusparse/etc as runtime deps.
+    # Bundled is much faster to install and easier on g5.xlarge's
+    # I/O during the install step.
+    echo "=== installing torch 2.1.2+cu121 ==="
+    pip install torch==2.1.2 --index-url https://download.pytorch.org/whl/cu121
+
+    # Now install L3TC's other deps. The trimmed list excludes:
+    #   - pkuseg (broken setup.py, we stub it)
+    #   - openpyxl (unused)
+    #   - transformers (was pulling CPU torch and overwriting our CUDA)
     grep -vE '^(pkuseg|openpyxl|transformers)\b' requirements.txt > /tmp/l3tc-req-trimmed.txt
     echo "=== trimmed L3TC requirements ==="
     cat /tmp/l3tc-req-trimmed.txt
     echo "=== installing trimmed L3TC requirements ==="
     pip install -r /tmp/l3tc-req-trimmed.txt
+
+    # Additional deps L3TC imports but doesn't list:
+    #   - termcolor: util/logger.py
+    #   - scipy:     util/arithmeticcoding.py
+    #   - ninja:     CUDA WKV JIT compile
+    #   - tqdm:      models/RWKV_V4/rwkv_v4_train.py
     echo "=== installing scipy termcolor ninja tqdm ==="
-    # tqdm is imported by models/RWKV_V4/rwkv_v4_train.py at module load
-    # but is not in L3TC's requirements.txt. Caught on attempt 14.
     pip install scipy termcolor ninja tqdm
-    echo "=== force-reinstall torch CUDA (cu121) ==="
-    pip install --force-reinstall --no-cache-dir torch --index-url https://download.pytorch.org/whl/cu121
+
     echo "=== python deps install complete ==="
 }
 
