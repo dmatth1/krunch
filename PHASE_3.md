@@ -1,4 +1,16 @@
-# Phase 3 — File format hardening, stream API, real benchmarks
+# Phase 3 — File format hardening, stream API, real benchmarks  ⚠️ MOSTLY SHIPPED
+
+**Final result:** v3 file format with CRC32 + magic bytes,
+streaming encode + raw-store streaming decode, binary input
+support, full enwik8 baseline (110.65 KB/s / 0.2166), Silesia
+text + binary measured (with two known UTF-8 robustness gaps
+documented). Multi-platform release builds (3d) deferred to
+Phase 6. True tokenized streaming decode + UTF-8 robustness
+fixes deferred to Phase 4a (which bundles them with the
+classical-fallback work). See "Outcome" at the bottom for the
+shipping list.
+
+
 
 **Starting point (end of Phase 2.5):**
 - 116 KB/s compress, 121 KB/s decompress on enwik6 (1 MB)
@@ -162,7 +174,62 @@ recent x86_64 Linux, etc.
   set is enough for headline comparisons.
 - Fuzzing the decoder (Phase 5).
 
-## Success criteria (Phase 3 exit)
+## Outcome
+
+**Shipped:**
+
+- **3a — File format v3 with CRC32** (commit `641dd19`). Magic
+  bytes, version field, integrity trailer; reader still accepts
+  v2. New corruption-detection test.
+- **3b — Streaming encode** (commit `e465d03`). `encode_reader`
+  with bounded ~4 MB carry buffer, parallel batches via rayon,
+  `N_SEGMENTS_IMPLICIT` framing so no `Seek` is required on the
+  writer. CLI streams the input file from disk.
+- **3b-decode — Streaming decode for raw-store** (commit `21929bd`).
+  `decode_writer` with rolling 8-byte tail buffer, CRC validated
+  incrementally. Streaming for raw-store path; tokenized path
+  still slurps the compressed body (it's small).
+- **Binary input support via FLAG_RAW_STORE** (commit `3f5bc0d`).
+  encode_reader probes the first batch for UTF-8 validity; if
+  binary, it sets the flag and pipes bytes verbatim through the
+  same v3 framing. Decoder branches on the flag.
+- **3c-lite — full enwik8 baseline** (commit `6dd2296`):
+  110.65 KB/s compress / 117.50 KB/s decompress / ratio 0.2166,
+  byte-identical round trip. Committed `bench/results/enwik8-l3tc.md`.
+- **CLAUDE.md** (commit `657e1a4`) — codifies the two project
+  goals and the regression gates.
+- **Silesia measurement** (text + binary; numbers in
+  `docs/phase_3_findings.md`).
+
+**Deferred to Phase 4a (bundled with classical-fallback work):**
+
+- **True tokenized streaming decode.** Today `decode_writer`
+  reads the full compressed body into memory for tokenized files
+  (not raw-store, which truly streams). Bounded RSS for huge
+  *compressed* files needs a hashing-reader + segment-by-segment
+  peek-trailer loop (~150 lines). Low priority because compressed
+  bodies are ~5× smaller than the decoded output, so this only
+  matters for absurdly large inputs.
+- **Bug A: stray byte poisons whole file** (dickens). 8 stray
+  non-UTF-8 bytes in 10 MB of ASCII text route the entire file to
+  raw-store. Per-segment UTF-8 detection would let the 99.9999%
+  text portions still get tokenized.
+- **Bug B: mid-stream UTF-8 failure crashes encode_reader**
+  (reymont, xml). The first batch passes the UTF-8 probe so
+  encode_reader takes the text path; later bytes are invalid and
+  the encoder errors out, leaving a partial output file on disk.
+  Should fall back to raw-store or classical instead of crashing.
+
+**Deferred to Phase 6:**
+
+- **3d — Multi-platform release builds.** macOS-arm64,
+  macOS-x86_64, linux-x86_64 release artifacts; GitHub Actions;
+  SHA256 manifests. Mostly CI plumbing — moved to Phase 6 because
+  Phase 4 ratio work is higher value per unit time.
+
+---
+
+## Original success criteria (Phase 3 exit)
 
 Phase 3 is done when:
 - File format is v3 with CRC32, documented as stable.

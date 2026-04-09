@@ -52,6 +52,16 @@ decision log (including what we tried and reversed). See
 |---|---:|---:|---:|
 | **l3tc-rust** (Phase 2.5) | **0.2061** | **0.116** | **0.121** |
 | **l3tc-rust** on enwik8 (100 MB) | **0.2166** | **0.111** | **0.118** |
+
+On Silesia (heterogeneous, mostly out of distribution for an
+enwik8-trained LM), the picture changes. webster (a 41 MB English
+dictionary) compresses to **52 MB** through the LM path — model-based
+compression is exactly as good as the model's distribution match,
+and a Wikipedia-trained model has no priors for dictionary
+formatting. Phase 4a addresses this by adding a `min(LM, zstd)`
+hybrid fallback so the worst case becomes "as good as zstd"; Phase
+5 retrains on a broader corpus so the LM wins on more inputs in the
+first place. See `docs/phase_3_findings.md` for the full numbers.
 | Python L3TC-200K | 0.1665 | 0.013 | — |
 | bzip2-9 | 0.2813 | 16.67 | 35.09 |
 | xz-9e | 0.2907 | 3.77 | 52.39 |
