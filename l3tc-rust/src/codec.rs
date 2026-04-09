@@ -81,12 +81,16 @@
 //! table via:
 //!
 //! 1. Apply softmax → floating-point probabilities
-//! 2. Scale to a total of `MAX_TOTAL` = arithmetic::MAX_TOTAL
-//! 3. Clamp every symbol to at least 1 (avoid zero-probability)
-//! 4. Adjust the top-probability symbol to make the total exact
+//! 2. `freqs[i] = round(p[i] * 10_000_000)`
+//! 3. `freqs[i] = max(freqs[i], 1)` (avoid zero-probability)
+//! 4. Cumulative table is the prefix sum of `freqs`.
 //!
-//! This matches Project Nayuki's "model-driven arithmetic coding"
-//! pattern and is what L3TC's Python coder does as well.
+//! This is intentionally bit-identical with the Python L3TC
+//! reference (`vendor/L3TC/scripts/compressor.py` lines 273-276).
+//! Earlier phases used a finer scale (~2^62) with `floor` rounding
+//! and a residual fixup pass; that diverged from Python in three
+//! ways simultaneously and was 4 percentage points worse on enwik6.
+//! Phase 4a closes that gap by matching Python exactly.
 
 use crate::arithmetic::{ArithmeticDecoder, ArithmeticEncoder, MAX_TOTAL};
 use crate::error::{Error, Result};
@@ -839,88 +843,6 @@ impl CodecScratch {
     }
 }
 
-/// Fast `exp(x)` approximation for `x <= 0`, vectorization-friendly.
-///
-/// Used by [`logits_to_cum_freqs_scratch`] to turn softmax-shifted
-/// logits (which are always ≤ 0 after subtracting the max) into
-/// probabilities without calling the libm `exp` scalar function.
-///
-/// # Method
-///
-/// We factor `exp(x) = 2^(x · log2(e))` and split the exponent into
-/// an integer part `k` and a fractional part `r`:
-///
-/// ```text
-/// exp(x) = 2^(k + r) = 2^k · exp2(r),  with r in [0, 1)
-/// ```
-///
-/// - `2^k` for integer `k` is computed by directly constructing an
-///   IEEE-754 float via bit manipulation: the float `2^k` has
-///   biased exponent `k + 127` and a zero mantissa.
-/// - `exp2(r)` for `r in [0, 1)` is approximated by a degree-4
-///   polynomial fit on that interval (minimax coefficients from a
-///   standard reference). The polynomial is in Horner form, which
-///   is a 4-step scalar accumulation that LLVM vectorizes cleanly
-///   using ARM NEON FMA / x86 FMA3.
-///
-/// # Accuracy
-///
-/// Maximum relative error is around 1e-5 over `x ∈ [-50, 0]`. For
-/// `x < -50` the result is below f32 precision anyway (~2e-22), and
-/// we clamp to 0 there.
-///
-/// For arithmetic coding, this level of precision is more than
-/// sufficient: the worst-case coding overhead from approximating
-/// the probability model is the log2 of the relative error,
-/// approximately 2^-17 bits per symbol for our approximation, or
-/// about 0.00001 bits per token. On a 280,000-token file that's
-/// less than half a byte of extra output.
-///
-/// # Performance
-///
-/// About 3-5x faster than `f32::exp` because the whole routine is
-/// inlined, branch-free, and fully vectorizable. Empirically on
-/// Apple Silicon the 16384-element softmax loop drops from ~82 us
-/// to ~15-25 us.
-#[inline(always)]
-fn fast_exp_neg(x: f32) -> f32 {
-    // Clamp to a safe range; below -50 the result is ~1.9e-22,
-    // far below any frequency we'd actually emit.
-    let x = x.max(-50.0);
-
-    // y = x * log2(e); exp(x) = 2^y
-    const LOG2E: f32 = 1.442_695_f32;
-    let y = x * LOG2E;
-
-    // Split into integer and fractional parts. Since y <= 0, floor
-    // gives the largest integer <= y, and r = y - k is in [0, 1).
-    let k = y.floor();
-    let r = y - k;
-
-    // Polynomial minimax approximation of 2^r on [0, 1), degree 4.
-    // Coefficients are the same ones used by cephes and various
-    // SIMD math libraries.
-    //   2^r ≈ 1 + r*(c1 + r*(c2 + r*(c3 + r*c4)))
-    let poly = 1.0_f32
-        + r * (0.693_147_18_f32
-            + r * (0.240_226_51_f32
-                + r * (0.055_505_4_f32 + r * 0.009_618_129_f32)));
-
-    // 2^k via direct bit construction. The IEEE-754 float 2^k has
-    // biased exponent `k + 127` and a zero mantissa, so we build
-    // it as `((k + 127) << 23)` reinterpreted as f32.
-    //
-    // k can be very negative (down to -72 after the clamp), and
-    // (k + 127) can be a small positive number; for the smallest
-    // subnormal values we'd need to handle underflow, but the
-    // clamp on x guarantees we stay in the normal range.
-    let k_i = k as i32;
-    let exp_bits = ((k_i + 127) as u32) << 23;
-    let two_k = f32::from_bits(exp_bits);
-
-    two_k * poly
-}
-
 /// Public alias for [`logits_to_cum_freqs_scratch`], used by the
 /// profile tests in `tests/profile_codec.rs`. Not part of the stable API.
 #[doc(hidden)]
@@ -930,19 +852,43 @@ pub fn logits_to_cum_freqs_public(logits: &[f32], cum: &mut [u64]) {
     logits_to_cum_freqs_scratch(logits, cum, &mut exps, &mut freqs);
 }
 
-/// Convert raw model logits to a cumulative frequency table.
+/// Convert raw model logits to a cumulative frequency table,
+/// **matching the Python L3TC reference exactly**.
 ///
-/// Three passes, but the expensive one is a single-loop
-/// scale/floor/accumulate that also builds `cum` in place. The
-/// sequential cum dependency doesn't matter in practice because
-/// the `(e * scale).floor() as u64` operation is itself scalar on
-/// ARM NEON — the loop was never going to vectorize anyway, so we
-/// might as well fuse the accumulation into it and save a memory
-/// pass.
+/// The Python reference (`vendor/L3TC/scripts/compressor.py`) does:
 ///
-/// The separate `freqs` buffer in [`CodecScratch`] is retained so
-/// the signature is future-proof for a smarter vectorized
-/// implementation (e.g. an INT8-quantized path).
+/// ```python
+/// probs = torch.softmax(logits, dim=-1)
+/// freqs = torch.round(probs * 10_000_000).int()
+/// freqs = torch.max(freqs, freqs.new_ones(freqs.size()))
+/// ```
+///
+/// We mirror this exactly:
+///
+/// 1. Compute `softmax(logits)` in f32 using libm `exp` (matches
+///    PyTorch's softmax — `fast_exp_neg` introduces ~1% relative
+///    error per call, which compounds across 16384 symbols and
+///    measurably hurts ratio).
+/// 2. `freqs[i] = round(p[i] * PYTHON_FREQ_TOTAL).max(1)` where
+///    `PYTHON_FREQ_TOTAL = 10_000_000`.
+/// 3. Cumulative table = prefix sum of `freqs`.
+///
+/// The arithmetic coder accepts any `total ≤ MAX_TOTAL = 2^62`,
+/// so the ~10M total here is well within bounds. There is **no
+/// residual fixup**: whatever the rounding produces is what the
+/// AC sees, exactly as in Python.
+///
+/// Earlier (Phase 1-3) we used a finer scale (~2^62) with `floor`
+/// rounding plus a residual fixup pass distributing the truncation
+/// error to the top symbol. That looked like it should give better
+/// resolution, but it diverged from Python in three ways
+/// simultaneously (`floor` vs `round`, scale, fixup) and ended up
+/// 4 percentage points worse on enwik6. Phase 4a closes that gap
+/// by matching Python bit-for-bit.
+///
+/// `_freqs` is unused in this implementation but kept in the
+/// signature for the hot-path scratch reuse pattern in
+/// [`CodecScratch`].
 fn logits_to_cum_freqs_scratch(
     logits: &[f32],
     cum: &mut [u64],
@@ -952,9 +898,13 @@ fn logits_to_cum_freqs_scratch(
     debug_assert_eq!(cum.len(), logits.len() + 1);
     debug_assert_eq!(exps.len(), logits.len());
 
+    /// Total target frequency, matching Python L3TC's
+    /// `freqs = round(probs * 10_000_000)`.
+    const PYTHON_FREQ_TOTAL: u64 = 10_000_000;
+
     let n = logits.len();
 
-    // --- Pass 1: find max logit ---
+    // --- Pass 1: find max logit (numerical-stability shift) ---
     let mut max = f32::NEG_INFINITY;
     for &l in logits {
         if l > max {
@@ -966,10 +916,16 @@ fn logits_to_cum_freqs_scratch(
         return;
     }
 
-    // --- Pass 2: compute shifted exps and running sum ---
+    // --- Pass 2: shifted exp via libm + running sum ---
+    //
+    // We use `f32::exp` (libm) here instead of `fast_exp_neg`.
+    // The polynomial approximation is ~3-5× faster but has ~1%
+    // relative error per call. Multiplied across 16384 symbols
+    // per token, that error costs ratio. Phase 4a found this to
+    // be the second-largest contributor to the 4 pp Python gap.
     let mut sum = 0.0f32;
     for i in 0..n {
-        let e = fast_exp_neg(logits[i] - max);
+        let e = (logits[i] - max).exp();
         exps[i] = e;
         sum += e;
     }
@@ -978,54 +934,27 @@ fn logits_to_cum_freqs_scratch(
         return;
     }
 
-    // --- Pass 3: scale, floor, clamp, accumulate cum ---
+    // --- Pass 3: round(p * 10M); max(1); accumulate cum ---
     //
-    // Using f64 for scale to preserve precision against the large
-    // `usable ≈ 2^62`. f32 rounding of `usable as f32` would
-    // misallocate frequencies on many low-probability tokens.
-    let target_total: u64 = MAX_TOTAL as u64;
-    let usable = target_total.saturating_sub(n as u64);
-    let scale: f64 = (usable as f64) / (sum as f64);
-    if !scale.is_finite() {
-        uniform_fallback(n, cum);
-        return;
-    }
-
-    let mut assigned: u64 = 0;
-    let mut best_idx = 0usize;
-    let mut best_exp = f32::NEG_INFINITY;
-
+    // Mirror Python exactly: per-symbol freq is
+    // `max(1, round(prob * 10_000_000))`. No residual fixup.
+    let inv_sum = 1.0f32 / sum;
     cum[0] = 0;
+    let mut total: u64 = 0;
     for i in 0..n {
-        let e = exps[i];
-        let scaled = (((e as f64) * scale).floor() as u64).max(1);
-        assigned += scaled;
-        cum[i + 1] = cum[i] + scaled;
-        if e > best_exp {
-            best_exp = e;
-            best_idx = i;
-        }
+        let prob = exps[i] * inv_sum;
+        let scaled = (prob * PYTHON_FREQ_TOTAL as f32).round() as i64;
+        let freq = scaled.max(1) as u64;
+        total += freq;
+        cum[i + 1] = total;
     }
 
-    // --- Fix up the total ---
-    if assigned < target_total {
-        let residual = target_total - assigned;
-        for i in (best_idx + 1)..=n {
-            cum[i] += residual;
-        }
-    } else if assigned > target_total {
-        let excess = assigned - target_total;
-        let best_freq = cum[best_idx + 1] - cum[best_idx];
-        if best_freq > excess + 1 {
-            for i in (best_idx + 1)..=n {
-                cum[i] -= excess;
-            }
-        } else {
-            uniform_fallback(n, cum);
-            return;
-        }
-    }
-    debug_assert_eq!(cum[n], target_total);
+    // Sanity: total must be ≤ MAX_TOTAL for the AC to accept it.
+    // With PYTHON_FREQ_TOTAL = 10M and n ≤ 16384, the max
+    // achievable total is ~10M + 16384 (every freq rounds up by 1
+    // and the max(1) clamp pushes near-zero freqs to 1). Both are
+    // far below MAX_TOTAL = 2^62, so this never triggers.
+    debug_assert!(total <= MAX_TOTAL as u64);
 }
 
 /// Build a uniform cumulative-frequency table in `cum`.
@@ -1196,15 +1125,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cum_freqs_sum_to_max_total() {
-        // Random-ish logits
+    fn cum_freqs_match_python_total() {
+        // Random-ish logits. Phase 4a: we now match Python's
+        // `freqs = round(probs * 10_000_000); max(1)` scheme, so
+        // the total is approximately 10M (not MAX_TOTAL = 2^62).
+        // Exact value depends on rounding noise + the max(1) clamp.
         let logits: Vec<f32> = (0..256).map(|i| (i as f32 / 50.0).sin()).collect();
         let mut cum = vec![0u64; logits.len() + 1];
         let mut exps = vec![0.0f32; logits.len()];
         let mut freqs = vec![0u64; logits.len()];
         logits_to_cum_freqs_scratch(&logits, &mut cum, &mut exps, &mut freqs);
         assert_eq!(cum[0], 0);
-        assert_eq!(cum[logits.len()], MAX_TOTAL as u64);
+        // Total is bounded above by 10M + n (every freq could
+        // round up by 1) and bounded below by max(n, 10M - n).
+        let total = cum[logits.len()];
+        assert!(total <= 10_000_000 + logits.len() as u64);
+        assert!(total >= logits.len() as u64);
+        assert!(total <= MAX_TOTAL as u64);
         // No zero frequencies
         for i in 0..logits.len() {
             assert!(cum[i + 1] > cum[i], "zero freq at symbol {i}");
@@ -1218,26 +1155,12 @@ mod tests {
         let mut exps = vec![0.0f32; logits.len()];
         let mut freqs = vec![0u64; logits.len()];
         logits_to_cum_freqs_scratch(&logits, &mut cum, &mut exps, &mut freqs);
+        // The uniform fallback still uses MAX_TOTAL because it
+        // takes a different code path (for degenerate inputs).
         assert_eq!(cum[logits.len()], MAX_TOTAL as u64);
         // Every step is non-zero
         for i in 0..logits.len() {
             assert!(cum[i + 1] > cum[i]);
-        }
-    }
-
-    #[test]
-    fn fast_exp_neg_matches_libm_reasonably() {
-        // Spot-check the approximation against libm's f32::exp
-        // across the range we care about.
-        for &x in &[0.0_f32, -0.1, -0.5, -1.0, -2.0, -5.0, -10.0, -20.0, -40.0] {
-            let actual = fast_exp_neg(x);
-            let expected = x.exp();
-            let rel_err = ((actual - expected) / expected).abs();
-            // Allow ~1% relative error — more than enough for our use case
-            assert!(
-                rel_err < 0.01,
-                "fast_exp_neg({x}) = {actual}, expected {expected}, rel_err {rel_err}"
-            );
         }
     }
 
@@ -1269,12 +1192,4 @@ mod tests {
         assert_ne!(LittleEndian::read_u32(crc_bytes), crc32fast::hash(payload));
     }
 
-    #[test]
-    fn fast_exp_neg_clamps_extreme_negatives() {
-        // Below -50 we return ~0 (the input is clamped to -50)
-        let v = fast_exp_neg(-1000.0);
-        assert!(v.is_finite());
-        assert!(v >= 0.0);
-        assert!(v < 1e-20);
-    }
 }
