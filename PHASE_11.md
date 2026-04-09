@@ -6,11 +6,26 @@ on enwik6, win substantially on everything else), and decide
 whether the broader model becomes the default or ships
 alongside the enwik-trained specialist.
 
-**Status:** back-burner. Downstream of Phases 5 (architecture
-upgrade to v7) and 8 (specialist dispatch), but logically
-independent — Phase 11 can run with v4 or v7, and its output
-can be used as a standalone generalist or as one specialist
-among Phase 8's dispatch targets.
+**Status:** decision gate for Phase 8. Logically independent of
+Phase 5 (v4 or v7 both work as the underlying architecture)
+but **ordered before Phase 8** because Phase 11's outcome
+determines whether Phase 8 needs to exist at all.
+
+**Why this is a gate, not just a phase:** Phase 8 (specialist
+model dispatch + classical fallback) is ~2-3 months of work
+that only pays off if **no single broader-corpus model can
+cover the distributions we care about** at acceptable ratio.
+If Phase 11 trains a 200K (or 3.2M) model on Pile / RedPajama
+and that single model handles enwik / webster / code / logs
+all within 10-20% of the enwik-specialized number, Phase 8 is
+unnecessary — we ship the generalist as the default and the
+OOD problem is solved. If Phase 11's broader model loses badly
+on every non-Pile distribution, Phase 8 becomes mandatory and
+we know exactly which specialists to train.
+
+**Run Phase 11 before committing to Phase 8.** It saves
+2-3 months of speculative dispatch-engineering work in the
+"single broader model wins" case.
 
 ---
 

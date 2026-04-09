@@ -99,7 +99,7 @@ use crate::tensor;
 use crate::tokenizer::{EncodedSegment, Tokenizer, BOS_ID, UNK_ID};
 
 use byteorder::{ByteOrder, LittleEndian, ReadBytesExt, WriteBytesExt};
-use std::io::{Read, Write};
+use std::io::{Cursor, Read, Write};
 
 /// Header magic bytes.
 const MAGIC: &[u8; 4] = b"LRUS";
@@ -421,6 +421,21 @@ pub fn decompress(bytes: &[u8], tokenizer: &Tokenizer, model: &Model) -> Result<
         }
         out
     } else {
+        // Bound `n_segments` against the body so a malformed header
+        // claiming `n_segments = u32::MAX` cannot force a multi-GB
+        // Vec::with_capacity. The minimum on-disk size of one
+        // segment is bounded below by `MIN_SEGMENT_BYTES` (1 byte
+        // n_tokens varint + 1 byte n_unks varint + 1 byte flags +
+        // 1 byte ac_bytes_len varint = 4 bytes for an empty
+        // segment); anything larger than `body.len() / 4` is
+        // structurally impossible and we treat it as malformed.
+        const MIN_SEGMENT_BYTES: usize = 4;
+        let body_cap = body.len() / MIN_SEGMENT_BYTES;
+        if (n_segments as usize) > body_cap {
+            return Err(Error::BadCheckpoint(format!(
+                "header claims {n_segments} segments but body could fit at most {body_cap}",
+            )));
+        }
         let mut out = Vec::with_capacity(n_segments as usize);
         for _ in 0..n_segments {
             let seg = if varint_segments {
@@ -1252,6 +1267,21 @@ fn decompress_segment(
     _model: &Model,
     scratch: &mut CodecScratch,
 ) -> Result<Vec<u32>> {
+    // Prevent attacker-controlled `n_tokens` from forcing a huge
+    // `Vec::with_capacity`. The arithmetic decoder produces tokens
+    // *per symbol entropy*, not per bit, so a confident model can
+    // emit many tokens per AC byte (~1-2 in practice). We use a
+    // generous structural cap of 64 tokens per AC byte, which is
+    // far above anything realistic but still bounds the allocation
+    // at ~256× ac_body bytes — turning a memory-DOS into a
+    // well-behaved error.
+    let max_tokens = ac_body.len().saturating_mul(64).saturating_add(64);
+    if (n_tokens as usize) > max_tokens {
+        return Err(Error::BadCheckpoint(format!(
+            "segment claims {n_tokens} tokens, exceeding the structural cap of {max_tokens} for a {}-byte AC body",
+            ac_body.len(),
+        )));
+    }
     let mut tokens = Vec::with_capacity(n_tokens as usize);
     tokens.push(BOS_ID);
 
@@ -1583,26 +1613,61 @@ fn write_segment<W: Write>(w: &mut W, seg: &EncodedSegment, ac_body: &[u8]) -> R
     Ok(())
 }
 
+/// How many bytes remain after the cursor position. Used to bound
+/// allocations driven by attacker-controlled length fields read
+/// from the on-disk format.
+#[inline]
+fn remaining(cur: &Cursor<&[u8]>) -> usize {
+    cur.get_ref().len().saturating_sub(cur.position() as usize)
+}
+
+/// Allocate and fill a `Vec<u8>` of `len` bytes from `cur`, but only
+/// after sanity-checking that `len` doesn't exceed the bytes that
+/// actually remain in the input. Without this check, an attacker
+/// who supplies a 22-byte file with a varint claiming `len = 2^60`
+/// would force a 1 EB allocation before `read_exact` ever fails.
+fn read_bounded_vec(cur: &mut Cursor<&[u8]>, len: usize) -> Result<Vec<u8>> {
+    let rem = remaining(cur);
+    if len > rem {
+        return Err(Error::BadCheckpoint(format!(
+            "length-prefixed field claims {len} bytes but only {rem} remain in input",
+        )));
+    }
+    let mut buf = vec![0u8; len];
+    cur.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
 /// Read one segment in the **v4** format.
-fn read_segment_meta<R: Read>(r: &mut R) -> Result<SegmentRead> {
-    let n_tokens = read_varint(r)? as u32;
-    let n_unks = read_varint(r)? as usize;
-    let seg_flags = r.read_u8()?;
-    let ac_bytes_len = read_varint(r)? as usize;
-    let mut ac_body = vec![0u8; ac_bytes_len];
-    r.read_exact(&mut ac_body)?;
+///
+/// Every length field read here comes from on-disk bytes that may
+/// be attacker-controlled. We bound each allocation against the
+/// cursor's remaining input to keep a malformed header from forcing
+/// a multi-GB allocation. The bound is conservative — `n_unks` and
+/// `unk_len` are each capped at "no more bytes than the rest of
+/// the input could possibly contain", which is loose but enough
+/// to turn an allocation DOS into a clean `BadCheckpoint` error.
+fn read_segment_meta(cur: &mut Cursor<&[u8]>) -> Result<SegmentRead> {
+    let n_tokens = read_varint(cur)? as u32;
+    let n_unks_u64 = read_varint(cur)?;
+    if n_unks_u64 > remaining(cur) as u64 {
+        return Err(Error::BadCheckpoint(format!(
+            "segment claims {n_unks_u64} unks but only {} bytes remain",
+            remaining(cur),
+        )));
+    }
+    let n_unks = n_unks_u64 as usize;
+    let seg_flags = cur.read_u8()?;
+    let ac_bytes_len = read_varint(cur)? as usize;
+    let ac_body = read_bounded_vec(cur, ac_bytes_len)?;
     let mut unks = Vec::with_capacity(n_unks);
     for _ in 0..n_unks {
-        let unk_len = read_varint(r)? as usize;
-        let mut buf = vec![0u8; unk_len];
-        r.read_exact(&mut buf)?;
-        unks.push(buf);
+        let unk_len = read_varint(cur)? as usize;
+        unks.push(read_bounded_vec(cur, unk_len)?);
     }
     let raw_fallback = if seg_flags & SEG_FLAG_RAW_FALLBACK != 0 {
-        let raw_len = read_varint(r)? as usize;
-        let mut raw = vec![0u8; raw_len];
-        r.read_exact(&mut raw)?;
-        Some(raw)
+        let raw_len = read_varint(cur)? as usize;
+        Some(read_bounded_vec(cur, raw_len)?)
     } else {
         None
     };
@@ -1618,25 +1683,29 @@ fn read_segment_meta<R: Read>(r: &mut R) -> Result<SegmentRead> {
 ///
 /// Kept for back-compat: any v2 or v3 file produced before
 /// Phase 4b1 still decodes through this path. v4 readers should
-/// use [`read_segment_meta`] instead.
-fn read_segment_meta_v3<R: Read>(r: &mut R) -> Result<SegmentRead> {
-    let n_tokens = r.read_u32::<LittleEndian>()?;
-    let n_unks = r.read_u32::<LittleEndian>()?;
-    let seg_flags = r.read_u8()?;
-    let ac_bytes_len = r.read_u32::<LittleEndian>()? as usize;
-    let mut ac_body = vec![0u8; ac_bytes_len];
-    r.read_exact(&mut ac_body)?;
+/// use [`read_segment_meta`] instead. Same allocation-bound
+/// discipline as [`read_segment_meta`] — every length field is
+/// checked against remaining input before allocating.
+fn read_segment_meta_v3(cur: &mut Cursor<&[u8]>) -> Result<SegmentRead> {
+    let n_tokens = cur.read_u32::<LittleEndian>()?;
+    let n_unks = cur.read_u32::<LittleEndian>()?;
+    if n_unks as usize > remaining(cur) {
+        return Err(Error::BadCheckpoint(format!(
+            "segment claims {n_unks} unks but only {} bytes remain",
+            remaining(cur),
+        )));
+    }
+    let seg_flags = cur.read_u8()?;
+    let ac_bytes_len = cur.read_u32::<LittleEndian>()? as usize;
+    let ac_body = read_bounded_vec(cur, ac_bytes_len)?;
     let mut unks = Vec::with_capacity(n_unks as usize);
     for _ in 0..n_unks {
-        let unk_len = r.read_u16::<LittleEndian>()? as usize;
-        let mut buf = vec![0u8; unk_len];
-        r.read_exact(&mut buf)?;
-        unks.push(buf);
+        let unk_len = cur.read_u16::<LittleEndian>()? as usize;
+        unks.push(read_bounded_vec(cur, unk_len)?);
     }
     let raw_fallback = if seg_flags & SEG_FLAG_RAW_FALLBACK != 0 {
-        let raw_len = r.read_u32::<LittleEndian>()? as usize;
-        let mut raw = vec![0u8; raw_len];
-        r.read_exact(&mut raw)?;
+        let raw_len = cur.read_u32::<LittleEndian>()? as usize;
+        let raw = read_bounded_vec(cur, raw_len)?;
         Some(raw)
     } else {
         None
@@ -1712,6 +1781,68 @@ mod tests {
         // Every step is non-zero
         for i in 0..logits.len() {
             assert!(cum[i + 1] > cum[i]);
+        }
+    }
+
+    #[test]
+    fn bounded_read_rejects_oversized_length() {
+        // 16 bytes of input; ask for 1 GB. Must error, not allocate.
+        let buf = vec![0u8; 16];
+        let mut cur = Cursor::new(buf.as_slice());
+        let err = read_bounded_vec(&mut cur, 1_000_000_000).unwrap_err();
+        match err {
+            Error::BadCheckpoint(msg) => assert!(
+                msg.contains("length-prefixed field"),
+                "unexpected error message: {msg}"
+            ),
+            other => panic!("expected BadCheckpoint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bounded_read_accepts_exact_fit() {
+        let buf = vec![0xABu8; 8];
+        let mut cur = Cursor::new(buf.as_slice());
+        let v = read_bounded_vec(&mut cur, 8).expect("exact fit must succeed");
+        assert_eq!(v.len(), 8);
+        assert_eq!(v[0], 0xAB);
+    }
+
+    #[test]
+    fn read_segment_meta_v3_rejects_oversized_ac_bytes_len() {
+        // v3 segment header layout (fixed-width):
+        //   n_tokens: u32 LE  | n_unks: u32 LE | seg_flags: u8
+        //   ac_bytes_len: u32 LE | ac_body[ac_bytes_len] | ...
+        // Build a 13-byte header that claims a 1 GB ac_body and
+        // confirm we reject before any allocation.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&100u32.to_le_bytes()); // n_tokens
+        buf.extend_from_slice(&0u32.to_le_bytes()); // n_unks
+        buf.push(0u8); // seg_flags
+        buf.extend_from_slice(&1_000_000_000u32.to_le_bytes()); // ac_bytes_len
+        let mut cur = Cursor::new(buf.as_slice());
+        let err = match read_segment_meta_v3(&mut cur) {
+            Err(e) => e,
+            Ok(_) => panic!("expected error, got valid SegmentRead"),
+        };
+        assert!(matches!(err, Error::BadCheckpoint(_)));
+    }
+
+    #[test]
+    fn read_segment_meta_v3_rejects_oversized_n_unks() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&100u32.to_le_bytes()); // n_tokens
+        buf.extend_from_slice(&u32::MAX.to_le_bytes()); // n_unks (4B!)
+        buf.push(0u8); // seg_flags
+        buf.extend_from_slice(&0u32.to_le_bytes()); // ac_bytes_len
+        let mut cur = Cursor::new(buf.as_slice());
+        let err = match read_segment_meta_v3(&mut cur) {
+            Err(e) => e,
+            Ok(_) => panic!("expected error, got valid SegmentRead"),
+        };
+        match err {
+            Error::BadCheckpoint(msg) => assert!(msg.contains("unks"), "msg: {msg}"),
+            other => panic!("expected BadCheckpoint, got {other:?}"),
         }
     }
 

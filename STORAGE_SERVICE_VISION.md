@@ -4,6 +4,20 @@
 up during Phase 4b to capture the thinking while it's fresh so a
 future session can pick it up without re-deriving everything.
 
+**Scope note (added post Phase 4):** This document describes a
+*different product* that could be built on top of the runtime —
+a managed storage service whose unit economics depend on GPU
+batch inference at ≥100 MB/s per GPU. The l3tc-prod runtime
+itself is *not* on a roadmap toward that target. After Phase 4
+we have strong evidence (Bellard's NNCP at 3.25 KB/s, CMIX at
+1.66 KB/s, and our own Phase 4c/4e ceiling at ~150 KB/s) that
+single-stream CPU neural compression at this ratio band is
+**physically capped well below the MB/s range**, so any
+"runtime + service" pivot would be a separate engineering
+project, not a continuation of the existing phase plan. Treat
+this doc as reference material for a possible future product,
+not as a load-bearing roadmap item for the open source CLI.
+
 ## The idea in one paragraph
 
 A cloud storage service that uses neural compression on the
