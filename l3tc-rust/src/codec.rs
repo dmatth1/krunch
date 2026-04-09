@@ -121,6 +121,13 @@ const VERSION: u8 = 3;
 /// Legacy version this decoder still accepts (without CRC).
 const VERSION_V2_COMPAT: u8 = 2;
 
+/// Sentinel value stored in the header `n_segments` field to signal
+/// "segment count not known at header-write time — read segments
+/// until the trailer magic". Used by the streaming encoder
+/// ([`encode_reader`]) so it can emit a valid header before knowing
+/// how many segments it will produce.
+const N_SEGMENTS_IMPLICIT: u32 = u32::MAX;
+
 /// Per-segment flag bit: "raw fallback bytes follow the unks".
 ///
 /// When the encoder detects that `sp.decode(tokens) != original`
@@ -253,11 +260,36 @@ pub fn decompress(bytes: &[u8], tokenizer: &Tokenizer, model: &Model) -> Result<
 
     // First pass: read all segment metadata + bodies sequentially.
     // This is I/O bound and very cheap (just byte copies).
-    let mut raw_segments: Vec<SegmentRead> = Vec::with_capacity(n_segments as usize);
-    for _ in 0..n_segments {
-        raw_segments.push(read_segment_meta(&mut cursor)?);
-    }
+    //
+    // If the header carries the `N_SEGMENTS_IMPLICIT` sentinel the
+    // stream was produced by [`encode_reader`] and we don't know
+    // how many segments to expect. Peek 4 bytes before each segment
+    // and stop when they equal the trailer magic.
+    let mut raw_segments: Vec<SegmentRead> = if n_segments == N_SEGMENTS_IMPLICIT {
+        let mut out = Vec::new();
+        loop {
+            let pos = cursor.position() as usize;
+            if body.len() - pos < 4 {
+                return Err(Error::BadCheckpoint(
+                    "truncated before trailer in implicit-count stream".into(),
+                ));
+            }
+            if &body[pos..pos + 4] == TRAILER {
+                break;
+            }
+            out.push(read_segment_meta(&mut cursor)?);
+        }
+        out
+    } else {
+        let mut out = Vec::with_capacity(n_segments as usize);
+        for _ in 0..n_segments {
+            out.push(read_segment_meta(&mut cursor)?);
+        }
+        out
+    };
     read_trailer(&mut cursor)?;
+    // Silence the "may be mutated" lint when the explicit branch runs.
+    let _ = &mut raw_segments;
 
     // Second pass: decode each segment in parallel. Each thread
     // owns a fresh Session (because LayerState is per-thread).
@@ -283,6 +315,159 @@ pub fn decompress(bytes: &[u8], tokenizer: &Tokenizer, model: &Model) -> Result<
         out.push_str(&piece);
     }
     Ok(out)
+}
+
+/// Streaming compress from a reader to a writer.
+///
+/// Reads `src` in bounded batches, tokenizes each batch (splitting
+/// only on newlines so segmentation stays consistent with the
+/// in-memory path), compresses the batch's segments in parallel
+/// with rayon, and writes the header/body/trailer to `dst`
+/// incrementally. Peak memory is roughly
+/// `BATCH_BYTES + rayon_workers * segment_bytes + segment bodies`,
+/// independent of total input size.
+///
+/// The header's `n_segments` field is written as
+/// [`N_SEGMENTS_IMPLICIT`] because the streaming writer doesn't
+/// know the final segment count at header-write time. The decoder
+/// recognises this sentinel and walks segments until it sees the
+/// trailer magic.
+///
+/// Returns the total number of uncompressed input bytes consumed.
+pub fn encode_reader<R: Read, W: Write>(
+    mut src: R,
+    dst: W,
+    tokenizer: &Tokenizer,
+    model: &Model,
+    segment_bytes: usize,
+) -> Result<u64> {
+    use rayon::prelude::*;
+
+    /// Soft target for how many input bytes to buffer before
+    /// segmenting + compressing a batch. Larger batches mean more
+    /// segment-level parallelism per batch (better rayon
+    /// utilisation) at the cost of higher peak memory. 4 MB is
+    /// empirically enough to fill 8 cores without blowing past a
+    /// ~10 MB RSS budget.
+    const BATCH_BYTES: usize = 4 * 1024 * 1024;
+
+    // Wrap the writer in a CRC-computing adapter so we can write
+    // bytes once and update the hash in step.
+    let mut dst = CrcWriter::new(dst);
+
+    // --- Header with implicit segment count ---
+    // total_bytes is unknown until the stream ends; we write 0 as a
+    // placeholder. Consumers that need the exact count can derive
+    // it from the reconstructed output. The CLI's --time path
+    // doesn't rely on this field.
+    write_header(&mut dst, 0, N_SEGMENTS_IMPLICIT)?;
+
+    // Byte accumulator straddling batch boundaries. We only split
+    // on '\n' so the carry holds the tail of the current read that
+    // didn't end on a newline.
+    let mut carry: Vec<u8> = Vec::with_capacity(BATCH_BYTES);
+    let mut read_buf = vec![0u8; 64 * 1024];
+    let mut total_in: u64 = 0;
+    let mut eof = false;
+
+    while !eof {
+        // Fill carry to BATCH_BYTES (or until EOF).
+        while carry.len() < BATCH_BYTES {
+            let n = src.read(&mut read_buf).map_err(Error::Io)?;
+            if n == 0 {
+                eof = true;
+                break;
+            }
+            carry.extend_from_slice(&read_buf[..n]);
+        }
+
+        // Choose a cut point: the last '\n' in carry, so we never
+        // break a line across batches (segmentation groups short
+        // lines and splits long ones, and both behaviours depend
+        // on seeing whole lines).
+        let cut = if eof {
+            carry.len()
+        } else {
+            match carry.iter().rposition(|&b| b == b'\n') {
+                Some(idx) => idx + 1,
+                None => {
+                    // No newline in 4 MB of input — degenerate
+                    // binary-ish content. Flush the whole carry to
+                    // avoid pathological unbounded growth.
+                    carry.len()
+                }
+            }
+        };
+        if cut == 0 {
+            continue;
+        }
+
+        // Move the prefix out so we can stream the tail forward.
+        let prefix: Vec<u8> = carry.drain(..cut).collect();
+        total_in += prefix.len() as u64;
+        let text = std::str::from_utf8(&prefix)
+            .map_err(|e| Error::BadCheckpoint(format!("non-utf8 input: {e}")))?;
+
+        let segments = tokenizer.encode_file(text, segment_bytes)?;
+
+        // Compress this batch's segments in parallel. Each segment
+        // gets its own Session + scratch so threads don't contend.
+        let bodies: Result<Vec<Vec<u8>>> = segments
+            .par_iter()
+            .map(|seg| {
+                if seg.needs_raw_fallback {
+                    return Ok(Vec::new());
+                }
+                let mut session = Session::new(model);
+                let mut scratch = CodecScratch::new(model.vocab_size);
+                compress_segment(seg, &mut session, model, &mut scratch)
+            })
+            .collect();
+        let bodies = bodies?;
+
+        for (seg, body) in segments.iter().zip(bodies.iter()) {
+            write_segment(&mut dst, seg, body)?;
+        }
+    }
+
+    write_trailer(&mut dst)?;
+    let (mut inner, crc) = dst.finish();
+    inner.write_u32::<LittleEndian>(crc).map_err(Error::Io)?;
+    Ok(total_in)
+}
+
+/// Write adapter that computes a CRC32 over every byte written.
+///
+/// Used by [`encode_reader`] so the streaming writer can produce
+/// the same CRC32 trailer that [`compress`] appends in one shot.
+struct CrcWriter<W: Write> {
+    inner: W,
+    hasher: crc32fast::Hasher,
+}
+
+impl<W: Write> CrcWriter<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            hasher: crc32fast::Hasher::new(),
+        }
+    }
+
+    fn finish(self) -> (W, u32) {
+        let crc = self.hasher.finalize();
+        (self.inner, crc)
+    }
+}
+
+impl<W: Write> Write for CrcWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.hasher.update(&buf[..n]);
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 // -------- per-segment codec -------- //

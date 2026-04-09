@@ -31,7 +31,9 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use l3tc::{compress, decompress, Checkpoint, Model, Tokenizer, DEFAULT_SEGMENT_BYTES};
+use l3tc::{
+    decompress, encode_reader, Checkpoint, Model, Tokenizer, DEFAULT_SEGMENT_BYTES,
+};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
@@ -150,10 +152,12 @@ fn run_compress(
     });
     let output = output.unwrap_or(&default_out);
 
-    let t0 = Instant::now();
-    let text = std::fs::read_to_string(input)
-        .with_context(|| format!("reading input {input:?}"))?;
-    let read_dt = t0.elapsed();
+    // Stat the input up front so we can report the ratio without
+    // having to hold the whole thing in memory.
+    let input_bytes = std::fs::metadata(input)
+        .with_context(|| format!("stat input {input:?}"))?
+        .len() as usize;
+    let read_dt = Instant::now().elapsed(); // placeholder; streaming reads during compress
 
     let t0 = Instant::now();
     let model = load_model(model_path)?;
@@ -164,18 +168,30 @@ fn run_compress(
         .with_context(|| format!("loading tokenizer {tokenizer_path:?}"))?;
     let tok_load_dt = t0.elapsed();
 
+    // Streaming encode: read input in bounded batches, write each
+    // batch's compressed segments immediately. Peak RSS is the
+    // model + tokenizer + ~4 MB batch buffer, independent of
+    // input size.
     let t0 = Instant::now();
-    let compressed = compress(&text, &tokenizer, &model, segment_bytes)
+    let in_file = std::fs::File::open(input)
+        .with_context(|| format!("opening input {input:?}"))?;
+    let src = std::io::BufReader::new(in_file);
+    let out_file = std::fs::File::create(output)
+        .with_context(|| format!("creating output {output:?}"))?;
+    let mut out_buf = std::io::BufWriter::new(out_file);
+    encode_reader(src, &mut out_buf, &tokenizer, &model, segment_bytes)
         .with_context(|| "compression failed")?;
+    use std::io::Write;
+    out_buf
+        .flush()
+        .with_context(|| format!("flushing output {output:?}"))?;
+    drop(out_buf);
     let compress_dt = t0.elapsed();
+    let write_dt = std::time::Duration::from_secs(0);
 
-    let t0 = Instant::now();
-    std::fs::write(output, &compressed)
-        .with_context(|| format!("writing output {output:?}"))?;
-    let write_dt = t0.elapsed();
-
-    let input_bytes = text.len();
-    let output_bytes = compressed.len();
+    let output_bytes = std::fs::metadata(output)
+        .with_context(|| format!("stat output {output:?}"))?
+        .len() as usize;
     let ratio = output_bytes as f64 / input_bytes.max(1) as f64;
     let compress_kb_s = (input_bytes as f64 / 1024.0) / compress_dt.as_secs_f64();
 
@@ -198,6 +214,10 @@ fn run_compress(
 
     if verify {
         let vt0 = Instant::now();
+        let compressed = std::fs::read(output)
+            .with_context(|| format!("verify: reading {output:?}"))?;
+        let text = std::fs::read_to_string(input)
+            .with_context(|| format!("verify: reading {input:?}"))?;
         let decompressed = decompress(&compressed, &tokenizer, &model)
             .with_context(|| "verify: decompression failed")?;
         let verify_dt = vt0.elapsed();
