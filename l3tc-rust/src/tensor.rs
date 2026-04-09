@@ -329,6 +329,85 @@ pub fn matvec_col_major(
     }
 }
 
+/// Quantize a column-major f32 matrix to INT8 with per-column scales.
+///
+/// For each column `j`, computes `scale_j = max(|col_j|) / 127`
+/// (symmetric) and stores `q_j[i] = round(col_j[i] / scale_j)`
+/// clamped to `[-127, 127]`. Zero columns get `scale = 0` and all
+/// zero quantized values.
+///
+/// Returns `(qdata, scales)` where `qdata` is the column-major i8
+/// buffer of length `rows * cols` and `scales` is an f32 vector of
+/// length `cols`.
+pub fn quantize_col_major_int8(
+    mat_col_major: &[f32],
+    rows: usize,
+    cols: usize,
+) -> (Vec<i8>, Vec<f32>) {
+    debug_assert_eq!(mat_col_major.len(), rows * cols);
+    let mut qdata = vec![0i8; rows * cols];
+    let mut scales = vec![0.0f32; cols];
+    for j in 0..cols {
+        let col = &mat_col_major[j * rows..(j + 1) * rows];
+        let mut max_abs = 0.0f32;
+        for &v in col {
+            let a = v.abs();
+            if a > max_abs {
+                max_abs = a;
+            }
+        }
+        if max_abs == 0.0 {
+            scales[j] = 0.0;
+            continue;
+        }
+        let scale = max_abs / 127.0;
+        let inv = 1.0 / scale;
+        scales[j] = scale;
+        let qcol = &mut qdata[j * rows..(j + 1) * rows];
+        for i in 0..rows {
+            let q = (col[i] * inv).round();
+            qcol[i] = q.clamp(-127.0, 127.0) as i8;
+        }
+    }
+    (qdata, scales)
+}
+
+/// INT8 column-major matvec with per-column dequant.
+///
+/// Computes `out[i] = sum_j (xs_j * (qmat_col[j][i] as f32))` where
+/// `xs_j = x[j] * scales[j]`. This is the f32 AXPY form over the
+/// widened i8 column — the inner loop widens i8 → f32 and does a
+/// scalar-broadcast FMA, which LLVM auto-vectorizes into NEON sxtl
+/// + scvtf + fmla. Memory traffic is 4× lower than the f32 path.
+pub fn matvec_col_major_int8(
+    qmat: &[i8],
+    scales: &[f32],
+    x: &[f32],
+    out: &mut [f32],
+    rows: usize,
+    cols: usize,
+) {
+    debug_assert_eq!(qmat.len(), rows * cols);
+    debug_assert_eq!(scales.len(), cols);
+    debug_assert_eq!(x.len(), cols);
+    debug_assert_eq!(out.len(), rows);
+
+    for v in out.iter_mut() {
+        *v = 0.0;
+    }
+
+    for j in 0..cols {
+        let xs = x[j] * scales[j];
+        if xs == 0.0 {
+            continue;
+        }
+        let col = &qmat[j * rows..(j + 1) * rows];
+        for i in 0..rows {
+            out[i] += xs * (col[i] as f32);
+        }
+    }
+}
+
 /// Transpose a row-major `(rows, cols)` matrix into a column-major
 /// buffer of length `rows * cols`.
 ///

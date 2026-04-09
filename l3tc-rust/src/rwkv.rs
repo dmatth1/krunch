@@ -187,6 +187,13 @@ pub struct Model {
     /// for L3TC-200K) and unlocks a ~10× speedup on the head matmul
     /// at inference time.
     pub head_col_major: Vec<f32>,
+    /// INT8-quantized head weights (column-major, same layout as
+    /// `head_col_major` but one byte per element). Per-column scales
+    /// are in `head_scales`. Populated at load time from the f32 head
+    /// and used by `Session::forward` for the hot head matvec.
+    pub head_q: Vec<i8>,
+    /// Per-column f32 dequant scales for `head_q`, length `vocab_size`.
+    pub head_scales: Vec<f32>,
 }
 
 impl Model {
@@ -213,6 +220,12 @@ impl Model {
         // tensor::matvec_col_major).
         let head_tensor = ckpt.take_shape("head.weight", &[vocab_size, hidden_size])?;
         let head_col_major = tensor::transpose(&head_tensor.data, vocab_size, hidden_size);
+        // Quantize the head to INT8 per-column at load time. The f32
+        // head is kept as a fallback for parity tests but the hot path
+        // uses the INT8 version (~4× lower memory traffic on the
+        // 6.3 MB head weight, the single biggest matmul in the pass).
+        let (head_q, head_scales) =
+            tensor::quantize_col_major_int8(&head_col_major, vocab_size, hidden_size);
 
         let ln0 = LayerNormParams {
             weight: ckpt.take_shape("ln0.weight", &[hidden_size])?.data,
@@ -246,6 +259,8 @@ impl Model {
             blocks,
             ln_out,
             head_col_major,
+            head_q,
+            head_scales,
         })
     }
 
@@ -461,8 +476,9 @@ impl<'a> Session<'a> {
         // savings from multi-threading. Segment-level parallelism
         // (in codec.rs) is where the actual parallelism wins.
         // Within a segment's forward pass, serial is fastest.
-        tensor::matvec_col_major(
-            &self.model.head_col_major,
+        tensor::matvec_col_major_int8(
+            &self.model.head_q,
+            &self.model.head_scales,
             &self.scratch.normed,
             &mut self.logits,
             self.model.vocab_size,
@@ -700,6 +716,8 @@ mod tests {
             // head is stored column-major; for a tiny test model
             // where all values are equal, the layout doesn't matter.
             head_col_major: vec![0.01; vocab * hidden],
+            head_q: vec![0i8; vocab * hidden],
+            head_scales: vec![0.0f32; hidden],
         }
     }
 
