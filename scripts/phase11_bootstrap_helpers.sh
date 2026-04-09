@@ -53,8 +53,10 @@ phase11_install_python_deps() {
     cat /tmp/l3tc-req-trimmed.txt
     echo "=== installing trimmed L3TC requirements ==="
     pip install -r /tmp/l3tc-req-trimmed.txt
-    echo "=== installing scipy termcolor ninja ==="
-    pip install scipy termcolor ninja
+    echo "=== installing scipy termcolor ninja tqdm ==="
+    # tqdm is imported by models/RWKV_V4/rwkv_v4_train.py at module load
+    # but is not in L3TC's requirements.txt. Caught on attempt 14.
+    pip install scipy termcolor ninja tqdm
     echo "=== force-reinstall torch CUDA (cu121) ==="
     pip install --force-reinstall --no-cache-dir torch --index-url https://download.pytorch.org/whl/cu121
     echo "=== python deps install complete ==="
