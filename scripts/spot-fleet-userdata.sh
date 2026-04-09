@@ -115,21 +115,61 @@ echo "trimmed L3TC requirements:"
 cat /tmp/l3tc-req-trimmed.txt
 pip install -r /tmp/l3tc-req-trimmed.txt -q
 
-# pkuseg workaround: L3TC's three dataset files (enwik_dataset.py,
-# enwik_ascii_dataset.py, dataset.py) all do `import pkuseg` at the
-# top of the module, but NONE of them actually call any pkuseg
-# function. We confirmed this by grepping the source. The import is
-# vestigial. pkuseg's own setup.py is broken (imports numpy before
-# build_requires installs it), so installing it is painful even with
-# the workaround. The clean fix is to write an empty pkuseg/__init__.py
-# into site-packages so the import succeeds and immediately yields a
-# do-nothing module. Since L3TC never calls pkuseg.<anything>, this
-# is functionally equivalent to having pkuseg installed.
+# Additional runtime deps NOT in L3TC's requirements.txt that L3TC's
+# training path actually imports. Confirmed by grepping the L3TC
+# source for non-stdlib imports under main.py + util/ + models/
+# + dataset/.
+#   - termcolor: util/logger.py imports `from termcolor import colored`
+#   - scipy:     util/arithmeticcoding.py imports `scipy.special`
+pip install scipy termcolor -q
+
+# pkuseg + deepspeed workarounds: L3TC's source has hard top-level
+# imports for both even though neither is in requirements.txt and
+# neither is actually called from our training path:
+#
+# 1. pkuseg: imported at the top of all three dataset/*.py files but
+#    never actually called. The L3TC tokenization is SentencePiece;
+#    pkuseg is vestigial. pkuseg's own setup.py is also broken
+#    (imports numpy before build_requires installs it).
+#
+# 2. deepspeed: every model in models/RWKV_V4/*train.py imports
+#    `from deepspeed.ops.adam import FusedAdam` at the top, so the
+#    module fails to load if deepspeed is missing. BUT — and this
+#    is the unlock — `configure_optimizers()` (line 526-530 of
+#    rwkv_tc_hira_train.py) wraps the FusedAdam call in a try/except
+#    and falls back to torch.optim.Adam. So we only need the import
+#    to succeed; the symbol can be a stub class that raises on init.
+#    Installing real deepspeed is heavy (CUDA toolkit, ninja, ~10 min
+#    compile) and unnecessary for our 200K model.
+#
+# Both fixes: write minimal stub modules into site-packages.
 SITE_PKGS=$(python -c "import sysconfig; print(sysconfig.get_path('purelib'))")
+
+# pkuseg stub
 mkdir -p "${SITE_PKGS}/pkuseg"
 echo "# stub: real pkuseg not installed because L3TC's import is vestigial" \
     > "${SITE_PKGS}/pkuseg/__init__.py"
 echo "stubbed pkuseg at ${SITE_PKGS}/pkuseg/__init__.py"
+
+# deepspeed stub: package + ops + ops.adam, with FusedAdam class
+# that raises on instantiation (caught by L3TC's try/except).
+mkdir -p "${SITE_PKGS}/deepspeed/ops/adam"
+echo "# stub: real deepspeed not installed; FusedAdam falls back to torch.optim.Adam" \
+    > "${SITE_PKGS}/deepspeed/__init__.py"
+echo "" > "${SITE_PKGS}/deepspeed/ops/__init__.py"
+cat > "${SITE_PKGS}/deepspeed/ops/adam/__init__.py" <<'PYEOF'
+# Stub: real deepspeed not installed. L3TC's configure_optimizers
+# wraps the FusedAdam call in try/except and falls back to
+# torch.optim.Adam if it raises. We make instantiation raise so the
+# fallback always wins.
+class FusedAdam:
+    def __init__(self, *args, **kwargs):
+        raise RuntimeError(
+            "deepspeed stub: FusedAdam not available; "
+            "L3TC will fall back to torch.optim.Adam via try/except"
+        )
+PYEOF
+echo "stubbed deepspeed.ops.adam.FusedAdam at ${SITE_PKGS}/deepspeed/"
 
 # CUDA-PyTorch matching the host CUDA. Install AFTER the L3TC reqs so
 # that nothing in the dependency chain (transformers, tokenizers, etc.)
