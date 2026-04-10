@@ -96,6 +96,36 @@ we know exactly which specialists to train.
 
 ---
 
+## After Phase 11 — the shipping track
+
+Phase 11's outcome determines the path, but **Phase 9 (fuzzing)
+should run next regardless** — it's mandatory for any public
+release, it's local Rust work (no cloud), and it can run in
+parallel with Phase 11 training.
+
+**If Phase 11 succeeds** (broader model ≤ 0.20 on enwik6, OOD
+numbers improve dramatically):
+
+| order | phase | what | effort |
+|---|---|---|---|
+| 1 | **Phase 9** | Fuzzing + input caps + panic-free | ~1 week |
+| 2 | **Phase 7** | Cross-platform numeric determinism | ~2-3 weeks |
+| 3 | **Phase 6** | Multi-platform release builds + CI | ~1-2 weeks |
+| 4 | **Phase 10** | Distribution + language bindings | ~2-4 weeks |
+
+Phase 8 (specialist dispatch) becomes unnecessary. Phase 5
+(RWKV-v7) becomes a post-ship ratio bet.
+
+**If Phase 11 fails** (enwik6 floor broken or OOD doesn't
+improve): Phase 8 becomes mandatory (specialist dispatch +
+classical fallback), Phase 5 becomes a capacity bet. Then the
+same 9 → 7 → 6 → 10 shipping track follows.
+
+**Shortest path to open source release:** 9 → 7 → 6 → 10,
+~6-8 weeks of systems work, all Rust, no ML training.
+
+---
+
 ## Why a broader corpus matters
 
 Everything we've measured so far has been on enwik6/enwik8.

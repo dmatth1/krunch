@@ -20,7 +20,7 @@ speed is Bellard's [ts_zip](https://bellard.org/ts_zip/) at
 ~1 MB/s on an RTX 4090, which uses an 850× larger model and is
 GPU-only — different product category. Slower than classical
 codecs (gzip / xz / zstd) by ~30-130×, with 30-45% better ratio
-than zstd-22. See [`COMPARISON.md`](COMPARISON.md) for the full
+than zstd-22. See [`docs/COMPARISON.md`](docs/COMPARISON.md) for the full
 primary-source comparison and the math behind every number.
 
 This is a ratio-first tool. Reach for it when bytes-on-disk
@@ -54,7 +54,7 @@ shrinking. See [`docs/phase-findings/phase_4e_findings.md`](docs/phase-findings/
 
 Combined with NNCP v3.2 at 4 KB/s, CMIX v21 at 1.57 KB/s, and
 the rest of the LTCB neural / PAQ field below 14 KB/s
-wall-clock (see [`COMPARISON.md`](COMPARISON.md)), the honest
+wall-clock (see [`docs/COMPARISON.md`](docs/COMPARISON.md)), the honest
 read is that **~150 KB/s is at or near the practical ceiling
 for single-stream learned compression on CPU at this ratio
 band**, and l3tc-prod 200K is sitting on it. The runtime is
@@ -170,15 +170,15 @@ gated on Phase 11 data.
   webster / code / logs at acceptable ratio, Phase 8 (specialist
   dispatch) is unnecessary.
 
-Plus [`STORAGE_SERVICE_VISION.md`](STORAGE_SERVICE_VISION.md) —
+Plus [`docs/STORAGE_SERVICE_VISION.md`](docs/STORAGE_SERVICE_VISION.md) —
 exploratory writeup of a managed-storage-service productization
 path that dodges most of the client-side deployment problems.
 Back-burner reference, not an active phase.
 
 See [`docs/phases/`](docs/phases/) for detailed per-phase plans. See
 [`CLAUDE.md`](CLAUDE.md) for the two project goals and regression
-gates. See [`ANALYSIS.md`](ANALYSIS.md) for the full project
-thinking. See [`DECISIONS.md`](DECISIONS.md) for the architectural
+gates. See [`docs/ANALYSIS.md`](docs/ANALYSIS.md) for the full project
+thinking. See [`docs/DECISIONS.md`](docs/DECISIONS.md) for the architectural
 decision log (including what we tried and reversed). See
 [`docs/`](docs/) for per-phase findings.
 
@@ -258,7 +258,7 @@ about.
 For the full primary-source comparison including LLMZip,
 Llamazip, Nacrith, the L3TC paper's batched-inference numbers,
 the per-core single-thread normalization math, and the
-methodology caveats, see [`COMPARISON.md`](COMPARISON.md).
+methodology caveats, see [`docs/COMPARISON.md`](docs/COMPARISON.md).
 
 ### vs classical compressors (enwik6, 1 MB, round-trip verified)
 
@@ -363,10 +363,10 @@ parallelism — per-core single-thread, the gap shrinks to
 1.2-10.5×. The full primary-source breakdown, including the
 ratio gap (we sit ~67% behind NNCP v3.2 at the frontier; the
 3.2M opt-in tier closes that to ~24%), is in
-[`COMPARISON.md`](COMPARISON.md).
+[`docs/COMPARISON.md`](docs/COMPARISON.md).
 
 We did not become a zstd alternative. The original target in
-ANALYSIS.md was ≥10 MB/s single-stream CPU; that target was
+docs/ANALYSIS.md was ≥10 MB/s single-stream CPU; that target was
 calibrated against classical compressors without checking what
 was actually achievable in the learned class. After Phase 4 we
 have strong evidence — Bellard's NNCP at 4 KB/s wall-clock,
@@ -394,14 +394,13 @@ compressor.
 l3tc-prod/
 ├── README.md              this file
 ├── CLAUDE.md              the two project goals + regression gates
-├── COMPARISON.md          primary-source compressor landscape + math
-├── ANALYSIS.md            original project thinking document
-├── DECISIONS.md           architectural decision log
+│   ├── COMPARISON.md      primary-source compressor landscape + math
+│   ├── ANALYSIS.md        original project thinking document
+│   ├── DECISIONS.md       architectural decision log
 ├── docs/
 │   ├── phases/            per-phase plans (PHASE_0..11.md)
 │   ├── phase-findings/    per-phase results writeups
-├── STORAGE_SERVICE_VISION.md
-│                          exploratory back-burner productization writeup
+│   ├── STORAGE_SERVICE_VISION.md  exploratory back-burner writeup
 │   └── ...
 ├── bench/                 Python benchmark harness (stdlib-only)
 │   ├── bench.py
@@ -498,7 +497,7 @@ cargo test --release --test end_to_end -- --ignored --test-threads=1 --nocapture
   fallback", but reversed in Phase 1 — we hand-rolled the tensor math
   because the model is small (2 layers × 96 dim) and a framework's
   abstractions cost more than they save. See D3 and D8 in
-  [`DECISIONS.md`](DECISIONS.md).
+  [`docs/DECISIONS.md`](docs/DECISIONS.md).
 - **D4 — Training data:** stick with enwik8 through Phase 5 (v7
   architecture upgrade); broader corpus (The Pile / RedPajama /
   domain mix) is its own Phase 11 after the architecture test
@@ -508,5 +507,5 @@ cargo test --release --test end_to_end -- --ignored --test-threads=1 --nocapture
 - **D7 — Benchmark harness:** stdlib-only Python (no numpy, no pandas),
   shells out to compressors and measures wall time + rusage + byte counts
 
-See [`DECISIONS.md`](DECISIONS.md) for the full list with reasoning and
+See [`docs/DECISIONS.md`](docs/DECISIONS.md) for the full list with reasoning and
 (where applicable) what we changed our mind about.
