@@ -325,7 +325,55 @@ From the 100-step bf16 canary on the A10G:
 | Wall time | ~3-8 hours |
 | **Cost** | **~$2-6 on spot** |
 
-### Pass 1 — enwik9 sanity check (AFTER RECIPE VALIDATION)
+### enwik8 recipe validation results (DONE — 2026-04-10)
+
+5-epoch run on g5.xlarge A10G, bf16, AdamW + cosine warmup:
+
+| metric | L3TC shipped (20 ep × 1M) | our recipe (5 ep × 200K) |
+|---|---:|---:|
+| total tokens | 40.96B | 2.05B (20× less) |
+| enwik6 ratio | 0.1699 | 0.2161 |
+| compress speed | 131 KB/s | 138.6 KB/s |
+| final train loss | — | 4.2623 |
+| eval CE (nats) | — | 4.6706 |
+| round-trip | OK | OK |
+| bf16 NaN | n/a | none over 125K steps |
+| wall time | — | 88 min |
+| cost | — | ~$1.80 on-demand |
+
+**Verdict:** recipe works. The 0.2161 ratio is undertrained (20×
+less compute than L3TC), not broken — loss was still actively
+decreasing at epoch 5 with no sign of plateau. bf16 stable over
+125K training steps. Pipeline is end-to-end clean: train →
+checkpoint → convert_checkpoint.py → Rust runtime → byte-identical
+round-trip at unchanged speed.
+
+Not spending ~$27 to match L3TC's full 41B-token training budget
+on enwik8 — the recipe is validated, the corpus is the real
+variable under test. Moving directly to Pass 2 (Pile dedup).
+
+### Pass 1 — enwik9 sanity check (SKIPPED)
+
+Originally planned as a pipeline sanity check on enwik9 (1 GB).
+The enwik8 recipe validation served this purpose: it proved the
+cloud training pipeline, the AMI, bf16, the improved recipe,
+checkpoint conversion, and Rust runtime round-trip all work.
+enwik9 would just be "more of the same domain" without answering
+the OOD question that Phase 11 exists to answer. Skipping
+straight to Pass 2.
+
+### Pass 2 — Pile dedup broader corpus (NEXT — the actual Phase 11 experiment)
+
+This is the run that answers the real question: can a single 200K
+model trained on a broader corpus handle webster / dickens / code
+/ logs without breaking the enwik6 ratio floor (≤ 0.20)?
+
+**Blocker:** `scripts/build_pile_corpus.py` — not yet written.
+Needs to pull the Pile deduplicated subset from HuggingFace,
+select ~50 GB of shards, concatenate, tokenize with the existing
+SPM, and upload to S3.
+
+### Pass 1 — enwik9 (ORIGINAL PLAN, NOW SKIPPED)
 
 **Goal:** train on enwik9 (1 GB, 10× enwik8) with the validated
 recipe and the baked AMI. By this point the recipe is already
