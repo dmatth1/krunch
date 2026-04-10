@@ -19,7 +19,11 @@ named separately.
    intermediate 96, rwkv_rank 4, vocab 16384. Don't touch the
    model class. If we want to test v7, that's Phase 5; mixing
    "v4 → v7" with "enwik8 → broader corpus" confounds two
-   variables in one experiment.
+   variables in one experiment. **Training recipe (optimizer,
+   LR schedule, mixed precision) is NOT constrained** — we use
+   the best modern recipe for the architecture, not L3TC's
+   original recipe which had a broken double-stepping StepLR
+   and zero weight decay.
 
 2. **Same parameter count: 200K, fixed.** Don't grow it. If a
    broader corpus doesn't fit at 200K, **that is a real finding

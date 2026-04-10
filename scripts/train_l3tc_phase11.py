@@ -18,10 +18,13 @@ That's it. Everything else is our own code: the dataset, the
 training loop, the optimizer setup, the LR schedule, the eval
 function, the checkpointing.
 
-Hyperparameters and architecture are pinned to match
-`vendor/L3TC/config/l3tc/l3tc_200k.py` exactly per Phase 11
-hard constraint #1 (architecture and parameter count
-unchanged; only the training corpus varies).
+Architecture and parameter count are pinned to match
+`vendor/L3TC/config/l3tc/l3tc_200k.py` per Phase 11 hard
+constraint #1 (architecture unchanged). Training recipe is
+improved over L3TC: AdamW with weight_decay=0.01 (was Adam with
+0 decay), cosine annealing with linear warmup (was a broken
+double-stepping StepLR that collapsed LR to 0.3% by end of
+training), bf16 mixed precision, and torch.compile.
 
 Usage (local MPS validation):
 
@@ -137,9 +140,15 @@ LEARNING_RATE = 1e-4
 ADAM_BETAS = (0.9, 0.99)
 ADAM_EPS = 1e-8
 CLIP_MAX_NORM = 5.0
-# step_lr scheduler with step_size=10, gamma=0.9999
-SCHEDULER_STEP_SIZE = 10
-SCHEDULER_GAMMA = 0.9999
+# Cosine annealing with linear warmup. Replaces L3TC's broken
+# double-stepping StepLR (which collapsed LR to 0.3% of initial by
+# end of training). The warmup prevents instability on the first few
+# steps from random init; the cosine tail gives a smooth convergence.
+WARMUP_STEPS = 500
+LR_MIN = 1e-6
+# Weight decay for AdamW. L3TC used Adam with 0 decay; we use AdamW
+# with mild decay (0.01) for better generalization.
+WEIGHT_DECAY = 0.01
 # L3TC's per-epoch sample budget. We follow it 1:1.
 EPOCH_LENGTH = 1_000_000
 
@@ -304,24 +313,51 @@ def build_model(device: torch.device) -> RWKV_TC_HIRA:
         f"non-embed/head params: {n_params_no_embed:,}"
     )
     model = model.to(device)
+
+    # torch.compile for ~1.5-2× throughput on CUDA. No-op on MPS/CPU
+    # (torch.compile doesn't support MPS as of 2.1.x). Does NOT change
+    # the model architecture or parameter count — same math, JIT-compiled.
+    if device.type == "cuda":
+        try:
+            model = torch.compile(model)
+            print("  torch.compile enabled")
+        except Exception as e:
+            print(f"  torch.compile not available ({e}), running eager")
+
     return model
 
 
 def build_optimizer(model: nn.Module) -> torch.optim.Optimizer:
-    # L3TC uses torch.optim.Adam (not AdamW). Pinned per Phase 11 hard
-    # constraint #1.
-    return torch.optim.Adam(
+    # AdamW with mild weight decay (0.01) for generalization. L3TC
+    # used Adam with 0 decay; we've lifted the "match L3TC recipe
+    # exactly" constraint. AdamW + decay is the modern standard.
+    return torch.optim.AdamW(
         model.parameters(),
         lr=LEARNING_RATE,
         betas=ADAM_BETAS,
         eps=ADAM_EPS,
+        weight_decay=WEIGHT_DECAY,
     )
 
 
-def build_scheduler(optimizer: torch.optim.Optimizer):
-    return torch.optim.lr_scheduler.StepLR(
-        optimizer, step_size=SCHEDULER_STEP_SIZE, gamma=SCHEDULER_GAMMA
-    )
+def build_scheduler(
+    optimizer: torch.optim.Optimizer,
+    total_steps: int,
+) -> torch.optim.lr_scheduler.LRScheduler:
+    """Cosine annealing with linear warmup. Replaces L3TC's broken
+    double-stepping StepLR."""
+    from torch.optim.lr_scheduler import LambdaLR
+
+    def lr_lambda(step: int) -> float:
+        if step < WARMUP_STEPS:
+            return step / max(WARMUP_STEPS, 1)
+        # Cosine decay from 1.0 to LR_MIN/LEARNING_RATE
+        progress = (step - WARMUP_STEPS) / max(total_steps - WARMUP_STEPS, 1)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        min_factor = LR_MIN / LEARNING_RATE
+        return min_factor + (1.0 - min_factor) * cosine
+
+    return LambdaLR(optimizer, lr_lambda)
 
 
 # ============================================================
@@ -351,6 +387,8 @@ def train_one_epoch(
     epoch: int,
     use_amp_bf16: bool,
     log_every: int = 10,
+    save_every_steps: int = 1000,
+    save_fn=None,
 ) -> dict:
     model.train()
     n_steps = 0
@@ -395,6 +433,11 @@ def train_one_epoch(
 
         sum_loss += loss_value
         n_steps += 1
+
+        # Intra-epoch checkpoint so we don't lose multi-hour epochs
+        # to spot reclaim or unexpected termination.
+        if save_fn is not None and (step + 1) % save_every_steps == 0:
+            save_fn(f"checkpoint_latest.pth")
 
         if (step + 1) % log_every == 0:
             now = time.time()
@@ -584,7 +627,11 @@ def main() -> int:
     # Model + optimizer + scheduler
     model = build_model(device)
     optimizer = build_optimizer(model)
-    scheduler = build_scheduler(optimizer)
+    steps_per_epoch = args.epoch_length // args.batch_size
+    total_steps = steps_per_epoch * args.epochs
+    scheduler = build_scheduler(optimizer, total_steps)
+    print(f"schedule: {WARMUP_STEPS} warmup steps, {total_steps} total steps, "
+          f"cosine {LEARNING_RATE} -> {LR_MIN}")
     # Per-token cross entropy. We mask + reduce ourselves to match L3TC.
     criterion = nn.CrossEntropyLoss(reduction="none")
 
@@ -595,6 +642,14 @@ def main() -> int:
     # Training loop
     global_step = 0
     for epoch in range(start_epoch, args.epochs):
+        # Intra-epoch save callback for resilience against spot reclaim
+        # or unexpected termination.
+        def _save_fn(name: str):
+            save_checkpoint(
+                model, optimizer, scheduler, epoch, global_step,
+                args, args.output_dir, name,
+            )
+
         train_stats = train_one_epoch(
             model,
             train_loader,
@@ -605,6 +660,8 @@ def main() -> int:
             epoch,
             use_amp_bf16=use_amp_bf16,
             log_every=args.log_every,
+            save_every_steps=args.save_every_steps,
+            save_fn=_save_fn,
         )
         global_step += train_stats["n_steps"]
 
