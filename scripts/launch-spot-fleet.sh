@@ -124,7 +124,7 @@ for itype in "${INSTANCE_TYPES[@]}"; do
                 {
                     "DeviceName": "/dev/sda1",
                     "Ebs": {
-                        "VolumeSize": 200,
+                        "VolumeSize": 100,
                         "VolumeType": "gp3",
                         "DeleteOnTermination": true
                     }

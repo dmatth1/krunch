@@ -69,7 +69,7 @@ INSTANCE_ID=$(aws ec2 run-instances \
     --security-group-ids "$SG_ID" \
     --iam-instance-profile "Arn=${IAM_PROFILE_ARN}" \
     --user-data "$USERDATA" \
-    --block-device-mappings '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":200,"VolumeType":"gp3","DeleteOnTermination":true}}]' \
+    --block-device-mappings '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":100,"VolumeType":"gp3","DeleteOnTermination":true}}]' \
     --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=l3tc-phase11-${RUN_ID}},{Key=l3tc-run-id,Value=${RUN_ID}},{Key=l3tc-pass,Value=${PASS}}]" \
     --query 'Instances[0].InstanceId' --output text)
 

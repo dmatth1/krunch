@@ -28,9 +28,9 @@ case "$PASS" in
         EPOCHS=15
         ;;
     pass2)
-        CORPUS_NAME="pile_dedup_50gb"
-        CORPUS_S3="${S3_CORPUS_PATH}/pile_dedup_50gb.tar"
-        TRAIN_FILE="./data/train_data/train_pile_dedup_bpe_16384_0.999.txt"
+        CORPUS_NAME="pile_dedup"
+        CORPUS_S3="${S3_CORPUS_PATH}/train_pile_dedup.txt"
+        TRAIN_FILE="./data/train_data/train_pile_dedup.txt"
         EPOCHS=10
         ;;
     *)
@@ -89,7 +89,17 @@ phase11_pull_spm_tokenizer
 # Pass-specific corpus fetch
 case "$PASS" in
     pass1) phase11_fetch_corpus_pass1 ;;
-    pass2) echo "pass2 corpus fetch not yet implemented"; exit 1 ;;
+    pass2)
+        echo "=== Fetching Pile dedup corpus from S3 ==="
+        mkdir -p data/train_data
+        if ! aws s3 ls "${CORPUS_S3}" >/dev/null 2>&1; then
+            echo "ERROR: Pile corpus not found at ${CORPUS_S3}"
+            echo "Build it first with: python scripts/build_pile_corpus.py"
+            exit 1
+        fi
+        aws s3 cp "${CORPUS_S3}" "${TRAIN_FILE}" --quiet
+        ls -lh "${TRAIN_FILE}"
+        ;;
 esac
 
 # Tokenize if we don't already have a pre-tokenized file from S3
@@ -112,19 +122,19 @@ if [ -n "$LATEST_CKPT" ]; then
     RESUME_FLAG="--resume ${CKPT_DIR}/checkpoint_latest.pth"
 fi
 
-# === Background checkpoint + log uploader ===
-(
-    while true; do
-        sleep 120
-        if compgen -G "${CKPT_DIR}/checkpoint*.pth" > /dev/null; then
-            for ckpt in "${CKPT_DIR}"/checkpoint*.pth; do
-                aws s3 cp "$ckpt" "${S3_RUN_PATH}/$(basename "$ckpt")" --quiet 2>/dev/null || true
-            done
-        fi
-        aws s3 cp /home/ubuntu/l3tc-prod/vendor/L3TC/train.log "${S3_RUN_PATH}/train.log" --quiet 2>/dev/null || true
-    done
-) &
-TRAIN_UPLOAD_PID=$!
+# === S3 checkpoint + log sync via cron (reliable, no quoting issues) ===
+# The background subshell approach broke repeatedly due to nested bash
+# quoting in heredocs. Cron is simpler and proven to work.
+cat > /etc/cron.d/l3tc-upload <<CRONEOF
+*/3 * * * * root cd /home/ubuntu/l3tc-prod/vendor/L3TC && aws s3 cp train.log ${S3_RUN_PATH}/train.log --quiet 2>/dev/null; aws s3 sync ${CKPT_DIR}/ ${S3_RUN_PATH}/ --quiet 2>/dev/null
+CRONEOF
+chmod 644 /etc/cron.d/l3tc-upload
+service cron reload 2>/dev/null || true
+echo "S3 sync cron set (every 3 min)"
+
+# Also set a one-shot final sync that fires when training exits
+nohup bash -c "while kill -0 \$\$ 2>/dev/null; do sleep 60; done; cd /home/ubuntu/l3tc-prod/vendor/L3TC && aws s3 sync ${CKPT_DIR}/ ${S3_RUN_PATH}/ --quiet && aws s3 cp train.log ${S3_RUN_PATH}/train.log --quiet" > /tmp/final-sync.log 2>&1 &
+
 kill ${BOOTSTRAP_LOG_PID} 2>/dev/null || true
 
 # === Run our Phase 11.5 trainer ===
@@ -133,11 +143,16 @@ kill ${BOOTSTRAP_LOG_PID} 2>/dev/null || true
 echo "=== Starting train_l3tc_phase11.py (pass ${PASS}, ${EPOCHS} epochs) ==="
 date -u
 
-python /home/ubuntu/l3tc-prod/scripts/train_l3tc_phase11.py \
+PYTHONUNBUFFERED=1 python /home/ubuntu/l3tc-prod/scripts/train_l3tc_phase11.py \
     --train-file "${TRAIN_FILE}" \
     --val-file "${VAL_FILE}" \
     --output-dir "${CKPT_DIR}" \
     --epochs ${EPOCHS} \
+    --batch-size 16 \
+    --grad-accum 2 \
+    --no-compile \
+    --log-every 100 \
+    --save-every-steps 5000 \
     --device cuda \
     ${RESUME_FLAG} \
     2>&1 | tee train.log
