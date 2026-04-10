@@ -271,20 +271,52 @@ the broader-corpus results — any degradation might be the recipe,
 not the corpus. Running on enwik8 first (same corpus L3TC used)
 isolates the recipe variable.
 
+**Training config (calibrated from the AMI canary):**
+
+From the 100-step bf16 canary on the A10G:
+- **23.3 it/s** at batch_size=8 with bf16 autocast
+- **OOM at batch_size=32** (logits tensor ~4 GB at vocab 16384).
+  Fix: batch_size=8 with grad_accum=4 → effective batch 32.
+- **~5-6 GB GPU memory** at batch_size=8 → g5.xlarge (A10G
+  24 GB) is plenty. g5.2xlarge was only needed for the old
+  bootstrap issues now baked into the AMI.
+- **torch.compile disabled** — L2Wrap (custom autograd.Function)
+  can't be traced by dynamo; fallback adds memory overhead and
+  leads to OOM. No throughput benefit without a workaround.
+
+| setting | value | rationale |
+|---|---|---|
+| AMI | `ami-07a4fc98c4ed4e19e` (l3tc-phase11-base-v1) | pre-baked, canary-validated |
+| Instance | **g5.xlarge spot** (~$0.40-0.80/hr) | A10G at batch=8 uses ~5-6 GB VRAM |
+| epochs | **5** | enough to see convergence; L3TC used 20 but we only need the recipe validated |
+| epoch_length | **200,000** samples | 200K × 2048 tok × 5 epochs = 2B tokens ≈ 71× passes over enwik8 (28M tokens). L3TC did 1460× passes; we're scaled down proportionally. |
+| batch_size | **8** | fits A10G; with grad_accum=4 → effective batch 32 |
+| grad_accum | **4** | matches L3TC's effective batch of 32 |
+| Steps | 200K / 8 × 5 = **125,000** | |
+| Wall time | 125K / 23.3 ≈ **1.5 hours** | |
+| **Cost** | **~$0.60-1.20 on spot** | |
+
 **Plan:**
 
-- Launch from the baked AMI.
-- Train from scratch on enwik8 (100 MB), same architecture
-  (2L × 96H × 96I × rank 4 × vocab 16384), improved recipe
-  (AdamW, cosine warmup, bf16, torch.compile).
+- Launch from the baked AMI (`ami-07a4fc98c4ed4e19e`).
+- Train from scratch on enwik8 (100 MB, same corpus L3TC used),
+  same architecture (2L × 96H × 96I × rank 4 × vocab 16384),
+  improved recipe (AdamW, cosine warmup, bf16).
 - Evaluate on enwik6: target ratio ≤ 0.1699 (matching L3TC) or
   close. Speed should be ~131 KB/s (unchanged architecture).
 - **Success:** ratio matches or beats L3TC → recipe validated,
   proceed to enwik9. **Failure:** ratio significantly worse →
   debug the recipe before touching the corpus variable.
-- Estimated wall time: ~30-60 min on the AMI (depends on
-  epoch_length tuning, which we calibrate from the canary's
-  measured iteration speed).
+
+**Pass 1 (enwik9) after recipe validation:**
+
+| setting | value |
+|---|---|
+| Instance | g5.xlarge spot |
+| epochs | 10-15 (more data → fewer passes needed) |
+| epoch_length | 200,000-500,000 (tune based on enwik8 convergence) |
+| Wall time | ~3-8 hours |
+| **Cost** | **~$2-6 on spot** |
 
 ### Pass 1 — enwik9 sanity check (AFTER RECIPE VALIDATION)
 

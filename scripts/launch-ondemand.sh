@@ -16,7 +16,9 @@ S3_PREFIX="l3tc"
 KEY_NAME="swarm-ec2"
 SG_ID="sg-0af8b62d12cf4272c"
 IAM_PROFILE_ARN="arn:aws:iam::584956668248:instance-profile/bnn-s3-access"
-INSTANCE_TYPE="g5.2xlarge"
+# g5.xlarge: A10G 24 GB, 4 vCPU, 16 GB RAM. Plenty for batch=8 training
+# (~5-6 GB VRAM). g5.2xlarge was only needed for the old bootstrap issues.
+INSTANCE_TYPE="g5.xlarge"
 
 if [ -z "${L3TC_GITHUB_PAT:-}" ]; then
     echo "ERROR: L3TC_GITHUB_PAT not set. export L3TC_GITHUB_PAT=\$(cat ~/.l3tc-pat)"
@@ -30,13 +32,24 @@ echo "=== L3TC Phase 11 On-Demand Launcher ==="
 echo "Pass:   ${PASS}"
 echo "Run ID: ${RUN_ID}"
 
-AMI=$(aws ec2 describe-images --region "$REGION" --owners amazon \
-    --filters \
-        "Name=name,Values=Deep Learning Base AMI with Single CUDA (Ubuntu 22.04)*" \
-        "Name=state,Values=available" \
-        "Name=architecture,Values=x86_64" \
-    --query 'Images | sort_by(@, &CreationDate) | [-1].ImageId' --output text)
-echo "AMI: ${AMI}"
+# Pre-baked AMI with everything installed: torch 2.1.2+cu121, numpy<2,
+# sentencepiece, tqdm, ninja, pkuseg+deepspeed stubs, WKV CUDA kernel
+# compiled, SPM tokenizer, enwik9 pre-tokenized corpus. Validated with
+# 100-step bf16 canary at 23.3 it/s on A10G.
+# Fallback to Deep Learning Base AMI if the baked AMI is not available.
+BAKED_AMI="ami-07a4fc98c4ed4e19e"
+if aws ec2 describe-images --image-ids "$BAKED_AMI" --region "$REGION" --query 'Images[0].State' --output text 2>/dev/null | grep -q available; then
+    AMI="$BAKED_AMI"
+    echo "AMI: ${AMI} (pre-baked l3tc-phase11-base-v1)"
+else
+    AMI=$(aws ec2 describe-images --region "$REGION" --owners amazon \
+        --filters \
+            "Name=name,Values=Deep Learning Base AMI with Single CUDA (Ubuntu 22.04)*" \
+            "Name=state,Values=available" \
+            "Name=architecture,Values=x86_64" \
+        --query 'Images | sort_by(@, &CreationDate) | [-1].ImageId' --output text)
+    echo "AMI: ${AMI} (Deep Learning Base, fallback — baked AMI not ready)"
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 USERDATA_SCRIPT="${SCRIPT_DIR}/spot-fleet-userdata.sh"
