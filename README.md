@@ -50,7 +50,7 @@ The structural finding from that experiment — that per-token cost
 on this architecture is dominated by the head matvec and
 `cum_freqs`, both of which scale with vocab (16384), not layer
 count — closes the door on cheap speed wins from architecture
-shrinking. See [`docs/phase_4e_findings.md`](docs/phase_4e_findings.md).
+shrinking. See [`docs/phase-findings/phase_4e_findings.md`](docs/phase-findings/phase_4e_findings.md).
 
 Combined with NNCP v3.2 at 4 KB/s, CMIX v21 at 1.57 KB/s, and
 the rest of the LTCB neural / PAQ field below 14 KB/s
@@ -109,7 +109,7 @@ gated on Phase 11 data.
 - ✅ **Phase 4b enwik8 confirmation.** 100 MB round trip at
   ratio **0.1793**, **113.77 KB/s compress**, 113.13 KB/s
   decompress. Phase 4b wins generalize to 100× scale. See
-  [`docs/phase_4b_findings.md`](docs/phase_4b_findings.md).
+  [`docs/phase-findings/phase_4b_findings.md`](docs/phase-findings/phase_4b_findings.md).
 - ✅ **Phase 4c — CPU speed polish.** NEON `exp_f32x4`,
   FFN K/V matvecs on the NEON 96×96 kernel, and NEON
   `quantize_exps_to_freqs`. +7% compress / +8% decompress over
@@ -122,7 +122,7 @@ gated on Phase 11 data.
   **25.95 KB/s compress** — 2.4× faster than the Python 3.2M
   reference, 5× slower than our 200K. Ships as an opt-in
   high-ratio tier alongside 200K default. See
-  [`docs/phase_4d_findings.md`](docs/phase_4d_findings.md).
+  [`docs/phase-findings/phase_4d_findings.md`](docs/phase-findings/phase_4d_findings.md).
 - ❌ **Phase 4e — Distillation for compression speed (closed,
   failed).** Built the full pipeline: `dump-teacher` CLI + v2
   format + rayon-parallelized top-K softmax dumps,
@@ -135,7 +135,7 @@ gated on Phase 11 data.
   scale with vocab (16384), not with layers, so halving the
   layer count only yielded 1.12× speedup, not 2×. The 200K
   stays as default, the 3.2M stays as opt-in. See
-  [`docs/phase_4e_findings.md`](docs/phase_4e_findings.md).
+  [`docs/phase-findings/phase_4e_findings.md`](docs/phase-findings/phase_4e_findings.md).
 - ⏳ **Phase 5 — RWKV-v7 architecture upgrade (still enwik8).**
   Replace RWKV-v4-HiRA with RWKV-v7 at the same 200K parameter
   budget, same training corpus. Apples-to-apples architecture
@@ -175,8 +175,7 @@ exploratory writeup of a managed-storage-service productization
 path that dodges most of the client-side deployment problems.
 Back-burner reference, not an active phase.
 
-See [`PHASE_0.md`](PHASE_0.md) through
-[`PHASE_10.md`](PHASE_10.md) for detailed per-phase plans. See
+See [`docs/phases/`](docs/phases/) for detailed per-phase plans. See
 [`CLAUDE.md`](CLAUDE.md) for the two project goals and regression
 gates. See [`ANALYSIS.md`](ANALYSIS.md) for the full project
 thinking. See [`DECISIONS.md`](DECISIONS.md) for the architectural
@@ -314,7 +313,7 @@ as an open source tool in this niche.
   of framing. This is the OOD failure mode that Phase 8
   (multi-model dispatch with classical fallback) addresses
   structurally. See
-  [`docs/phase_3_findings.md`](docs/phase_3_findings.md) for
+  [`docs/phase-findings/phase_3_findings.md`](docs/phase-findings/phase_3_findings.md) for
   the detailed numbers.
 
 ### How we got here
@@ -398,22 +397,12 @@ l3tc-prod/
 ├── COMPARISON.md          primary-source compressor landscape + math
 ├── ANALYSIS.md            original project thinking document
 ├── DECISIONS.md           architectural decision log
-├── PHASE_0.md .. PHASE_11.md
-│                          per-phase plans (0-4 done; 4e closed
-│                          failed; 11 in progress; 5-10 roadmap)
-├── PHASE_4C.md, PHASE_4D.md, PHASE_4E.md
-│                          Phase 4 speed polish / 3.2M port /
-│                          distillation plans
+├── docs/
+│   ├── phases/            per-phase plans (PHASE_0..11.md)
+│   ├── phase-findings/    per-phase results writeups
 ├── STORAGE_SERVICE_VISION.md
 │                          exploratory back-burner productization writeup
-├── docs/
-│   ├── phase_0_findings.md
-│   ├── phase_2_findings.md
-│   ├── phase_3_findings.md
-│   ├── phase_4a_findings.md
-│   ├── phase_4b_findings.md
-│   ├── phase_4d_findings.md
-│   └── phase_4e_findings.md
+│   └── ...
 ├── bench/                 Python benchmark harness (stdlib-only)
 │   ├── bench.py
 │   ├── compressors.py
