@@ -1,13 +1,18 @@
 # l3tc-prod
 
-**The fastest CPU learned compressor.** 10-83× faster than every
-other neural/PAQ compressor on the
+A lossless text compressor built on L3TC (AAAI 2025). 10-83×
+faster than every other neural/PAQ compressor on the
 [Large Text Compression Benchmark](http://mattmahoney.net/dc/text.html),
-with 30-45% better ratio than zstd/xz/bzip2.
+with 30-45% better compression ratio than zstd/xz/bzip2.
 
-A production Rust implementation of RWKV-v4 + HiRA driving an
+Production Rust implementation of RWKV-v4 + HiRA driving an
 arithmetic coder. 6.6K LOC, minimal deps, hand-rolled NEON
 kernels, no ML framework at runtime.
+
+**Limitation:** the current model is trained on Wikipedia
+(enwik8). It compresses Wikipedia-like text well but degrades
+on out-of-distribution input (code, logs, dictionaries). Broader
+corpus training is in progress.
 
 ## Numbers
 
@@ -22,9 +27,7 @@ kernels, no ML framework at runtime.
 | lstm-compress v3 | ~1.39 | 10.58 | CPU |
 
 l3tc-prod is 10-83× faster wall-clock than every LTCB entry.
-The trade: ~67% behind the ratio frontier. Different operating
-point, not a failure — nobody else ships interactive learned
-compression at this speed. See
+The trade: ~67% behind the ratio frontier. See
 [`docs/COMPARISON.md`](docs/COMPARISON.md) for the full
 primary-source analysis.
 
@@ -40,8 +43,8 @@ primary-source analysis.
 
 Best ratio in the suite — 41% better than bzip2, 43% better than
 zstd. The cost is wall time: xz is ~30× faster. This is a
-ratio-first tool for cold archive, compliance, scientific text
-corpora, log archival.
+ratio-first tool for cold archive, compliance, and scientific
+text corpora.
 
 ## Quick start
 
@@ -59,11 +62,6 @@ cargo test --release
 
 # Use the high-ratio 3.2M model
 ./target/release/l3tc compress input.txt --model checkpoints/l3tc_3m2.bin -o out.l3tc
-
-# Debug / profiling
-./target/release/l3tc entropy-bound --input input.txt --segment-bytes 4096
-./target/release/l3tc audit --input input.txt
-./target/release/l3tc profile --input input.txt
 ```
 
 ## How it works
@@ -76,47 +74,8 @@ is confident. Better predictions = fewer bits = smaller file.
 
 The Rust runtime hand-rolls the forward pass with NEON intrinsics,
 INT8-quantizes the head weight, and parallelizes across segments
-via rayon. The model runs at batch-1 on CPU — no GPU, no Python,
-no framework.
-
-## Project status
-
-- **Phase 4 complete** — runtime optimization done. Forward pass
-  bit-identical to Python L3TC. Speed ceiling reached (~150 KB/s
-  on CPU for this model class).
-- **Phase 11 in progress** — training on a broader corpus (Pile
-  dedup) to fix the OOD cliff (webster/dickens/code/logs compress
-  badly with the enwik-only model). Same architecture, improved
-  training recipe (AdamW + cosine warmup).
-- **Next:** Phase 9 (fuzzing) → Phase 7 (numeric determinism) →
-  Phase 6 (release builds) → Phase 10 (distribution). ~6-8 weeks
-  to open source release.
-
-See [`docs/phases/`](docs/phases/) for detailed per-phase plans
-and [`docs/phase-findings/`](docs/phase-findings/) for results.
-
-## Architecture
-
-```
-l3tc-prod/
-├── l3tc-rust/             Rust crate (the product)
-│   ├── src/
-│   │   ├── rwkv.rs        RWKV-v4 + HiRA forward pass
-│   │   ├── tensor.rs      Hand-rolled f32 + INT8 + NEON linalg
-│   │   ├── codec.rs       Compress/decompress + segment parallelism
-│   │   ├── arithmetic.rs  Nayuki-style arithmetic coder
-│   │   ├── tokenizer.rs   SentencePiece wrapper
-│   │   ├── checkpoint.rs  Binary checkpoint reader
-│   │   └── bin/l3tc.rs    CLI
-│   ├── checkpoints/       Converted model weights (.bin)
-│   └── tests/             Integration tests
-├── scripts/               Training + cloud infrastructure
-├── bench/                 Benchmark harness (stdlib-only Python)
-├── vendor/                (gitignored) L3TC + RWKV-LM reference
-├── docs/                  Phases, findings, analysis, comparisons
-├── CLAUDE.md              Project goals + regression gates
-└── README.md              This file
-```
+via rayon. Runs at batch-1 on CPU — no GPU, no Python, no
+framework.
 
 ## Building from source
 
@@ -142,20 +101,17 @@ cargo test --release
 ./iter.sh
 ```
 
-## Key decisions
+## Documentation
 
-- **Hand-rolled tensor math** over candle/tch — the model is
-  2 layers × 96 dim; a framework's abstractions cost more than
-  they save.
-- **Segment-level parallelism** via rayon — the only parallelism
-  lever available in autoregressive compression. Biggest single
-  speed win (5×).
-- **INT8 head quantization** — the 16384×96 head weight is the
-  memory-bandwidth bottleneck; INT8 halves the streaming cost.
-- **No GPU required** — runs on any aarch64 or x86_64 CPU.
-
-See [`docs/DECISIONS.md`](docs/DECISIONS.md) for the full
-decision log including reversals.
+- [`docs/COMPARISON.md`](docs/COMPARISON.md) — primary-source
+  compressor landscape analysis with LTCB numbers
+- [`docs/DECISIONS.md`](docs/DECISIONS.md) — architectural
+  decision log including reversals
+- [`docs/phases/`](docs/phases/) — per-phase plans
+- [`docs/phase-findings/`](docs/phase-findings/) — per-phase
+  results
+- [`docs/DETAILED_README.md`](docs/DETAILED_README.md) — full
+  project history and detailed status
 
 ## License
 
