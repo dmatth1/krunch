@@ -32,6 +32,7 @@ case "$PASS" in
         CORPUS_S3="${S3_CORPUS_PATH}/train_pile_dedup.txt"
         TRAIN_FILE="./data/train_data/train_pile_dedup.txt"
         EPOCHS=10
+        EPOCH_LENGTH=500000
         ;;
     *)
         echo "ERROR: unknown PASS '${PASS}'"
@@ -148,6 +149,7 @@ PYTHONUNBUFFERED=1 python /home/ubuntu/l3tc-prod/scripts/train_l3tc_phase11.py \
     --val-file "${VAL_FILE}" \
     --output-dir "${CKPT_DIR}" \
     --epochs ${EPOCHS} \
+    --epoch-length ${EPOCH_LENGTH:-200000} \
     --batch-size 16 \
     --grad-accum 2 \
     --no-compile \
