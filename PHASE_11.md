@@ -115,12 +115,21 @@ the standard fix.
 
 ## Current progress
 
-**Status as of 2026-04-09:** Phase 11 cloud training infrastructure
-landed. Pass 1 (enwik9 sanity check) is ready to launch; Pass 2
-(Pile dedup broader corpus) requires the corpus build step before
-it can run. No training has been kicked off yet — the next action
-is human review of this section, then `./scripts/launch-spot-fleet.sh
-pass1`.
+**Status as of 2026-04-10:** Phase 11.5 shipped (our own training
+script replacing L3TC's main.py). Training recipe improved
+(AdamW + cosine warmup, replacing L3TC's broken double-stepping
+StepLR). AMI bake in progress. Next steps:
+
+1. **AMI bake** — bootstrap a g5.2xlarge, run a 100-step bf16
+   canary on CUDA to validate, snapshot as a private AMI.
+2. **enwik8 recipe validation** — train from scratch on enwik8
+   (same corpus L3TC used) with the improved recipe. If enwik6
+   ratio matches or beats L3TC's 0.1699, the recipe is at least
+   as good. This isolates "recipe change" from "corpus change."
+3. **Pass 1 (enwik9)** — train on enwik9 using the validated
+   recipe and the baked AMI. Pipeline sanity check.
+4. **Pass 2 (Pile dedup)** — train on the broader corpus. The
+   real experiment.
 
 ### Why cloud, not the MacBook
 
@@ -223,16 +232,69 @@ export L3TC_GITHUB_PAT=$(cat ~/.l3tc-pat)
 ./scripts/launch-spot-fleet.sh pass1
 ```
 
-### Pass 1 — enwik9 sanity check (READY TO LAUNCH)
+### AMI bake (IN PROGRESS)
 
-**Goal:** verify the cloud training pipeline end-to-end on the
-simplest possible corpus before touching the broader-corpus
-experiment. enwik9 is 1 GB of the same source as enwik8 (Wikipedia
-XML, March 2006 dump); training on it is "more in-distribution
-data" with no other variables changed. Expected outcome: a
-checkpoint that produces a slightly better enwik6 ratio than the
-current default (more training data → marginally better fit) and
-identical speed.
+**Why:** Phase 11 attempts 1-15 burned ~4 hours and ~$8 iterating
+through bootstrap dependency failures on every fresh instance.
+Each failure was a real bug in L3TC's vendor environment, but
+none would recur if we bake a known-good instance into a
+private AMI and launch from that.
+
+**Steps:**
+
+1. Launch g5.2xlarge with current userdata (lets bootstrap run
+   to completion — installs all deps, writes stubs, pulls SPM
+   tokenizer, pulls pre-tokenized enwik9 from S3).
+2. SSH in. Run a **100-step training canary with bf16 on the
+   A10G GPU**. Verify: loss is finite and decreasing,
+   torch.compile works, checkpoint saves, no NaN. This is the
+   first time we've tested bf16 on real CUDA for this model.
+3. **Stop the instance** (not terminate).
+4. **Create AMI:** `aws ec2 create-image --instance-id ...
+   --name l3tc-phase11-base-v1`. Takes ~5 min.
+5. Update `scripts/launch-ondemand.sh` to use the new AMI ID.
+6. Terminate the bake instance.
+7. Commit the AMI ID + updated launcher.
+
+**Future launches from the AMI:** boot in ~60-90 sec with
+everything pre-installed. Userdata becomes `cd l3tc-prod &&
+git pull && python scripts/train_l3tc_phase11.py ...`. No pip
+installs, no stub writing, no SPM download, no corpus download
+(already on disk from the bake).
+
+### enwik8 recipe validation (NEXT AFTER AMI)
+
+**Why:** We changed the training recipe (AdamW + cosine warmup
+instead of L3TC's Adam + broken StepLR). If the enwik6 ratio
+from our recipe is worse than L3TC's 0.1699, we can't trust
+the broader-corpus results — any degradation might be the recipe,
+not the corpus. Running on enwik8 first (same corpus L3TC used)
+isolates the recipe variable.
+
+**Plan:**
+
+- Launch from the baked AMI.
+- Train from scratch on enwik8 (100 MB), same architecture
+  (2L × 96H × 96I × rank 4 × vocab 16384), improved recipe
+  (AdamW, cosine warmup, bf16, torch.compile).
+- Evaluate on enwik6: target ratio ≤ 0.1699 (matching L3TC) or
+  close. Speed should be ~131 KB/s (unchanged architecture).
+- **Success:** ratio matches or beats L3TC → recipe validated,
+  proceed to enwik9. **Failure:** ratio significantly worse →
+  debug the recipe before touching the corpus variable.
+- Estimated wall time: ~30-60 min on the AMI (depends on
+  epoch_length tuning, which we calibrate from the canary's
+  measured iteration speed).
+
+### Pass 1 — enwik9 sanity check (AFTER RECIPE VALIDATION)
+
+**Goal:** train on enwik9 (1 GB, 10× enwik8) with the validated
+recipe and the baked AMI. By this point the recipe is already
+validated on enwik8, so any ratio change on enwik6 compared to
+the enwik8 run is attributable to the larger corpus, not the
+recipe. Expected outcome: slightly better enwik6 ratio than the
+enwik8-only model (more in-distribution data → marginally better
+fit) at identical speed.
 
 **Pre-launch checklist:**
 
