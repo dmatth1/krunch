@@ -314,16 +314,21 @@ def build_model(device: torch.device) -> RWKV_TC_HIRA:
     )
     model = model.to(device)
 
-    # torch.compile for ~1.5-2× throughput on CUDA. No-op on MPS/CPU
-    # (torch.compile doesn't support MPS as of 2.1.x). Does NOT change
-    # the model architecture or parameter count — same math, JIT-compiled.
-    if device.type == "cuda":
-        try:
-            model = torch.compile(model)
-            print("  torch.compile enabled")
-        except Exception as e:
-            print(f"  torch.compile not available ({e}), running eager")
+    return model
 
+
+def maybe_compile(model, device: torch.device, no_compile: bool):
+    """torch.compile for throughput on CUDA. Disabled by default because
+    L2Wrap (custom autograd.Function) can't be traced by dynamo and
+    causes fallback + extra memory overhead that leads to OOM."""
+    if no_compile or device.type != "cuda":
+        print("  torch.compile: disabled")
+        return model
+    try:
+        model = torch.compile(model)
+        print("  torch.compile: enabled")
+    except Exception as e:
+        print(f"  torch.compile: not available ({e})")
     return model
 
 
@@ -389,6 +394,7 @@ def train_one_epoch(
     log_every: int = 10,
     save_every_steps: int = 1000,
     save_fn=None,
+    grad_accum: int = 1,
 ) -> dict:
     model.train()
     n_steps = 0
@@ -402,8 +408,6 @@ def train_one_epoch(
         input_types = batch["input_types"]
         output_token = batch["output_token"]
         output_types = batch["output_types"]
-
-        optimizer.zero_grad(set_to_none=True)
 
         if use_amp_bf16:
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
@@ -419,17 +423,24 @@ def train_one_epoch(
             )
             loss = L2Wrap.apply(loss, logits)
 
-        loss_value = loss.item()
+        # Scale loss for gradient accumulation
+        loss = loss / grad_accum
+
+        loss_value = loss.item() * grad_accum  # un-scale for logging
         if not math.isfinite(loss_value):
             print(f"  WARNING: non-finite loss {loss_value} at step {step}")
             sys.exit(1)
 
         loss.backward()
-        if CLIP_MAX_NORM > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), CLIP_MAX_NORM)
-        optimizer.step()
-        if scheduler is not None:
-            scheduler.step()
+
+        # Optimizer step every grad_accum micro-batches
+        if (step + 1) % grad_accum == 0:
+            if CLIP_MAX_NORM > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), CLIP_MAX_NORM)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            if scheduler is not None:
+                scheduler.step()
 
         sum_loss += loss_value
         n_steps += 1
@@ -579,6 +590,13 @@ def main() -> int:
     p.add_argument("--no-bf16", action="store_true",
                    help="Disable bf16 mixed precision (use fp32). "
                         "Auto-disabled on non-CUDA devices.")
+    p.add_argument("--no-compile", action="store_true",
+                   help="Disable torch.compile. Required when using "
+                        "custom autograd Functions like L2Wrap that "
+                        "dynamo cannot trace.")
+    p.add_argument("--grad-accum", type=int, default=1,
+                   help="Gradient accumulation steps. Effective batch "
+                        "= batch-size * grad-accum.")
     args = p.parse_args()
 
     # Reproducibility
@@ -626,6 +644,7 @@ def main() -> int:
 
     # Model + optimizer + scheduler
     model = build_model(device)
+    model = maybe_compile(model, device, args.no_compile)
     optimizer = build_optimizer(model)
     steps_per_epoch = args.epoch_length // args.batch_size
     total_steps = steps_per_epoch * args.epochs
@@ -662,6 +681,7 @@ def main() -> int:
             log_every=args.log_every,
             save_every_steps=args.save_every_steps,
             save_fn=_save_fn,
+            grad_accum=args.grad_accum,
         )
         global_step += train_stats["n_steps"]
 
