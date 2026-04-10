@@ -232,7 +232,7 @@ export L3TC_GITHUB_PAT=$(cat ~/.l3tc-pat)
 ./scripts/launch-spot-fleet.sh pass1
 ```
 
-### AMI bake (IN PROGRESS)
+### AMI bake (DONE — 2026-04-10, ami-07a4fc98c4ed4e19e)
 
 **Why:** Phase 11 attempts 1-15 burned ~4 hours and ~$8 iterating
 through bootstrap dependency failures on every fresh instance.
@@ -368,10 +368,13 @@ This is the run that answers the real question: can a single 200K
 model trained on a broader corpus handle webster / dickens / code
 / logs without breaking the enwik6 ratio floor (≤ 0.20)?
 
-**Blocker:** `scripts/build_pile_corpus.py` — not yet written.
-Needs to pull the Pile deduplicated subset from HuggingFace,
-select ~50 GB of shards, concatenate, tokenize with the existing
-SPM, and upload to S3.
+**Corpus build:** `scripts/build_pile_corpus.py` written and
+running. Streaming 10 GB from HuggingFace Pile dedup, tokenizing
+with the existing SPM, uploading to
+`s3://dmatth1-bnn-checkpoints/l3tc/corpora/train_pile_dedup.txt`.
+Training config: 500K epoch_length × 10 epochs (~5× passes over
+the corpus), batch 16 + grad_accum 2, on-demand g5.xlarge,
+~3.7 hours, ~$4.50.
 
 ### Pass 1 — enwik9 (ORIGINAL PLAN, NOW SKIPPED)
 

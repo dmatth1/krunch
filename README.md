@@ -30,8 +30,7 @@ learned compressor that doesn't take all night to run.
 
 ## Status
 
-**Phase 4 complete; runtime optimization track is done. Moving to
-Phase 5/6/7 (architecture + release engineering).**
+**Phase 4 complete; Phase 11 (broader corpus training) in progress.**
 
 The current state of the runtime:
 
@@ -160,12 +159,16 @@ gated on Phase 11 data.
   Python wheel, Node module, Homebrew / apt / rpm packages,
   docker image, cargo crate on crates.io. The "how do users
   actually get this" layer.
-- ⏳ **Phase 11 — Broader training corpus.** Retrain L3TC-200K
-  on The Pile / RedPajama / domain-mix (whatever architecture
-  Phase 5 produces), same parameter budget. Does one broader
-  model cover enough distributions to be the new default, or
-  does the distribution zoo need Phase 8 specialist dispatch?
-  Phase 11's result decides whether Phase 8 is worth doing.
+- 🚧 **Phase 11 — Broader training corpus (in progress).**
+  Retrain L3TC-200K on the Pile dedup with an improved training
+  recipe (AdamW + cosine warmup, replacing L3TC's broken
+  double-stepping StepLR). Same architecture, same parameter
+  count. AMI baked (`ami-07a4fc98c4ed4e19e`), recipe validated
+  on enwik8 (5 epochs, loss 9.86 → 4.26, pipeline end-to-end
+  clean). Pass 2 (10 GB Pile dedup) corpus building now. This
+  is the decision gate for Phase 8: if the broader model covers
+  webster / code / logs at acceptable ratio, Phase 8 (specialist
+  dispatch) is unnecessary.
 
 Plus [`STORAGE_SERVICE_VISION.md`](STORAGE_SERVICE_VISION.md) —
 exploratory writeup of a managed-storage-service productization
@@ -396,8 +399,8 @@ l3tc-prod/
 ├── ANALYSIS.md            original project thinking document
 ├── DECISIONS.md           architectural decision log
 ├── PHASE_0.md .. PHASE_11.md
-│                          per-phase plans (0-4d done; 4e in
-│                          progress; 5-11 roadmap past Phase 4)
+│                          per-phase plans (0-4 done; 4e closed
+│                          failed; 11 in progress; 5-10 roadmap)
 ├── PHASE_4C.md, PHASE_4D.md, PHASE_4E.md
 │                          Phase 4 speed polish / 3.2M port /
 │                          distillation plans
