@@ -56,10 +56,16 @@ apt-get install -y -qq python3-venv python3-pip awscli xz-utils > /dev/null 2>&1
 ) &
 BOOTSTRAP_LOG_PID=$!
 
-# === Clone the repo (named "ltec" on GitHub, not "l3tc-prod") ===
+# === Get the repo (clone fresh or pull latest if baked AMI) ===
 cd /home/ubuntu
-git clone "https://x-access-token:${GITHUB_PAT}@github.com/dmatth1/ltec.git" l3tc-prod
-cd l3tc-prod
+if [ -d l3tc-prod/.git ]; then
+    cd l3tc-prod
+    git remote set-url origin "https://x-access-token:${GITHUB_PAT}@github.com/dmatth1/ltec.git"
+    git pull origin main
+else
+    git clone "https://x-access-token:${GITHUB_PAT}@github.com/dmatth1/ltec.git" l3tc-prod
+    cd l3tc-prod
+fi
 git log -1 --oneline
 chown -R ubuntu:ubuntu /home/ubuntu/l3tc-prod
 

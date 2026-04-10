@@ -256,6 +256,13 @@ private AMI and launch from that.
 6. Terminate the bake instance.
 7. Commit the AMI ID + updated launcher.
 
+**AMI cost:** EBS snapshots are $0.05/GB/month. The current AMI
+uses a 200 GB volume = **$10/month**. We only use ~30 GB (OS
+10 GB + venv ~5 GB + corpus 1.3 GB + repo ~2 GB + CUDA cache
+~5 GB). **Future re-bake should use a 50 GB volume** to cut
+the snapshot cost to ~$2.50/month. Delete the AMI once Phase 11
+is complete to stop the charges entirely.
+
 **Future launches from the AMI:** boot in ~60-90 sec with
 everything pre-installed. Userdata becomes `cd l3tc-prod &&
 git pull && python scripts/train_l3tc_phase11.py ...`. No pip
