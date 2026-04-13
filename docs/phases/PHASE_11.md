@@ -145,21 +145,58 @@ the standard fix.
 
 ## Current progress
 
-**Status as of 2026-04-10:** Phase 11.5 shipped (our own training
-script replacing L3TC's main.py). Training recipe improved
-(AdamW + cosine warmup, replacing L3TC's broken double-stepping
-StepLR). AMI bake in progress. Next steps:
+**Status as of 2026-04-13:**
 
-1. **AMI bake** — bootstrap a g5.2xlarge, run a 100-step bf16
-   canary on CUDA to validate, snapshot as a private AMI.
-2. **enwik8 recipe validation** — train from scratch on enwik8
-   (same corpus L3TC used) with the improved recipe. If enwik6
-   ratio matches or beats L3TC's 0.1699, the recipe is at least
-   as good. This isolates "recipe change" from "corpus change."
-3. **Pass 1 (enwik9)** — train on enwik9 using the validated
-   recipe and the baked AMI. Pipeline sanity check.
-4. **Pass 2 (Pile dedup)** — train on the broader corpus. The
-   real experiment.
+**Completed:**
+- ✅ Phase 11.5: own training script replacing L3TC's main.py
+- ✅ Training recipe: AdamW + cosine warmup + bf16
+- ✅ AMI baked: `ami-07a4fc98c4ed4e19e`
+- ✅ enwik8 recipe validation: pipeline works, recipe validated
+- ✅ Pass 1: skipped (enwik8 served the purpose)
+- ✅ Pass 2 (Pile 10 GB, 2L × 96H): **floor broken.** enwik6
+  ratio 0.3156 (limit was 0.20), webster 0.4886 (was 1.2613).
+  See `docs/phase-findings/phase_11_findings.md`.
+
+**Finding:** 200K non-embed params can learn ONE domain well
+(enwik8 → 0.17) or spread thin (Pile → 0.32 enwik6 / 0.49
+webster). Cannot do both. The bottleneck is model capacity AND
+the tokenizer (enwik8-trained SPM hurts OOD domains).
+
+**Next: Pass 3 — retrained tokenizer + 2L × 96H on Pile.**
+
+We're testing two hypotheses separately before adding layers:
+
+| experiment | tests | architecture | tokenizer | cost |
+|---|---|---|---|---|
+| **A (next)** | is the tokenizer the bottleneck? | 2L × 96H (unchanged, 131 KB/s) | **Pile-trained SPM 16384** | ~$6 |
+| B (if A fails) | is capacity the bottleneck? | **8L × 96H (~50 KB/s)** | Pile-trained SPM 16384 | ~$25 |
+
+**Rationale:** if a better tokenizer alone gets the 2L model
+close to ≤ 0.20 on most domains, we ship at 131 KB/s with no
+speed regression. If not, 8L × 96H gives 4× more transformer
+capacity at only ~50 KB/s (still 12× faster than every other
+LTCB learned compressor). We don't jump to 8L until the
+tokenizer experiment tells us we need it.
+
+**Pass 3 execution plan:**
+
+1. **Retrain SPM tokenizer locally** on a 1 GB sample of raw
+   Pile text streamed from HuggingFace. Vocab 16384, BPE.
+   CPU-only, ~10-30 min on MacBook. No cloud needed.
+2. **Re-tokenize the full 10 GB Pile corpus** on a cloud
+   instance (g5.xlarge from baked AMI) using the new SPM.
+   Upload to S3. ~30-60 min.
+3. **Train 2L × 96H** on the re-tokenized Pile using the same
+   recipe (AdamW, cosine warmup, bf16, batch 16, grad_accum 2).
+   Same g5.xlarge, ~3-4 hours, ~$5.
+4. **Measure the ratio matrix:** enwik6, webster, code sample,
+   log sample. Compare against Pass 2 numbers AND the default
+   200K.
+5. **Decision:**
+   - enwik6 ≤ 0.20 AND OOD dramatically improved → ship as
+     new default. The tokenizer was the bottleneck.
+   - enwik6 > 0.20 → run experiment B (8L × 96H). Capacity
+     is the bottleneck, need more layers.
 
 ### Why cloud, not the MacBook
 
