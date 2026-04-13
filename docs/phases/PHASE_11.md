@@ -198,6 +198,20 @@ tokenizer experiment tells us we need it.
    - enwik6 > 0.20 → run experiment B (8L × 96H). Capacity
      is the bottleneck, need more layers.
 
+**Future tokenizer optimizations (after Pass 3 answers the
+bottleneck question):**
+
+1. **Unigram instead of BPE** at the same vocab size. 10-min
+   experiment — same SPM library, just `model_type="unigram"`.
+   Unigram sometimes produces 5-10% fewer tokens on the same
+   text because it optimizes a likelihood objective over the
+   full vocab instead of greedy pairwise merges.
+2. **Vocab size sweep** (8K, 16K, 32K). The optimal vocab for
+   compression minimizes `tokens_per_byte × bits_per_token`.
+   Larger vocab = fewer tokens per byte but larger embedding
+   table eating into transformer capacity. There's a sweet
+   spot we haven't found yet.
+
 ### Why cloud, not the MacBook
 
 Phase 4e3 measured ~27 minutes for 5 MB × 2 epochs of L3TC training
