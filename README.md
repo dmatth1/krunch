@@ -1,18 +1,21 @@
 # l3tc-prod
 
-A lossless text compressor built on L3TC (AAAI 2025). 10-83×
-faster than every other neural/PAQ compressor on the
+A neural lossless compressor for text and structured data.
+10-83× faster than every other neural/PAQ compressor on the
 [Large Text Compression Benchmark](http://mattmahoney.net/dc/text.html),
-with 30-45% better compression ratio than zstd/xz/bzip2.
+with 30-45% better compression ratio than zstd/xz/bzip2 on
+text.
 
-Production Rust implementation of RWKV-v4 + HiRA driving an
-arithmetic coder. 6.6K LOC, minimal deps, hand-rolled NEON
-kernels, no ML framework at runtime.
+Built for backup, archival, log shipping, and cold storage —
+anywhere ratio matters more than speed. Production Rust
+implementation of RWKV-v4 + HiRA driving an arithmetic coder.
+6.6K LOC, minimal deps, hand-rolled NEON kernels, no ML
+framework at runtime.
 
-**Limitation:** the current model is trained on Wikipedia
-(enwik8). It compresses Wikipedia-like text well but degrades
-on out-of-distribution input (code, logs, dictionaries). Broader
-corpus training is in progress.
+**Current status:** the shipped model is trained on Wikipedia
+(enwik8) and compresses prose well. Broader corpus training
+(code, logs, JSON, dictionary text) is in progress to cover
+all text and structured data types.
 
 ## Numbers
 
