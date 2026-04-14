@@ -32,12 +32,12 @@ per byte. Net speed ~1.3× slower per byte.
 
 ### Model capacity — not tokenization — is the main bottleneck
 
-| experiment | architecture | tokenizer | enwik6 ratio | webster ratio | speed |
-|---|---|---|---:|---:|---:|
-| Default | 2L × 96H (1.03M non-embed) | enwik8 16K | 0.1699 | 1.2613 | 131 KB/s |
-| Pass 2 | 2L × 96H, Pile corpus | enwik8 16K | 0.3156 | 0.4886 | ~130 KB/s |
-| Pass 3 | 2L × 96H, Pile corpus | Pile 16K | 0.3429 | 0.5676 | 76 KB/s |
-| **Exp D** | **6L × 96H (3.1M non-embed)** | **Pile 32K** | **training...** | **training...** | **est ~50 KB/s** |
+| experiment | architecture | tokenizer | enwik6 ratio | webster ratio | speed | epoch measured |
+|---|---|---|---:|---:|---:|---|
+| Default | 2L × 96H (1.03M non-embed) | enwik8 16K | 0.1699 | 1.2613 | 131 KB/s | 20 (L3TC shipped) |
+| Pass 2 | 2L × 96H, Pile corpus | enwik8 16K | 0.3156 | 0.4886 | ~130 KB/s | 5 of 10 |
+| Pass 3 | 2L × 96H, Pile corpus | Pile 16K | 0.3429 | 0.5676 | 76 KB/s | 2 of 10 |
+| **Exp D** | **6L × 96H (3.1M non-embed)** | **Pile 32K** | **0.3579** | **tbd** | **48 KB/s** | **2 of 10** |
 
 Pass 2 proved: 200K non-embed params can learn one domain well
 (enwik8 → 0.17) or spread thin (Pile → 0.32 enwik6 / 0.49
@@ -97,18 +97,35 @@ non-embed transformer, 6.3M embed+head).
 grad_accum 4. 10.13 it/s. ~102 min/epoch, ~17 hours total.
 20-hour auto-shutdown.
 
-**Early results (epoch 0-1):**
+**Training progress:**
 
 | epoch | train loss | eval CE (nats) | bits/token |
 |---|---:|---:|---:|
 | 0 | 5.97 | 3.40 | 4.90 |
 | 1 | 5.21 | 3.23 | 4.66 |
+| 2 | 5.01 | 3.15 | 4.55 |
 
-Loss dropping fast. Checkpoints syncing to
+**Epoch 2 compression ratios (still undertrained, 8 epochs to go):**
+
+| file | type | exp D ratio | default 200K | speed |
+|---|---|---:|---:|---:|
+| enwik6 | Wikipedia | 0.3579 | 0.1699 | 48 KB/s |
+| json_api | structured | 0.3592 | untested | 43 KB/s |
+| python_source | code | 0.3671 | 0.4732 | 28 KB/s |
+| nginx_log | logs | 0.5010 | untested | 36 KB/s |
+| csv_data | tabular | 0.6211 | untested | 31 KB/s |
+
+Key observation: ratios are converging across domains (enwik6
+0.36, JSON 0.36, Python 0.37). The model is learning a
+general-purpose predictor. CSV/logs lag — those patterns need
+more training epochs.
+
+Checkpoints syncing to
 `s3://dmatth1-bnn-checkpoints/l3tc/experiment_d_6l_32k/`.
 
-**Next:** when training completes, pull checkpoint, convert,
-run `scripts/run_eval_suite.py` on all 9 domain files.
+**Next:** when training completes (~epoch 10), pull final
+checkpoint and re-measure all domains. Compare against bzip2
+baselines to see if we're competitive.
 
 ---
 
