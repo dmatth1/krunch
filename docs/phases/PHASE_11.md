@@ -97,6 +97,11 @@ non-embed transformer, 6.3M embed+head).
 grad_accum 4. 10.13 it/s. ~102 min/epoch, ~17 hours total.
 20-hour auto-shutdown.
 
+**Instance note:** switched from batch 8 / grad_accum 4 (10.13
+it/s) to batch 12 / grad_accum 3 (6.98 it/s) at epoch 4 to
+use more VRAM. Batch 16 OOM'd — L2Wrap backward allocates
+`zeros_like(logits)` which is 4 GB at batch 16 × 2048 × 32768.
+
 **Training progress:**
 
 | epoch | train loss | eval CE (nats) | bits/token |
@@ -104,6 +109,9 @@ grad_accum 4. 10.13 it/s. ~102 min/epoch, ~17 hours total.
 | 0 | 5.97 | 3.40 | 4.90 |
 | 1 | 5.21 | 3.23 | 4.66 |
 | 2 | 5.01 | 3.15 | 4.55 |
+| 3 | 4.89 | 3.10 | 4.47 |
+| 4 | 4.81 | 3.07 | 4.43 |
+| 5 | ~4.76 | — | — |
 
 **Epoch 2 compression ratios (still undertrained, 8 epochs to go):**
 
@@ -123,9 +131,59 @@ more training epochs.
 Checkpoints syncing to
 `s3://dmatth1-bnn-checkpoints/l3tc/experiment_d_6l_32k/`.
 
-**Next:** when training completes (~epoch 10), pull final
-checkpoint and re-measure all domains. Compare against bzip2
-baselines to see if we're competitive.
+Loss deceleration per epoch: 0.17 → 0.08 → 0.05 → 0.03.
+Projected epoch 10 eval CE: ~2.95. Projected enwik6 ratio:
+~0.32. Still above the 0.20 target — 6L likely needs either
+more training or more layers to reach it.
+
+---
+
+## Next run: 12L × 96H × vocab 32K on custom corpus
+
+**Architecture:** 12 layers × 96 hidden, vocab 32768 (~12.5M
+total params, ~6.2M non-embed). Estimated speed: ~35 KB/s
+before optimization (INT8 head + top-K cum_freqs could push
+to ~50 KB/s).
+
+**Instance:** g6e.xlarge (L40S 48 GB VRAM) via spot fleet.
+Needed because 12L at vocab 32K uses ~24 GB+ VRAM — too tight
+for A10G 24 GB. Use `INSTANCE_TYPE=g6e.xlarge` with
+`scripts/launch-spot-train.sh`.
+
+**Training:** 20-30 epochs × 500K epoch_length, batch 8 +
+grad_accum 4 (or larger batch if VRAM allows on L40S). With
+memmap token loading, any corpus size fits on any instance.
+Estimated cost: ~$80-100 on spot over 2-3 days.
+
+**Corpus: custom compressor-oriented mix (~50 GB).** The Pile
+is a good LLM pre-training corpus but has gaps for compression:
+no logs, no CSV, no YAML/config, stale code (2020). Building
+a custom corpus:
+
+| source | type | amount | notes |
+|---|---|---|---|
+| RedPajama/Dolma (base) | prose, code, web | ~40 GB | modern, well-curated, permissive license |
+| Synthetic nginx/syslog logs | log files | 1-2 GB | generated from realistic templates |
+| Synthetic JSON app logs | structured logs | 1 GB | structured logging patterns |
+| Kaggle CSV datasets | tabular data | 2-3 GB | public, diverse schemas |
+| GitHub YAML/TOML/Dockerfiles | config files | 500 MB | from The Stack or GitHub API |
+| Synthetic SQL dumps | database dumps | 500 MB | pgdump patterns |
+| GitHub Markdown/RST | documentation | 1 GB | already in most corpora |
+
+~85% general text + ~15% domain-specific structured data.
+The 15% is what makes this a compressor corpus instead of an
+LLM corpus. Built via `scripts/build_training_corpus.py`.
+
+**Tokenizer:** reuse the Pile SPM 32K (already trained and
+proven). The 32K vocab covers structured text well (2.57 B/T
+on JSON, 2.44 on logs). Can augment tokenizer training data
+with log/CSV samples later if eval shows gaps.
+
+**Decision after this run:** if 12L × 32K on the custom corpus
+hits ≤ 0.20 on enwik6 AND ≤ 0.30 on structured domains, ship
+it as the generalist tier at ~35-50 KB/s. If not, investigate
+deeper models (16L+) or architectural changes (context
+length, output layer).
 
 ---
 
