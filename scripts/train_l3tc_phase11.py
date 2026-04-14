@@ -125,13 +125,12 @@ from models.RWKV_V4.rwkv_tc_hira_train import RWKV_TC_HIRA  # noqa: E402
 from models.RWKV_V4.rwkv_v4_train import L2Wrap  # noqa: E402
 
 
-# === Hyperparameters pinned to vendor/L3TC/config/l3tc/l3tc_200k.py ===
-# Per Phase 11 hard constraint #1 these do not change.
+# === Default hyperparameters (overridable via CLI) ===
 HIDDEN_SIZE = 96
-NUM_HIDDEN_LAYERS = 2
+DEFAULT_NUM_LAYERS = 2
 INTERMEDIATE_SIZE = 96
 RWKV_RANK = 4
-VOCAB_SIZE = 16384
+DEFAULT_VOCAB_SIZE = 16384
 CTX_LEN = 2048
 SENTENCE_LENGTH = CTX_LEN
 CHUNK_SIZE = 1
@@ -288,15 +287,16 @@ class L3TCTokenDataset(Dataset):
 # ============================================================
 # Model + optimizer setup
 # ============================================================
-def build_model(device: torch.device) -> RWKV_TC_HIRA:
+def build_model(device: torch.device, num_layers: int = DEFAULT_NUM_LAYERS,
+                vocab_size: int = DEFAULT_VOCAB_SIZE) -> RWKV_TC_HIRA:
     print(
-        f"building RWKV_TC_HIRA: layers={NUM_HIDDEN_LAYERS} hidden={HIDDEN_SIZE} "
-        f"intermediate={INTERMEDIATE_SIZE} rank={RWKV_RANK} vocab={VOCAB_SIZE}"
+        f"building RWKV_TC_HIRA: layers={num_layers} hidden={HIDDEN_SIZE} "
+        f"intermediate={INTERMEDIATE_SIZE} rank={RWKV_RANK} vocab={vocab_size}"
     )
     model = RWKV_TC_HIRA(
-        vocab_size=VOCAB_SIZE,
+        vocab_size=vocab_size,
         hidden_size=HIDDEN_SIZE,
-        num_hidden_layers=NUM_HIDDEN_LAYERS,
+        num_hidden_layers=num_layers,
         intermediate_size=INTERMEDIATE_SIZE,
         rwkv_rank=RWKV_RANK,
         ctx_len=CTX_LEN,
@@ -579,6 +579,10 @@ def main() -> int:
                    help="Samples per training epoch (matches L3TC).")
     p.add_argument("--val-length", type=int, default=200,
                    help="Number of validation samples per eval pass.")
+    p.add_argument("--num-layers", type=int, default=DEFAULT_NUM_LAYERS,
+                   help="Number of RWKV transformer layers.")
+    p.add_argument("--vocab-size", type=int, default=DEFAULT_VOCAB_SIZE,
+                   help="Vocabulary size (must match the SPM tokenizer).")
     p.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     p.add_argument("--lr", type=float, default=LEARNING_RATE)
     p.add_argument("--num-workers", type=int, default=4)
@@ -643,7 +647,7 @@ def main() -> int:
     )
 
     # Model + optimizer + scheduler
-    model = build_model(device)
+    model = build_model(device, num_layers=args.num_layers, vocab_size=args.vocab_size)
     model = maybe_compile(model, device, args.no_compile)
     optimizer = build_optimizer(model)
     steps_per_epoch = args.epoch_length // args.batch_size
