@@ -53,3 +53,4 @@ l3tc-rust/checkpoints/*.bin
 l3tc-rust/checkpoints/*_distilled.pth
 l3tc-rust/checkpoints/*_distilled.epoch*.pth
 l3tc-rust/checkpoints/l3tc_1l96h.bin
+bench/corpora/eval_suite/
