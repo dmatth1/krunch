@@ -498,12 +498,12 @@ def evaluate(
         total_tokens += n_tok
 
     avg_ce = total_ce / max(total_tokens, 1)
-    bpb = avg_ce / math.log(2) / 3.5  # rough — ~3.5 bytes per BPE token
+    bits_per_token = avg_ce / math.log(2)
     print(
-        f"eval epoch {epoch}: tokens={total_tokens:,} avg_ce_nats={avg_ce:.4f} "
-        f"approx_bpb={bpb:.4f}"
+        f"eval epoch {epoch}: tokens={total_tokens:,} "
+        f"avg_ce_nats={avg_ce:.4f} bits_per_token={bits_per_token:.4f}"
     )
-    return {"avg_ce_nats": avg_ce, "approx_bpb": bpb, "n_tokens": total_tokens}
+    return {"avg_ce_nats": avg_ce, "bits_per_token": bits_per_token, "n_tokens": total_tokens}
 
 
 # ============================================================
