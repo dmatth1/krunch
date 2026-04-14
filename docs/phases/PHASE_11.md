@@ -111,7 +111,8 @@ use more VRAM. Batch 16 OOM'd — L2Wrap backward allocates
 | 2 | 5.01 | 3.15 | 4.55 |
 | 3 | 4.89 | 3.10 | 4.47 |
 | 4 | 4.81 | 3.07 | 4.43 |
-| 5 | ~4.76 | — | — |
+| 5 | 4.76 | 3.05 | 4.39 |
+| 6 (in progress) | ~4.73 | — | — |
 
 **Epoch 2 compression ratios (still undertrained, 8 epochs to go):**
 
@@ -158,21 +159,22 @@ Estimated cost: ~$80-100 on spot over 2-3 days.
 **Corpus: custom compressor-oriented mix (~50 GB).** The Pile
 is a good LLM pre-training corpus but has gaps for compression:
 no logs, no CSV, no YAML/config, stale code (2020). Building
-a custom corpus:
+a custom corpus from REAL data (not synthetic):
 
 | source | type | amount | notes |
 |---|---|---|---|
-| RedPajama/Dolma (base) | prose, code, web | ~40 GB | modern, well-curated, permissive license |
-| Synthetic nginx/syslog logs | log files | 1-2 GB | generated from realistic templates |
-| Synthetic JSON app logs | structured logs | 1 GB | structured logging patterns |
-| Kaggle CSV datasets | tabular data | 2-3 GB | public, diverse schemas |
-| GitHub YAML/TOML/Dockerfiles | config files | 500 MB | from The Stack or GitHub API |
-| Synthetic SQL dumps | database dumps | 500 MB | pgdump patterns |
-| GitHub Markdown/RST | documentation | 1 GB | already in most corpora |
+| RedPajama/Pile (base) | prose, code, web | ~40 GB | HuggingFace streaming |
+| The Stack v2 | real YAML, SQL, JSON, XML, Dockerfiles, shell | ~5 GB | real GitHub files (needs HF_TOKEN, gated) |
+| Loghub (GitHub) | real system logs (Apache, HDFS, Linux, etc.) | ~1 GB | direct download from logpai/loghub |
+| Public CSV datasets | real tabular data (UCI, Kaggle public) | ~1 GB | direct download |
 
-~85% general text + ~15% domain-specific structured data.
-The 15% is what makes this a compressor corpus instead of an
-LLM corpus. Built via `scripts/build_training_corpus.py`.
+~85% general text + ~15% real structured data from production
+sources. No synthetic generation — all real files from real
+repos and systems. Built via `scripts/build_real_corpus.py`.
+
+**Status:** HF_TOKEN available locally. Downloading real data
+locally, will sort through quality, upload to S3, pull from S3
+on the cloud instance for training.
 
 **Tokenizer:** reuse the Pile SPM 32K (already trained and
 proven). The 32K vocab covers structured text well (2.57 B/T
