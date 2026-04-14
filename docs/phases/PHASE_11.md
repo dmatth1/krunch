@@ -457,6 +457,14 @@ Training config: 500K epoch_length × 10 epochs (~5× passes over
 the corpus), batch 16 + grad_accum 2, on-demand g5.xlarge,
 ~3.7 hours, ~$4.50.
 
+**Optimization for next run:** Pass 3 showed GPU VRAM at 57%
+utilization (13.2 GB / 23 GB). Bump batch_size to 32 and drop
+grad_accum to 1 for the same effective batch — uses more VRAM
+and should be ~1.5-2× faster throughput since grad_accum
+overhead is eliminated. The OOM at batch=32 from the canary was
+with torch.compile enabled; without torch.compile batch=32
+should fit in ~16-17 GB.
+
 ### Pass 1 — enwik9 (ORIGINAL PLAN, NOW SKIPPED)
 
 **Goal:** train on enwik9 (1 GB, 10× enwik8) with the validated
