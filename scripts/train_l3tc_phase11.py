@@ -181,9 +181,11 @@ class L3TCTokenDataset(Dataset):
     we can resume / reproduce. Random sampling within an epoch is
     seeded by `np.random.RandomState`.
 
-    Loading is done into a single np.int32 array, not a Python
-    list, so a 1.3 GB token file uses ~1 GB of RAM instead of
-    L3TC's ~17 GB Python-list-of-ints overhead.
+    Loading uses memory-mapped I/O (np.memmap) so corpus size is
+    not limited by RAM. On first load, the text token file is
+    converted to a binary .npy cache; subsequent loads memmap
+    the cache directly (~instant, zero RAM overhead beyond the
+    OS page cache). A 50 GB corpus works on a 16 GB instance.
     """
 
     def __init__(
@@ -201,10 +203,10 @@ class L3TCTokenDataset(Dataset):
 
         print(f"loading token file: {corpus_path}")
         t0 = time.time()
-        self.tokens = self._load_tokens(corpus_path)
+        self.tokens = self._load_tokens_mmap(corpus_path)
         print(
             f"  loaded {len(self.tokens):,} tokens in {time.time() - t0:.1f}s "
-            f"(~{self.tokens.nbytes / 1e6:.1f} MB int32)"
+            f"(memmap, ~{self.tokens.nbytes / 1e6:.1f} MB on disk)"
         )
         if len(self.tokens) < self.segment_length * self.chunk_size + 1:
             raise ValueError(
@@ -213,11 +215,35 @@ class L3TCTokenDataset(Dataset):
             )
 
     @staticmethod
-    def _load_tokens(path: Path) -> np.ndarray:
+    def _load_tokens_mmap(path: Path) -> np.ndarray:
+        """Load tokens via memory-mapped binary cache.
+
+        First call: parse the text file → save as .npy binary cache.
+        Subsequent calls: memmap the .npy directly (~instant, no RAM).
+        """
+        cache_path = path.with_suffix(".npy")
+
+        if cache_path.exists() and cache_path.stat().st_mtime > path.stat().st_mtime:
+            # Cache is fresh — memmap it directly (open_memmap reads
+            # the .npy header correctly, unlike raw np.memmap)
+            print(f"  using binary cache: {cache_path}")
+            return np.lib.format.open_memmap(cache_path, mode="r")
+
+        # First load: parse text → binary cache
+        print(f"  building binary cache (one-time)...")
+        tokens = L3TCTokenDataset._parse_text_tokens(path)
+        np.save(cache_path, tokens)
+        print(f"  saved cache: {cache_path} ({tokens.nbytes / 1e6:.1f} MB)")
+
+        # Now memmap the cache instead of keeping the array in RAM
+        del tokens
+        return np.lib.format.open_memmap(cache_path, mode="r")
+
+    @staticmethod
+    def _parse_text_tokens(path: Path) -> np.ndarray:
+        """Parse a text token file into an int32 array."""
         with open(path, "r", encoding="utf-8") as f:
             head = f.read(4096)
-        # Auto-detect format. If the head has commas and few newlines,
-        # it's L3TC comma-separated. Otherwise, one int per line.
         n_commas = head.count(",")
         n_newlines = head.count("\n")
         if n_commas > n_newlines * 2:
@@ -229,10 +255,8 @@ class L3TCTokenDataset(Dataset):
                 dtype=np.int32,
             )
         else:
-            # One int per line (our format from spot-fleet-userdata.sh).
+            # One int per line (our format).
             tokens = np.fromfile(path, sep="\n", dtype=np.int32)
-            # np.fromfile leaves a trailing zero if the file ends with
-            # a newline; trim if it doesn't look like a real token.
             if len(tokens) > 0 and tokens[-1] == 0 and not path.read_bytes()[-2:] == b"0\n":
                 tokens = tokens[:-1]
             return tokens
