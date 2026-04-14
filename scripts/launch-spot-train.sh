@@ -21,9 +21,12 @@ S3_PREFIX="l3tc"
 KEY_NAME="swarm-ec2"
 SG_ID="sg-0af8b62d12cf4272c"
 IAM_PROFILE_ARN="arn:aws:iam::584956668248:instance-profile/bnn-s3-access"
-INSTANCE_TYPES=("g5.xlarge" "g6.xlarge" "g5.2xlarge" "g6e.xlarge")
 BAKED_AMI="ami-07a4fc98c4ed4e19e"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# Default instance type. Override with INSTANCE_TYPE env var for
+# larger models that need more VRAM (e.g., INSTANCE_TYPE=g6e.xlarge
+# for 48 GB VRAM models).
+INSTANCE_TYPE="${INSTANCE_TYPE:-g5.xlarge}"
 
 if [ -z "${L3TC_GITHUB_PAT:-}" ]; then
     echo "ERROR: L3TC_GITHUB_PAT not set."
@@ -31,6 +34,7 @@ if [ -z "${L3TC_GITHUB_PAT:-}" ]; then
 fi
 if [ $# -lt 2 ]; then
     echo "Usage: $0 <RUN_ID> <TRAIN_ARGS...>"
+    echo "  INSTANCE_TYPE=g6e.xlarge $0 ...  # for larger models"
     exit 1
 fi
 
@@ -68,12 +72,12 @@ if [ "$SIZE_RAW" -gt 12000 ]; then
     echo "WARNING: userdata is large (${SIZE_RAW} bytes). EC2 limit is 16384 base64."
 fi
 
-# Build launch specs (one per instance type for diversification)
-LAUNCH_SPECS=""
-for itype in "${INSTANCE_TYPES[@]}"; do
-    [ -n "$LAUNCH_SPECS" ] && LAUNCH_SPECS="${LAUNCH_SPECS},"
-    LAUNCH_SPECS="${LAUNCH_SPECS}{\"ImageId\":\"${AMI}\",\"InstanceType\":\"${itype}\",\"KeyName\":\"${KEY_NAME}\",\"SecurityGroups\":[{\"GroupId\":\"${SG_ID}\"}],\"IamInstanceProfile\":{\"Arn\":\"${IAM_PROFILE_ARN}\"},\"BlockDeviceMappings\":[{\"DeviceName\":\"/dev/sda1\",\"Ebs\":{\"VolumeSize\":200,\"VolumeType\":\"gp3\",\"DeleteOnTermination\":true}}],\"UserData\":\"${USERDATA}\",\"TagSpecifications\":[{\"ResourceType\":\"instance\",\"Tags\":[{\"Key\":\"Name\",\"Value\":\"l3tc-${RUN_ID}\"},{\"Key\":\"l3tc-run-id\",\"Value\":\"${RUN_ID}\"}]}]}"
-done
+# Single instance type — no diversification. Pick the right one
+# for your model's VRAM needs:
+#   g5.xlarge  (A10G 24GB)  — 6L models, batch 8-12
+#   g6e.xlarge (L40S 48GB)  — 12L models, larger batches
+echo "Instance: ${INSTANCE_TYPE}"
+LAUNCH_SPECS="{\"ImageId\":\"${AMI}\",\"InstanceType\":\"${INSTANCE_TYPE}\",\"KeyName\":\"${KEY_NAME}\",\"SecurityGroups\":[{\"GroupId\":\"${SG_ID}\"}],\"IamInstanceProfile\":{\"Arn\":\"${IAM_PROFILE_ARN}\"},\"BlockDeviceMappings\":[{\"DeviceName\":\"/dev/sda1\",\"Ebs\":{\"VolumeSize\":200,\"VolumeType\":\"gp3\",\"DeleteOnTermination\":true}}],\"UserData\":\"${USERDATA}\",\"TagSpecifications\":[{\"ResourceType\":\"instance\",\"Tags\":[{\"Key\":\"Name\",\"Value\":\"l3tc-${RUN_ID}\"},{\"Key\":\"l3tc-run-id\",\"Value\":\"${RUN_ID}\"}]}]}"
 
 # Submit fleet
 FLEET_ID=$(echo "{\"IamFleetRole\":\"arn:aws:iam::584956668248:role/aws-ec2-spot-fleet-tagging-role\",\"TargetCapacity\":1,\"SpotPrice\":\"2.00\",\"TerminateInstancesWithExpiration\":false,\"Type\":\"maintain\",\"AllocationStrategy\":\"capacityOptimized\",\"LaunchSpecifications\":[${LAUNCH_SPECS}]}" \
