@@ -1,0 +1,110 @@
+#!/bin/bash
+set -euo pipefail
+exec > /var/log/l3tc-train.log 2>&1
+
+# Placeholders replaced by launch-spot-train.sh:
+#   __GITHUB_PAT__, __RUN_ID__, __S3_RUN__, __TRAIN_ARGS__
+
+echo "=== l3tc spot training ==="
+echo "run: __RUN_ID__"
+date -u
+
+# Clear stale at jobs, set safety net
+for job in $(atq 2>/dev/null | awk '{print $1}'); do atrm $job 2>/dev/null; done
+echo "shutdown -h now" | at now + 24 hours 2>&1
+
+# Pull latest code
+cd /home/ubuntu/l3tc-prod
+git remote set-url origin "https://x-access-token:__GITHUB_PAT__@github.com/dmatth1/ltec.git"
+if [ -d .git ]; then
+    git checkout -- . 2>/dev/null || true
+    git pull origin main
+fi
+git log -1 --oneline
+
+cd vendor/L3TC
+source .venv/bin/activate
+ln -sfn python3 .venv/bin/python 2>/dev/null || true
+pip install datasets -q 2>&1 | tail -1
+
+# Download corpus + tokenizer from S3 paths in the train args
+# Parse --train-file and --tokenizer-s3 from the args
+TRAIN_ARGS="__TRAIN_ARGS__"
+ORIG_ARGS="$TRAIN_ARGS"
+
+# Extract --train-file value
+TRAIN_FILE=$(echo "$TRAIN_ARGS" | grep -oP '(?<=--train-file )\S+')
+if [[ "$TRAIN_FILE" == s3://* ]]; then
+    LOCAL_TRAIN="data/train_data/$(basename $TRAIN_FILE)"
+    mkdir -p data/train_data
+    if [ ! -f "$LOCAL_TRAIN" ]; then
+        echo "downloading corpus: $TRAIN_FILE"
+        aws s3 cp "$TRAIN_FILE" "$LOCAL_TRAIN" --quiet
+    fi
+    ls -lh "$LOCAL_TRAIN"
+    TRAIN_ARGS=$(echo "$TRAIN_ARGS" | sed "s|$TRAIN_FILE|$LOCAL_TRAIN|g")
+    TRAIN_FILE="$LOCAL_TRAIN"
+fi
+
+# Extract --tokenizer-s3 value (custom flag, download then remove from args)
+TOK_S3=$(echo "$ORIG_ARGS" | grep -oP '(?<=--tokenizer-s3 )\S+' || true)
+if [ -n "$TOK_S3" ]; then
+    TOK_DIR="dictionary/$(basename $(dirname $TOK_S3))"
+    TOK_LOCAL="$TOK_DIR/$(basename $TOK_S3)"
+    mkdir -p "$TOK_DIR"
+    aws s3 cp "$TOK_S3" "$TOK_LOCAL" --quiet
+    aws s3 cp "${TOK_S3%.model}.vocab" "${TOK_LOCAL%.model}.vocab" --quiet 2>/dev/null || true
+    ls -lh "$TOK_DIR/"
+    TRAIN_ARGS=$(echo "$TRAIN_ARGS" | sed "s|--tokenizer-s3 $TOK_S3||g")
+fi
+
+# Val split
+if [ -n "$TRAIN_FILE" ] && [ -f "$TRAIN_FILE" ]; then
+    VAL_FILE="data/val_data/val_$(basename $TRAIN_FILE)"
+    mkdir -p data/val_data
+    if [ ! -f "$VAL_FILE" ]; then
+        tail -n 100000 "$TRAIN_FILE" > "$VAL_FILE"
+    fi
+    echo "val: $(wc -l < $VAL_FILE) lines"
+fi
+
+# Resume from S3 checkpoint if exists
+CKPT_DIR="checkpoint/__RUN_ID__"
+mkdir -p "$CKPT_DIR"
+RESUME=""
+if aws s3 ls "__S3_RUN__/checkpoint_latest.pth" >/dev/null 2>&1; then
+    aws s3 cp "__S3_RUN__/checkpoint_latest.pth" "$CKPT_DIR/checkpoint_latest.pth" --quiet
+    RESUME="--resume $CKPT_DIR/checkpoint_latest.pth"
+    echo "resuming from checkpoint"
+fi
+
+# S3 sync cron
+cat > /etc/cron.d/l3tc-upload <<CRON
+*/3 * * * * root cd /home/ubuntu/l3tc-prod/vendor/L3TC && aws s3 cp train.log __S3_RUN__/train.log --quiet 2>/dev/null; aws s3 sync $CKPT_DIR/ __S3_RUN__/ --quiet 2>/dev/null
+CRON
+chmod 644 /etc/cron.d/l3tc-upload
+service cron reload 2>/dev/null || true
+
+# GPU check
+python -c "import torch; print(f'GPU: {torch.cuda.get_device_name(0)}, VRAM: {torch.cuda.get_device_properties(0).total_memory/1e9:.1f} GB')"
+
+# Train
+echo "=== Starting training ==="
+echo "args: $TRAIN_ARGS"
+date -u
+
+PYTHONUNBUFFERED=1 python /home/ubuntu/l3tc-prod/scripts/train_l3tc_phase11.py \
+    $TRAIN_ARGS \
+    --val-file "$VAL_FILE" \
+    --output-dir "$CKPT_DIR" \
+    --no-compile \
+    --log-every 100 \
+    --save-every-steps 5000 \
+    --device cuda \
+    $RESUME \
+    2>&1 | tee train.log
+
+# Final sync
+aws s3 sync "$CKPT_DIR/" "__S3_RUN__/" --quiet
+aws s3 cp train.log "__S3_RUN__/train.log" --quiet
+echo "=== Done ==="
