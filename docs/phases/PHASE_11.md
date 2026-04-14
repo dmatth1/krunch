@@ -96,6 +96,34 @@ we know exactly which specialists to train.
 
 ---
 
+## Evaluation suite (TODO — needed before next experiment)
+
+Current evaluation is too narrow (enwik6 + webster). We need
+test files covering every target domain to properly evaluate
+any model change. Assemble these before running experiment C:
+
+| corpus | type | size | source | status |
+|---|---|---|---|---|
+| enwik6 | Wikipedia prose | 1 MB | mattmahoney.net | have it |
+| webster | dictionary | 41 MB | Silesia corpus | have it |
+| dickens | fiction | 10 MB | Silesia corpus | have it (non-UTF-8 bug, need to fix or clean) |
+| JSON sample | structured data | ~5 MB | Kaggle / synthetic | **need to find/generate** |
+| nginx access log | log file | ~5 MB | public datasets / synthetic | **need to find/generate** |
+| Python source | code | ~5 MB | CPython stdlib or popular repo | **need to find** |
+| CSV dataset | tabular data | ~5 MB | Kaggle / UCI ML repo | **need to find** |
+| XML/HTML | markup | ~5 MB | Common Crawl sample or W3C | **need to find** |
+
+Sources: publicly available datasets, Kaggle exports, GitHub
+repos, synthetic generation for logs. Can also extract domain
+samples from the Pile itself (it has code, web text, ArXiv).
+
+The ratio matrix from the success criteria section should be
+updated to use this full suite once assembled. Every experiment
+(Pass 2, Pass 3, experiment B, experiment C) should report all
+8 rows so results are comparable across runs.
+
+---
+
 ## After Phase 11 — the shipping track
 
 Phase 11's outcome determines the path, but **Phase 9 (fuzzing)
