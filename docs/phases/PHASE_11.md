@@ -471,19 +471,53 @@ enwik9 would just be "more of the same domain" without answering
 the OOD question that Phase 11 exists to answer. Skipping
 straight to Pass 2.
 
-### Pass 2 — Pile dedup broader corpus (NEXT — the actual Phase 11 experiment)
+### Pass 2 — Pile dedup, enwik8 tokenizer (DONE — 2026-04-11)
 
-This is the run that answers the real question: can a single 200K
-model trained on a broader corpus handle webster / dickens / code
-/ logs without breaking the enwik6 ratio floor (≤ 0.20)?
+Trained 2L × 96H on 10 GB Pile dedup with the enwik8 SPM
+tokenizer. See `docs/phase-findings/phase_11_findings.md` for
+full results. **Floor broken:** enwik6 0.3156, webster 0.4886.
+The 200K model can't cover both Wikipedia and the broader
+distribution at the same time. Capacity is the bottleneck.
 
-**Corpus build:** `scripts/build_pile_corpus.py` written and
-running. Streaming 10 GB from HuggingFace Pile dedup, tokenizing
-with the existing SPM, uploading to
-`s3://dmatth1-bnn-checkpoints/l3tc/corpora/train_pile_dedup.txt`.
-Training config: 500K epoch_length × 10 epochs (~5× passes over
-the corpus), batch 16 + grad_accum 2, on-demand g5.xlarge,
-~3.7 hours, ~$4.50.
+### Pass 3 — Pile dedup, Pile-retrained tokenizer (DONE — 2026-04-13)
+
+Tested whether retraining the SPM on the Pile (instead of enwik8)
+would improve compression. **Result: worse on both metrics.**
+
+| checkpoint | enwik6 ratio | enwik6 speed | eval CE (nats) |
+|---|---:|---:|---:|
+| Pass 3 epoch 2 | 0.3575 | 76 KB/s | 2.930 |
+| Pass 3 epoch 6 | 0.3429 | 90 KB/s | 2.823 |
+| Pass 3 epoch 10 (est) | ~0.33 | ~90 KB/s | ~2.80 |
+| Pass 2 epoch 5 (enwik8 SPM) | 0.3156 | ~130 KB/s | 4.30 |
+
+The Pile tokenizer is worse than the enwik8 tokenizer on BOTH
+enwik6 ratio AND speed. A broader tokenizer at the same vocab
+size (16384) produces more tokens per byte because the subwords
+are spread across more domains → more model predictions per byte
+→ slower AND more chances to be wrong.
+
+**Eval metric bug found:** the `approx_bpb` in
+`train_l3tc_phase11.py` used a hardcoded 3.5 bytes/token
+divisor from the enwik8 tokenizer. With the Pile tokenizer
+(~2.3 bytes/token), the reported bpb was artificially low.
+Fixed: now reports `bits_per_token` (tokenizer-independent).
+The actual compression ratio from the Rust runtime is the
+honest metric — eval CE is only useful for tracking training
+convergence within a single tokenizer, not for cross-tokenizer
+comparison.
+
+**Conclusion:** the tokenizer retrain was not the bottleneck.
+The enwik8 tokenizer at 131 KB/s is better to keep. The
+problem is model capacity — 200K non-embed params spread across
+many domains produces worse predictions per domain. Next
+experiment: more layers (8L × 96H) with the original enwik8
+tokenizer.
+
+**Corpus build:** `scripts/build_pile_corpus.py` written.
+10 GB Pile dedup tokenized and in S3.
+Training config: 500K epoch_length × 10 epochs, batch 16 +
+grad_accum 2, on-demand g5.xlarge, ~$5.
 
 **Optimization for next run:** Pass 3 showed GPU VRAM at 57%
 utilization (13.2 GB / 23 GB). Bump batch_size to 32 and drop
