@@ -1,6 +1,8 @@
 # Phase 9 — Production hardening (fuzz, security, panic budget)
 
-**Status:** back-burner. Turns "clean research runtime" into "safe to run on untrusted input from strangers". Not urgent while single-user on local machines; becomes critical for file-sharing workflows, backup tools, or a storage service accepting uploads.
+**Status as of 2026-04-15:** in progress. Fuzz infrastructure
+set up, first round of bugs found and fixed. Long-duration
+fuzz runs (48h each) pending.
 
 ## The problem
 
@@ -21,6 +23,43 @@ The decoder assumes well-formed input. Our tests cover "inputs our own encoder p
 6. **CI hardening.** Miri on unsafe code, ASan+UBSan on linux-x86_64, `clippy::unwrap_used` and `clippy::panic` as errors in the library crate, weekly fuzz runs.
 
 7. **Release signing + SBOM.** minisign/cosign signatures, `cargo sbom` for every release.
+
+## Progress
+
+### Completed (2026-04-15)
+
+**Fuzz infrastructure:**
+- `cargo-fuzz` with 3 harnesses in `l3tc-rust/fuzz/`:
+  - `fuzz_checkpoint_parse` — binary checkpoint parser
+  - `fuzz_arithmetic_decoder` — AC decoder with random freq tables
+  - `fuzz_decompress_header` — checkpoint parser via from_bytes
+- All three clean after 60s smoke tests (9.3M + 1.5M + 9.5M runs)
+- Requires nightly: `cargo +nightly fuzz run <target>`
+
+**Bugs found and fixed by fuzzing:**
+1. **Checkpoint OOM** — `HashMap::with_capacity(n_tensors)` where
+   n_tensors was read from malformed input without bounds check.
+   Fix: cap n_tensors against remaining input bytes.
+2. **Checkpoint integer overflow** — `shape.iter().product()`
+   panicked on crafted tensor dimensions that overflow usize.
+   Fix: `checked_mul` with explicit error return.
+
+**Safety hardening applied:**
+- Varint decoder: `checked_shl` prevents shift overflow
+  (`codec.rs:read_varint`)
+- cum_freqs accumulator: `saturating_add` + runtime fallback
+  replaces `debug_assert` (`codec.rs:logits_to_cum_freqs_scratch`)
+- NEON unsafe: `assert!` replaces `debug_assert!` for shape
+  checks — fires in release builds (`tensor.rs:matvec_96x96_neon`)
+- Checkpoint: ndim bounded against remaining bytes
+
+### Remaining
+
+- Long-duration fuzz runs (48h per harness) — schedule overnight
+- Input validation budgets (segment count, body length, unk caps)
+- Panic-free hot path audit (grep for unwrap/expect/indexing)
+- CI integration (Miri on unsafe, ASan/UBSan on Linux)
+- Release signing + SBOM (low priority, do at Phase 6)
 
 ## Success criteria
 
