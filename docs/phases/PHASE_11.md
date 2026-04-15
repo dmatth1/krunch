@@ -172,48 +172,27 @@ grad_accum 4 (or larger batch if VRAM allows on L40S). With
 memmap token loading, any corpus size fits on any instance.
 Estimated cost: ~$80-100 on spot over 2-3 days.
 
-**Corpus: custom compressor-oriented mix (~50 GB).** The Pile
-is a good LLM pre-training corpus but has gaps for compression:
-no logs, no CSV, no YAML/config, stale code (2020). Building
-a custom corpus from REAL data (not synthetic):
+**Corpus: custom compressor-oriented mix (64 GB tokenized).**
+The Pile is a good LLM pre-training corpus but has gaps for
+compression: no logs, no CSV, no YAML/config, stale code
+(2020). Built a custom corpus from all REAL data — no
+synthetic, no repetition, deduplicated (0.05% cross-file
+overlap verified via MD5 chunk hashing).
 
-| source | type | amount | notes |
-|---|---|---|---|
-| RedPajama/Pile (base) | prose, code, web | ~40 GB | HuggingFace streaming |
-| The Stack v2 | real YAML, SQL, JSON, XML, Dockerfiles, shell | ~5 GB | real GitHub files (needs HF_TOKEN, gated) |
-| Loghub (GitHub) | real system logs (Apache, HDFS, Linux, etc.) | ~1 GB | direct download from logpai/loghub |
-| Public CSV datasets | real tabular data (UCI, Kaggle public) | ~1 GB | direct download |
+| source | type | raw size | tokens | notes |
+|---|---|---|---|---|
+| Pile dedup (seed 2024) | prose, code, web | 40 GB | 10.75B | HF streaming, no overlap with Exp D |
+| lumees/github-code-2025 | YAML, JSON, SQL, XML, shell, Dockerfile, TOML, Makefile, Groovy, Gradle | 5.15 GB | 2.30B | open HF dataset, real GitHub files |
+| Zenodo Loghub full | BGL, Spark, HDFS system logs | 1.0 GB | 394M | real production logs, 2.4M lines |
+| data.gov + GitHub CSV | diverse tabular data (200+ schemas) | 0.96 GB | 446M | government + public datasets |
+| **Total** | | **47.1 GB raw** | **13.89B tokens** | **64 GB tokenized** |
 
-~85% general text + ~15% real structured data from production
-sources. No synthetic generation — all real files from real
-repos and systems. Built via `scripts/build_real_corpus.py`.
+77% general text + 23% structured data. All real files from
+real repos, real systems, and real public data. Built via
+`scripts/build_corpus_v2.py` (structured) +
+`scripts/build_pile_corpus.py` (base).
 
-**Corpus build plan (4 steps):**
-
-1. Stream 40 GB Pile base with **new seed** (not seed 1204
-   used for Exp D — ensures no overlap with the 10 GB the 6L
-   model already trained on). Tokenize with Pile SPM 32K.
-2. Run `build_real_corpus.py --target-gb-per-domain 1.0` to
-   get ~5 GB from The Stack v2 (YAML/SQL/JSON/XML/Dockerfiles/
-   shell) + ~1 GB loghub full logs + ~1 GB CSV. The Stack v2
-   access has been granted.
-3. Tokenize all structured data with Pile SPM 32K.
-4. Concatenate all tokenized files → upload to S3.
-
-**Status:**
-
-Completed locally:
-- 2.8 GB structured code from Pile GitHub filter (YAML, JSON,
-  SQL, XML, Dockerfiles, Makefiles, shell scripts)
-- 4.3 MB real system logs (16 loghub types, 2K-line samples)
-- 28 MB real CSV datasets (17 public sources)
-
-Remaining:
-- Stream 40 GB Pile base (new seed, ~6-8 hours locally)
-- Stream ~5 GB from The Stack v2 (access granted)
-- Scale up loghub to ~1 GB (full datasets, not 2K samples)
-- Scale up CSV to ~1 GB (more public sources)
-- Tokenize + concatenate + upload to S3
+**Corpus: `s3://dmatth1-bnn-checkpoints/l3tc/corpora/train_12l_corpus_32k.txt`**
 
 **Tokenizer:** reuse the Pile SPM 32K (already trained and
 proven). The 32K vocab covers structured text well (2.57 B/T
