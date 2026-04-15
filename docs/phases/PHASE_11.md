@@ -113,34 +113,45 @@ use more VRAM. Batch 16 OOM'd — L2Wrap backward allocates
 | 4 | 4.81 | 3.07 | 4.43 |
 | 5 | 4.76 | 3.05 | 4.39 |
 | 6 | 4.72 | 3.03 | 4.37 |
+| 7 | 4.69 | 3.01 | 4.34 |
+| 8 | 4.66 | 2.99 | 4.31 |
+| 9 (final) | 4.65 | 2.98 | 4.30 |
 
-**Epoch 6 compression ratios (measured on M1, clean machine):**
+**Training complete.** 10 epochs, ~17 hours on g5.xlarge.
+Final eval CE: 2.98 nats (projected ~2.95, close).
+
+**Final compression ratios (epoch 9, measured on M1, clean machine):**
 
 | file | type | exp D ratio | default 200K | speed |
 |---|---|---:|---:|---:|
-| enwik6 | Wikipedia | 0.3391 | 0.1699 | 49 KB/s |
-| python_source | code | 0.3538 | 0.4732 | ~30 KB/s |
-| fiction | fiction | 0.4052 | 0.4161 | ~20 KB/s |
-| c_source | C code | 0.5997 | 0.5535 | ~8 KB/s |
+| enwik6 | Wikipedia | 0.3349 | 0.1699 | 49 KB/s |
+| json_api | structured | 0.3342 | untested | 42 KB/s |
+| python_source | code | 0.3544 | 0.4732 | 30 KB/s |
+| fiction | fiction | 0.4074 | 0.4161 | 31 KB/s |
+| nginx_log | logs | 0.4717 | untested | 37 KB/s |
+| csv_data | tabular | 0.5937 | untested | 31 KB/s |
+| c_source | C code | 0.6130 | 0.5535 | 7 KB/s |
 | html | markup | 1.0011 | 1.0011 | — |
+| xml_silesia | markup | — | — | non-UTF8 error |
 
-Ratios converging across domains. enwik6 improved from 0.358
-(epoch 2) to 0.339 (epoch 6). Python source now 25% better
-than the enwik8-specialized 200K model. Fiction comparable.
-HTML still broken (OOD). Speed is 2.8× slower than 200K
-(expected from 3× layers + 2× vocab, offset by fewer tokens).
+**Key findings:**
+- JSON is now the **best domain** (0.334) — better than enwik6
+- Ratios converged: enwik6/JSON/python all 0.33-0.35
+- Python source 25% better than enwik8-specialized 200K model
+- CSV (0.59) and logs (0.47) lag — need more training data
+  in these domains (motivates the custom corpus for 12L)
+- HTML still broken (OOD, ratio ≥1.0)
+- xml_silesia eval file has non-UTF8 bytes — needs a clean file
+- Speed 30-49 KB/s across domains (2.8× slower than 200K,
+  expected from 3× layers + 2× vocab). See
+  `docs/SPEED_OPTIMIZATIONS.md` for improvement opportunities.
 
 **Speed note:** early measurements showed ~9 KB/s due to a
 concurrent Pile download eating CPU. Clean-machine benchmarks
 match the theoretical ~49 KB/s. See `docs/EVALUATION_GUIDELINES.md`.
 
-Checkpoints syncing to
-`s3://dmatth1-bnn-checkpoints/l3tc/experiment_d_6l_32k/`.
-
-Loss deceleration per epoch: 0.17 → 0.08 → 0.05 → 0.03.
-Projected epoch 10 eval CE: ~2.95. Projected enwik6 ratio:
-~0.32. Still above the 0.20 target — 6L likely needs either
-more training or more layers to reach it.
+Checkpoints: `s3://dmatth1-bnn-checkpoints/l3tc/experiment_d_6l_32k/`
+(epochs 0-9 + latest). Instance terminated.
 
 ---
 
