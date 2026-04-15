@@ -11,7 +11,7 @@ date -u
 
 # Clear stale at jobs, set safety net
 for job in $(atq 2>/dev/null | awk '{print $1}'); do atrm $job 2>/dev/null; done
-echo "shutdown -h now" | at now + 24 hours 2>&1
+echo "shutdown -h now" | at now + 48 hours 2>&1
 
 # Pull latest code
 cd /home/ubuntu/l3tc-prod

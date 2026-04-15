@@ -80,7 +80,7 @@ echo "Instance: ${INSTANCE_TYPE}"
 LAUNCH_SPECS="{\"ImageId\":\"${AMI}\",\"InstanceType\":\"${INSTANCE_TYPE}\",\"KeyName\":\"${KEY_NAME}\",\"SecurityGroups\":[{\"GroupId\":\"${SG_ID}\"}],\"IamInstanceProfile\":{\"Arn\":\"${IAM_PROFILE_ARN}\"},\"BlockDeviceMappings\":[{\"DeviceName\":\"/dev/sda1\",\"Ebs\":{\"VolumeSize\":200,\"VolumeType\":\"gp3\",\"DeleteOnTermination\":true}}],\"UserData\":\"${USERDATA}\",\"TagSpecifications\":[{\"ResourceType\":\"instance\",\"Tags\":[{\"Key\":\"Name\",\"Value\":\"l3tc-${RUN_ID}\"},{\"Key\":\"l3tc-run-id\",\"Value\":\"${RUN_ID}\"}]}]}"
 
 # Submit fleet
-FLEET_ID=$(echo "{\"IamFleetRole\":\"arn:aws:iam::584956668248:role/aws-ec2-spot-fleet-tagging-role\",\"TargetCapacity\":1,\"SpotPrice\":\"2.00\",\"TerminateInstancesWithExpiration\":false,\"Type\":\"maintain\",\"AllocationStrategy\":\"capacityOptimized\",\"LaunchSpecifications\":[${LAUNCH_SPECS}]}" \
+FLEET_ID=$(echo "{\"IamFleetRole\":\"arn:aws:iam::584956668248:role/aws-ec2-spot-fleet-tagging-role\",\"TargetCapacity\":1,\"SpotPrice\":\"3.50\",\"TerminateInstancesWithExpiration\":false,\"Type\":\"maintain\",\"AllocationStrategy\":\"capacityOptimized\",\"LaunchSpecifications\":[${LAUNCH_SPECS}]}" \
     | aws ec2 request-spot-fleet --region "$REGION" --spot-fleet-request-config file:///dev/stdin --query 'SpotFleetRequestId' --output text)
 
 echo ""
