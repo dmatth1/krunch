@@ -112,22 +112,27 @@ use more VRAM. Batch 16 OOM'd — L2Wrap backward allocates
 | 3 | 4.89 | 3.10 | 4.47 |
 | 4 | 4.81 | 3.07 | 4.43 |
 | 5 | 4.76 | 3.05 | 4.39 |
-| 6 (in progress) | ~4.73 | — | — |
+| 6 | 4.72 | 3.03 | 4.37 |
 
-**Epoch 2 compression ratios (still undertrained, 8 epochs to go):**
+**Epoch 6 compression ratios (measured on M1, clean machine):**
 
 | file | type | exp D ratio | default 200K | speed |
 |---|---|---:|---:|---:|
-| enwik6 | Wikipedia | 0.3579 | 0.1699 | 48 KB/s |
-| json_api | structured | 0.3592 | untested | 43 KB/s |
-| python_source | code | 0.3671 | 0.4732 | 28 KB/s |
-| nginx_log | logs | 0.5010 | untested | 36 KB/s |
-| csv_data | tabular | 0.6211 | untested | 31 KB/s |
+| enwik6 | Wikipedia | 0.3391 | 0.1699 | 49 KB/s |
+| python_source | code | 0.3538 | 0.4732 | ~30 KB/s |
+| fiction | fiction | 0.4052 | 0.4161 | ~20 KB/s |
+| c_source | C code | 0.5997 | 0.5535 | ~8 KB/s |
+| html | markup | 1.0011 | 1.0011 | — |
 
-Key observation: ratios are converging across domains (enwik6
-0.36, JSON 0.36, Python 0.37). The model is learning a
-general-purpose predictor. CSV/logs lag — those patterns need
-more training epochs.
+Ratios converging across domains. enwik6 improved from 0.358
+(epoch 2) to 0.339 (epoch 6). Python source now 25% better
+than the enwik8-specialized 200K model. Fiction comparable.
+HTML still broken (OOD). Speed is 2.8× slower than 200K
+(expected from 3× layers + 2× vocab, offset by fewer tokens).
+
+**Speed note:** early measurements showed ~9 KB/s due to a
+concurrent Pile download eating CPU. Clean-machine benchmarks
+match the theoretical ~49 KB/s. See `docs/EVALUATION_GUIDELINES.md`.
 
 Checkpoints syncing to
 `s3://dmatth1-bnn-checkpoints/l3tc/experiment_d_6l_32k/`.
