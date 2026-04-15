@@ -120,6 +120,16 @@ impl Checkpoint {
             )));
         }
         let n_tensors = p.read_u32()? as usize;
+        // Each tensor has at least: name_len(4) + 1 byte name + ndim(4)
+        // + dtype(4) + data_len(8) = 21 bytes minimum. Cap allocation
+        // against remaining input to prevent OOM on malformed headers.
+        let max_possible = p.remaining() / 21;
+        if n_tensors > max_possible {
+            return Err(Error::BadCheckpoint(format!(
+                "n_tensors={n_tensors} exceeds maximum possible for {} remaining bytes",
+                p.remaining()
+            )));
+        }
 
         let mut tensors = HashMap::with_capacity(n_tensors);
         for i in 0..n_tensors {
@@ -264,6 +274,13 @@ impl<'a> Parser<'a> {
     fn read_tensor(&mut self) -> Result<(String, Tensor)> {
         let name = self.read_name()?;
         let ndim = self.read_u32()? as usize;
+        // Sanity: ndim × 4 bytes (u32 per dim) must fit in remaining
+        // input. Prevents OOM from a malformed ndim value.
+        if ndim > self.remaining() / 4 {
+            return Err(Error::BadCheckpoint(format!(
+                "{name}: ndim={ndim} exceeds remaining bytes"
+            )));
+        }
         let mut shape = Vec::with_capacity(ndim);
         for _ in 0..ndim {
             shape.push(self.read_u32()? as usize);
@@ -277,8 +294,14 @@ impl<'a> Parser<'a> {
         let data_len = self.read_u64()? as usize;
         self.ensure(data_len)?;
 
-        let expected_numel: usize = shape.iter().product();
-        let expected_bytes = expected_numel * 4;
+        let expected_numel: usize = shape.iter().try_fold(1usize, |acc, &d| {
+            acc.checked_mul(d)
+        }).ok_or_else(|| Error::BadCheckpoint(format!(
+            "{name}: shape {shape:?} overflows usize"
+        )))?;
+        let expected_bytes = expected_numel.checked_mul(4).ok_or_else(|| {
+            Error::BadCheckpoint(format!("{name}: numel {expected_numel} * 4 overflows"))
+        })?;
         if data_len != expected_bytes {
             return Err(Error::BadCheckpoint(format!(
                 "{name}: data length {data_len} does not match shape {shape:?} * 4 = {expected_bytes}"

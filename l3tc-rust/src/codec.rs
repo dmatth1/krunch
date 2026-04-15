@@ -1450,16 +1450,20 @@ fn logits_to_cum_freqs_scratch(
     cum[0] = 0;
     let mut total: u64 = 0;
     for i in 0..n {
-        total += freqs[i] as u64;
+        total = total.saturating_add(freqs[i] as u64);
         cum[i + 1] = total;
     }
 
     // Sanity: total must be ≤ MAX_TOTAL for the AC to accept it.
-    // With PYTHON_FREQ_TOTAL = 10M and n ≤ 16384, the max
-    // achievable total is ~10M + 16384 (every freq rounds up by 1
+    // With PYTHON_FREQ_TOTAL = 10M and n ≤ 32768, the max
+    // achievable total is ~10M + 32768 (every freq rounds up by 1
     // and the max(1) clamp pushes near-zero freqs to 1). Both are
-    // far below MAX_TOTAL = 2^62, so this never triggers.
-    debug_assert!(total <= MAX_TOTAL as u64);
+    // far below MAX_TOTAL = 2^62, so this never triggers — but
+    // saturating_add + runtime check ensures safety even if the
+    // invariant is violated (e.g., corrupted model weights).
+    if total > MAX_TOTAL as u64 {
+        uniform_fallback(n, cum);
+    }
 }
 
 /// Build a uniform cumulative-frequency table in `cum`.
@@ -1572,7 +1576,15 @@ fn read_varint<R: Read>(r: &mut R) -> Result<u64> {
     let mut shift: u32 = 0;
     for _ in 0..10 {
         let byte = r.read_u8().map_err(Error::Io)?;
-        result |= ((byte & 0x7F) as u64) << shift;
+        let bits = (byte & 0x7F) as u64;
+        // Guard against overflow: shift must be < 64 for a valid
+        // u64, and the shifted bits must not exceed u64::MAX.
+        if shift >= 64 {
+            return Err(Error::BadCheckpoint("varint overflow".into()));
+        }
+        result |= bits.checked_shl(shift).ok_or_else(|| {
+            Error::BadCheckpoint("varint shift overflow".into())
+        })?;
         if byte & 0x80 == 0 {
             return Ok(result);
         }

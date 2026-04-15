@@ -101,9 +101,11 @@ const MATVEC_BLAS_THRESHOLD: usize = 512;
 unsafe fn matvec_96x96_neon(mat: &[f32], x: &[f32], out: &mut [f32]) {
     use std::arch::aarch64::*;
 
-    debug_assert_eq!(mat.len(), 96 * 96);
-    debug_assert_eq!(x.len(), 96);
-    debug_assert_eq!(out.len(), 96);
+    // Hard requirements for memory safety — pointer arithmetic below
+    // assumes exactly 96×96 layout. Must fire in release builds.
+    assert_eq!(mat.len(), 96 * 96, "matvec_96x96_neon: mat must be 96x96");
+    assert_eq!(x.len(), 96, "matvec_96x96_neon: x must be 96");
+    assert_eq!(out.len(), 96, "matvec_96x96_neon: out must be 96");
 
     let mat_p = mat.as_ptr();
     let x_p = x.as_ptr();
@@ -213,9 +215,11 @@ pub fn matvec_square(mat: &[f32], x: &[f32], out: &mut [f32], n: usize) {
 /// that measure the 96×96 kernel directly.
 #[inline]
 pub fn matvec_96x96(mat: &[f32], x: &[f32], out: &mut [f32]) {
-    debug_assert_eq!(mat.len(), 96 * 96);
-    debug_assert_eq!(x.len(), 96);
-    debug_assert_eq!(out.len(), 96);
+    // Hard requirements for memory safety — pointer arithmetic below
+    // assumes exactly 96×96 layout. Must fire in release builds.
+    assert_eq!(mat.len(), 96 * 96, "matvec_96x96_neon: mat must be 96x96");
+    assert_eq!(x.len(), 96, "matvec_96x96_neon: x must be 96");
+    assert_eq!(out.len(), 96, "matvec_96x96_neon: out must be 96");
 
     #[cfg(target_arch = "aarch64")]
     {
