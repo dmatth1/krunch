@@ -134,6 +134,49 @@ Located in `bench/corpora/eval_suite/`:
 | c_source.txt | C code | 11 KB | too small for speed benchmarks |
 | html.txt | HTML | 24 KB | too small for speed benchmarks |
 
+## Speed optimization opportunities
+
+Identified via `l3tc profile` on the 6L×32K model. Ranked by
+expected impact.
+
+### Compress path (forward pass is 84.5% of time)
+
+1. **Head matvec: pre-widen INT8 columns** — `tensor.rs:656`.
+   The i8→f32 widening (`sxtl` + `scvtf`) happens inside the
+   inner 32K-iteration loop, limiting NEON autovectorization.
+   Pre-widening one column of i8 to f32 in a temp buffer before
+   the AXPY multiply would let the inner loop be a pure `fmla`
+   broadcast. Expected: ~30% reduction in head matvec time.
+
+2. **Top-K cum_freqs truncation** — `codec.rs:1388`. Most
+   probability mass is in <1000 tokens. Zero out the tail,
+   compute cum_freqs only over the top-K. Cuts the 32K loop
+   to ~1K per token. Expected: cum_freqs from 99 µs → ~10 µs
+   (15% → 2% of total time).
+
+3. **Vectorize cum_freqs prefix sum** — `codec.rs:1450`. The
+   scalar serial loop over 32K elements has a carried
+   dependency. SIMD parallel prefix scan (tree reduction)
+   could help but is complex. Top-K (#2) is simpler and
+   more impactful.
+
+### Decompress path
+
+4. **AC decode: binary search over cum_freqs** —
+   `arithmetic.rs:228`. Currently a linear O(V) scan with a
+   comment "we can switch to binary search later." At 32K
+   vocab this is ~16K comparisons per token → ~15 with binary
+   search. Decompress is already ~2× slower than compress on
+   the 6L model; this would roughly equalize them.
+
+### Both paths
+
+5. **Larger segment size** — currently 4096 bytes. Larger
+   segments (8K-16K) mean fewer segments, less per-segment
+   overhead (session reset, rayon dispatch), and better
+   compression ratio (longer context). Tradeoff: less rayon
+   parallelism on small files.
+
 ## Reference results (epoch 6, 6L × 32K, clean machine)
 
 | file | ratio | KB/s | notes |
