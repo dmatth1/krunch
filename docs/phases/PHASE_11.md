@@ -5,9 +5,9 @@ data types (prose, code, JSON, logs, CSV, XML) at ratios
 competitive with or better than classical compressors, while
 maintaining usable speed.
 
-**Status as of 2026-04-14:** Experiment D running (6L × 96H ×
-vocab 32K on 10 GB Pile dedup). Earlier experiments established
-that both more model capacity AND a better tokenizer are needed.
+**Status as of 2026-04-15:** Experiment D complete (6L × 96H ×
+32K). 12L run preparing — 64 GB custom corpus built, uploading
+to S3. LR scheduler bug fixed. Launch imminent.
 
 ---
 
@@ -37,7 +37,7 @@ per byte. Net speed ~1.3× slower per byte.
 | Default | 2L × 96H (1.03M non-embed) | enwik8 16K | 0.1699 | 1.2613 | 131 KB/s | 20 (L3TC shipped) |
 | Pass 2 | 2L × 96H, Pile corpus | enwik8 16K | 0.3156 | 0.4886 | ~130 KB/s | 5 of 10 |
 | Pass 3 | 2L × 96H, Pile corpus | Pile 16K | 0.3429 | 0.5676 | 76 KB/s | 2 of 10 |
-| **Exp D** | **6L × 96H (3.1M non-embed)** | **Pile 32K** | **0.3579** | **tbd** | **48 KB/s** | **2 of 10** |
+| **Exp D** | **6L × 96H (3.1M non-embed)** | **Pile 32K** | **0.3349** | **tbd** | **49 KB/s** | **9 of 10** |
 
 Pass 2 proved: 200K non-embed params can learn one domain well
 (enwik8 → 0.17) or spread thin (Pile → 0.32 enwik6 / 0.49
@@ -59,17 +59,15 @@ pipeline end-to-end clean, no NaN over 125K steps).
 - **Pre-baked AMI** (`ami-07a4fc98c4ed4e19e`): everything
   installed, boots in ~90 sec. Stale `at` shutdown jobs from
   the bake trigger on reboot — clear them on SSH.
-- **Always set auto-shutdown safety net** (8-20 hours via `at`).
+- **Always set auto-shutdown safety net** via `at`.
 - **S3 sync via cron every 3 min** (not background subshells —
   those broke from quoting issues).
 - **PYTHONUNBUFFERED=1** for visible training logs.
 - **On-demand for short runs** (<6 hr), spot for long runs.
-- **g5.xlarge** (A10G 24 GB, $0.76/hr) is the right instance.
-  Batch 16 + grad_accum 2 for 2L models. Batch 8 + grad_accum 4
-  for 6L models at vocab 32K.
+- **g5.xlarge** (A10G 24 GB) for ≤6L models. **g6e.xlarge**
+  (L40S 48 GB) for 12L+ models at vocab 32K.
 - **torch.compile disabled** — L2Wrap can't be traced by dynamo.
-- **AMI cost:** $10/month at 200 GB. Future re-bake at 50 GB =
-  $2.50/month. Delete when Phase 11 complete.
+- **AMI cost:** $10/month at 200 GB. Delete when Phase 11 complete.
 
 ### Eval metric bug (fixed)
 
@@ -167,10 +165,17 @@ Needed because 12L at vocab 32K uses ~24 GB+ VRAM — too tight
 for A10G 24 GB. Use `INSTANCE_TYPE=g6e.xlarge` with
 `scripts/launch-spot-train.sh`.
 
-**Training:** 20-30 epochs × 500K epoch_length, batch 8 +
-grad_accum 4 (or larger batch if VRAM allows on L40S). With
-memmap token loading, any corpus size fits on any instance.
-Estimated cost: ~$80-100 on spot over 2-3 days.
+**Training:** 10 epochs × 1M epoch_length (20.5B tokens,
+1.5× corpus coverage), batch 16 + grad_accum 2 (effective
+batch 32). L40S 48 GB VRAM gives headroom for batch 16
+(~13-14 GB est. usage). Memmap token loading, 200 GB disk.
+72-hour auto-shutdown safety net. Estimated cost: ~$100-140
+on spot over 2-3 days.
+
+**LR schedule:** AdamW 1e-4 peak, cosine → 1e-6 over 625K
+optimizer steps. Fixed bug where scheduler counted micro-batch
+steps instead of optimizer steps (Exp D's LR only decayed to
+7.3e-5 instead of 1e-6).
 
 **Corpus: custom compressor-oriented mix (64 GB tokenized).**
 The Pile is a good LLM pre-training corpus but has gaps for
@@ -272,27 +277,24 @@ generalist tier). Then same shipping track.
 
 | path | contents |
 |---|---|
-| `l3tc/corpora/enwik9.xz` | compressed enwik9 (1 GB) |
-| `l3tc/corpora/train_pile_dedup.txt` | Pile 10 GB tokenized with enwik8 SPM 16K |
-| `l3tc/corpora/train_pile_new_spm.txt` | Pile 10 GB tokenized with Pile SPM 16K |
-| `l3tc/corpora/train_pile_32k.txt` | Pile 10 GB tokenized with Pile SPM 32K |
-| `l3tc/corpora/pile_raw_1gb.txt` | raw Pile text (1 GB) for tokenizer training |
-| `l3tc/corpora/tokenizer_pile/` | Pile SPM 16K .model + .vocab |
+| `l3tc/corpora/train_12l_corpus_32k.txt` | **12L corpus**: 64 GB, 13.9B tokens (Pile 40 GB + structured 7 GB) |
+| `l3tc/corpora/train_pile_32k.txt` | Exp D corpus: Pile 10 GB tokenized with Pile SPM 32K |
 | `l3tc/corpora/tokenizer_pile_32k/` | Pile SPM 32K .model + .vocab |
+| `l3tc/corpora/tokenizer_pile/` | Pile SPM 16K .model + .vocab |
+| `l3tc/corpora/pile_raw_1gb.txt` | raw Pile text (1 GB) for tokenizer training |
 | `l3tc/corpora/spm_enwik8.tar.gz` | enwik8 SPM tokenizer files |
-| `l3tc/enwik8_recipe_validation/` | enwik8 recipe validation checkpoints |
+| `l3tc/experiment_d_6l_32k/` | Experiment D checkpoints (6L, epochs 0-9) |
 | `l3tc/phase11_pass2/` | Pass 2 checkpoints (2L, enwik8 SPM) |
 | `l3tc/phase11_pass3/` | Pass 3 checkpoints (2L, Pile SPM 16K) |
-| `l3tc/experiment_d_6l_32k/` | Experiment D checkpoints (6L, Pile SPM 32K) |
 
 ## Infrastructure
 
 - **AMI:** `ami-07a4fc98c4ed4e19e` (200 GB, $10/month)
-- **Instance:** g5.xlarge on-demand ($0.76/hr)
+- **Instances:** g5.xlarge (A10G 24 GB, ≤6L), g6e.xlarge (L40S 48 GB, 12L+)
 - **S3:** `s3://dmatth1-bnn-checkpoints/l3tc/` (shared bnn bucket)
 - **IAM:** `bnn-s3-access` instance profile
 - **Key:** `swarm-ec2`
 - **Scripts:** `scripts/train_l3tc_phase11.py`,
-  `scripts/build_pile_corpus.py`, `scripts/train_tokenizer_pile.py`,
+  `scripts/build_pile_corpus.py`, `scripts/build_corpus_v2.py`,
   `scripts/build_eval_suite.py`, `scripts/run_eval_suite.py`,
-  `scripts/launch-ondemand.sh`, `scripts/launch-spot-fleet.sh`
+  `scripts/launch-spot-train.sh`, `scripts/launch-ondemand.sh`
