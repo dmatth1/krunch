@@ -675,10 +675,13 @@ def main() -> int:
     model = maybe_compile(model, device, args.no_compile)
     optimizer = build_optimizer(model)
     steps_per_epoch = args.epoch_length // args.batch_size
-    total_steps = steps_per_epoch * args.epochs
+    # total_steps counts OPTIMIZER steps (not micro-batch steps).
+    # The scheduler is called once per optimizer step (every grad_accum
+    # micro-batches), so we divide by grad_accum.
+    total_steps = (steps_per_epoch * args.epochs) // args.grad_accum
     scheduler = build_scheduler(optimizer, total_steps)
-    print(f"schedule: {WARMUP_STEPS} warmup steps, {total_steps} total steps, "
-          f"cosine {LEARNING_RATE} -> {LR_MIN}")
+    print(f"schedule: {WARMUP_STEPS} warmup steps, {total_steps} optimizer steps, "
+          f"cosine {LEARNING_RATE} -> {LR_MIN} (grad_accum={args.grad_accum})")
     # Per-token cross entropy. We mask + reduce ourselves to match L3TC.
     criterion = nn.CrossEntropyLoss(reduction="none")
 
