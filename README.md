@@ -12,10 +12,11 @@ implementation of RWKV-v4 + HiRA driving an arithmetic coder.
 6.6K LOC, minimal deps, hand-rolled NEON kernels, no ML
 framework at runtime.
 
-**Current status:** the shipped model is trained on Wikipedia
-(enwik8) and compresses prose well. Broader corpus training
-(code, logs, JSON, dictionary text) is in progress to cover
-all text and structured data types.
+**Current status:** the shipped 200K model is trained on
+Wikipedia (enwik8) and compresses prose well. A generalist
+model trained on 52 GB of diverse data (prose + GitHub code +
+configs + logs + CSV) is in development to cover all text and
+structured data types — see `docs/phases/PHASE_11.md`.
 
 ## Numbers
 
