@@ -153,62 +153,84 @@ Checkpoints: `s3://dmatth1-bnn-checkpoints/l3tc/experiment_d_6l_32k/`
 
 ---
 
-## Next run: 12L × 96H × vocab 32K on custom corpus
+## Pivot: speed-first generalist (2L × 96H × 32K)
 
-**Architecture:** 12 layers × 96 hidden, vocab 32768 (~12.5M
-total params, ~6.2M non-embed). Estimated speed: ~35 KB/s
-before optimization (INT8 head + top-K cum_freqs could push
-to ~50 KB/s).
+**Decision (2026-04-15):** the project goal is a CLI tool that
+ships fast lossless compression. Speed is a hard constraint,
+not a soft one. Larger models (6L, 12L) progressively eroded
+the speed advantage that originally motivated this work
+(Default 200K hits 130 KB/s; Exp D 6L hits 49 KB/s; 12L
+projected at 25-35 KB/s). Pivoting back to small + fast.
 
-**Instance:** g6e.xlarge (L40S 48 GB VRAM) via spot fleet.
-Needed because 12L at vocab 32K uses ~24 GB+ VRAM — too tight
-for A10G 24 GB. Use `INSTANCE_TYPE=g6e.xlarge` with
-`scripts/launch-spot-train.sh`.
+**Architecture:** 2 layers × 96 hidden × vocab 32K (~6.4M
+total params, ~200K non-embed). Same shape as the original
+L3TC-200K but with the broader 32K tokenizer. Estimated speed:
+~75-90 KB/s on M1 (vs Default 200K at 130 KB/s — 32K head
+matvec doubles per-token cost, partially offset by ~8% fewer
+tokens via better tokenizer).
 
-**Training:** 10 epochs × 1M epoch_length (20.5B tokens,
-1.5× corpus coverage), batch 16 + grad_accum 2 (effective
-batch 32). L40S 48 GB VRAM gives headroom for batch 16
-(~13-14 GB est. usage). Memmap token loading, 200 GB disk.
-72-hour auto-shutdown safety net. Estimated cost: ~$100-140
-on spot over 2-3 days.
+**Hypothesis we never tested directly:** can a 2L × 96H model
+generalize across all text domains given enough diverse data
+and the right tokenizer? Pass 2 (2L × 96H × 16K, Pile corpus)
+got enwik6 0.32 with 5 epochs. With 50 GB diverse corpus +
+Pile 32K SPM + 20 epochs, can we get to ~0.25-0.30 across all
+domains while keeping 75+ KB/s?
 
-**LR schedule:** AdamW 1e-4 peak, cosine → 1e-6 over 625K
-optimizer steps. Fixed bug where scheduler counted micro-batch
-steps instead of optimizer steps (Exp D's LR only decayed to
-7.3e-5 instead of 1e-6).
+**Instance:** g5.xlarge on-demand (A10G 24 GB). 2L is small
+enough that batch 32 should fit easily. ~$0.76/hr × ~24-36h =
+~$20-30. No need for L40S.
 
-**Corpus: custom compressor-oriented mix (64 GB tokenized).**
-The Pile is a good LLM pre-training corpus but has gaps for
-compression: no logs, no CSV, no YAML/config, stale code
-(2020). Built a custom corpus from all REAL data — no
-synthetic, no repetition, deduplicated (0.05% cross-file
-overlap verified via MD5 chunk hashing).
+**Training:** 20 epochs × 500K epoch_length (~20B tokens,
+~1.5× corpus coverage), batch 32 + grad_accum 1. Bf16 mixed
+precision. 24-36h total wall time. 48-hour auto-shutdown.
 
-| source | type | raw size | tokens | notes |
-|---|---|---|---|---|
-| Pile dedup (seed 2024) | prose, code, web | 40 GB | 10.75B | HF streaming, no overlap with Exp D |
-| lumees/github-code-2025 | YAML, JSON, SQL, XML, shell, Dockerfile, TOML, Makefile, Groovy, Gradle | 5.15 GB | 2.30B | open HF dataset, real GitHub files |
-| Zenodo Loghub full | BGL, Spark, HDFS system logs | 1.0 GB | 394M | real production logs, 2.4M lines |
-| data.gov + GitHub CSV | diverse tabular data (200+ schemas) | 0.96 GB | 446M | government + public datasets |
-| **Total** | | **47.1 GB raw** | **13.89B tokens** | **64 GB tokenized** |
+**LR schedule:** AdamW 1e-4 peak, cosine → 1e-6 with the fixed
+scheduler (counts optimizer steps, not micro-batch steps).
 
-77% general text + 23% structured data. All real files from
-real repos, real systems, and real public data. Built via
-`scripts/build_corpus_v2.py` (structured) +
-`scripts/build_pile_corpus.py` (base).
+**Corpus: ~52 GB diverse, deduplicated, all real data.**
 
-**Corpus: `s3://dmatth1-bnn-checkpoints/l3tc/corpora/train_12l_corpus_32k.txt`**
+| source | type | size | notes |
+|---|---|---|---|
+| Pile dedup (seed 2024) | prose, web, papers | 40 GB | HF streaming, no overlap with Exp D |
+| nick007x/github-code-2025 (random) | natural GitHub mix: python, JS/TS, Java, C/C++, Go, Rust, HTML, CSS, markdown, etc. | 5 GB | open HF, 882 GB parent dataset |
+| lumees structured | YAML, JSON, SQL, XML, shell, Dockerfile, TOML, Makefile, Groovy, Gradle | 5 GB | open HF, real GitHub configs |
+| Zenodo Loghub full | BGL, Spark, HDFS system logs | 1 GB | real production logs |
+| data.gov + GitHub CSV | diverse tabular data (200+ schemas) | 1 GB | government + public data |
+| **Total** | | **~52 GB raw** | all deduplicated via MD5 |
 
-**Tokenizer:** reuse the Pile SPM 32K (already trained and
-proven). The 32K vocab covers structured text well (2.57 B/T
-on JSON, 2.44 on logs). Can augment tokenizer training data
-with log/CSV samples later if eval shows gaps.
+**Tokenizer: retrain the 32K SPM on this diverse corpus.** The
+existing Pile 32K SPM was trained on 1 GB of straight Pile
+text — never saw real logs, CSVs, configs, HTML, or modern
+GitHub code. Retraining on a balanced 1 GB sample drawn from
+the new corpus (50% Pile / 25% code / 12% structured /
+6% logs / 7% CSV) should improve B/T on the weak domains
+(currently 2.44 on logs, 2.57 on JSON; target 2.7+ on each).
 
-**Decision after this run:** if 12L × 32K on the custom corpus
-hits ≤ 0.20 on enwik6 AND ≤ 0.30 on structured domains, ship
-it as the generalist tier at ~35-50 KB/s. If not, investigate
-deeper models (16L+) or architectural changes (context
-length, output layer).
+**Sequence:**
+1. Stream 5 GB from nick007x/github-code-2025 → add to corpus
+2. Train new SPM 32K on balanced 1 GB sample of full corpus
+3. Compare B/T per domain vs current Pile 32K — only ship if
+   meaningfully better on weak domains
+4. Re-tokenize the full ~52 GB corpus with the new SPM
+5. Upload to S3, launch 2L × 32K training on g5.xlarge
+6. Eval on full 9-domain suite
+
+**Success criteria:** ≥75 KB/s on M1 AND ≤0.30 ratio on at
+least 5 of 8 domains (vs. 6L Exp D's 49 KB/s and 0.33-0.59
+ratios). If we hit that, this is the shipping tier.
+
+**Backup plans if 2L isn't enough:**
+- 4L × 32K — moderate capacity bump, still ~50-60 KB/s
+- Multi-tier product: ship 200K (specialized prose) + 2L×32K
+  (generalist) + 6L Exp D (max ratio) — let users pick
+- The 6L Exp D model already exists and works as the "max
+  ratio" tier if needed
+
+**12L plan deferred.** The 64 GB corpus and uploaded 12L
+training data are still valid if the 2L approach doesn't
+generalize. We can always come back to 12L for a "max ratio"
+tier later. The 2L experiment costs $20 vs $100-140 for 12L,
+so it's the right cheap test first.
 
 ---
 
