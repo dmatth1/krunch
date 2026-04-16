@@ -1401,12 +1401,9 @@ fn logits_to_cum_freqs_scratch(
     let n = logits.len();
 
     // --- Pass 1: find max logit (numerical-stability shift) ---
-    let mut max = f32::NEG_INFINITY;
-    for &l in logits {
-        if l > max {
-            max = l;
-        }
-    }
+    // NEON 4-wide reduction; scalar elsewhere. The branch in the
+    // old `if l > max` form blocks autovectorization.
+    let max = tensor::max_f32(logits);
     if !max.is_finite() {
         uniform_fallback(n, cum);
         return;

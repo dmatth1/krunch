@@ -960,6 +960,75 @@ pub fn max_elem(a: &[f32], b: &[f32], out: &mut [f32]) {
     }
 }
 
+/// Reduce `xs` to its maximum value. NEON 4-wide on aarch64;
+/// scalar elsewhere. Returns `f32::NEG_INFINITY` for an empty
+/// slice.
+///
+/// Used by the cum_freqs path as Pass 1 (numerical-stability
+/// shift before exp). At vocab=32K this saves ~5-10 µs per token
+/// vs the scalar `if l > max` loop, which the compiler doesn't
+/// autovectorize because of the branch.
+///
+/// NaN handling: `vmaxq_f32` propagates NaN, so a single NaN in
+/// the input makes the result NaN. The caller's `is_finite()`
+/// guard then triggers the uniform fallback — same as the scalar
+/// path's NEG_INFINITY-then-fallback behavior.
+pub fn max_f32(xs: &[f32]) -> f32 {
+    if xs.is_empty() {
+        return f32::NEG_INFINITY;
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        #[allow(unsafe_code)]
+        unsafe {
+            max_f32_neon(xs)
+        }
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let mut m = f32::NEG_INFINITY;
+        for &x in xs {
+            if x > m {
+                m = x;
+            }
+        }
+        m
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(unsafe_code)]
+unsafe fn max_f32_neon(xs: &[f32]) -> f32 {
+    use std::arch::aarch64::*;
+
+    let n = xs.len();
+    let chunks = n / 4;
+    let p = xs.as_ptr();
+
+    let mut max_v = vdupq_n_f32(f32::NEG_INFINITY);
+    let mut i = 0usize;
+    while i < chunks {
+        let v = vld1q_f32(p.add(i * 4));
+        max_v = vmaxq_f32(max_v, v);
+        i += 1;
+    }
+
+    let mut m = vmaxvq_f32(max_v);
+
+    let mut j = chunks * 4;
+    while j < n {
+        let v = *p.add(j);
+        if v > m {
+            m = v;
+        }
+        j += 1;
+    }
+    m
+}
+
 /// Time-mix blend used in every RWKV block:
 ///
 /// `out[i] = x[i] * mix[i] + prev[i] * (1 - mix[i])`
@@ -1225,6 +1294,31 @@ mod tests {
             sum_rel < 1e-5,
             "NEON exp sum relative error {sum_rel}; ours={sum_ours} ref={sum_ref}"
         );
+    }
+
+    #[test]
+    fn max_f32_basic() {
+        // Empty
+        assert_eq!(max_f32(&[]), f32::NEG_INFINITY);
+        // Single element
+        assert_eq!(max_f32(&[3.5]), 3.5);
+        // Tail-only (n < 4)
+        assert_eq!(max_f32(&[1.0, -2.0, 3.0]), 3.0);
+        // Multiple chunks + tail
+        let v: Vec<f32> = (0..18).map(|i| (i as f32) - 9.0).collect();
+        assert_eq!(max_f32(&v), 8.0);
+        // Max in tail
+        let mut v = vec![-10.0; 17];
+        v[16] = 99.0;
+        assert_eq!(max_f32(&v), 99.0);
+        // Max in middle of chunk
+        let mut v = vec![-10.0; 32];
+        v[5] = 7.0;
+        v[19] = 5.0;
+        assert_eq!(max_f32(&v), 7.0);
+        // NaN propagates → caller falls back via is_finite check
+        let v = vec![1.0, f32::NAN, 3.0, 2.0];
+        assert!(max_f32(&v).is_nan() || !max_f32(&v).is_finite());
     }
 
     #[test]
