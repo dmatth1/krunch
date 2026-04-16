@@ -77,22 +77,55 @@ fi
 #   g5.xlarge  (A10G 24GB)  — 6L models, batch 8-12
 #   g6e.xlarge (L40S 48GB)  — 12L models, larger batches
 echo "Instance: ${INSTANCE_TYPE}"
-LAUNCH_SPECS="{\"ImageId\":\"${AMI}\",\"InstanceType\":\"${INSTANCE_TYPE}\",\"KeyName\":\"${KEY_NAME}\",\"SecurityGroups\":[{\"GroupId\":\"${SG_ID}\"}],\"IamInstanceProfile\":{\"Arn\":\"${IAM_PROFILE_ARN}\"},\"BlockDeviceMappings\":[{\"DeviceName\":\"/dev/sda1\",\"Ebs\":{\"VolumeSize\":200,\"VolumeType\":\"gp3\",\"DeleteOnTermination\":true}}],\"UserData\":\"${USERDATA}\",\"TagSpecifications\":[{\"ResourceType\":\"instance\",\"Tags\":[{\"Key\":\"Name\",\"Value\":\"l3tc-${RUN_ID}\"},{\"Key\":\"l3tc-run-id\",\"Value\":\"${RUN_ID}\"}]}]}"
+echo "Mode:     ${LAUNCH_MODE:-spot}"
 
-# Submit fleet
-FLEET_ID=$(echo "{\"IamFleetRole\":\"arn:aws:iam::584956668248:role/aws-ec2-spot-fleet-tagging-role\",\"TargetCapacity\":1,\"SpotPrice\":\"3.50\",\"TerminateInstancesWithExpiration\":false,\"Type\":\"maintain\",\"AllocationStrategy\":\"capacityOptimized\",\"LaunchSpecifications\":[${LAUNCH_SPECS}]}" \
-    | aws ec2 request-spot-fleet --region "$REGION" --spot-fleet-request-config file:///dev/stdin --query 'SpotFleetRequestId' --output text)
+if [ "${LAUNCH_MODE:-spot}" = "ondemand" ]; then
+    # On-demand: aws ec2 run-instances. Slightly more expensive but
+    # no spot reclaim risk. Best for runs <12h where reclaim cost
+    # outweighs spot savings.
+    INSTANCE_ID=$(aws ec2 run-instances \
+        --region "$REGION" \
+        --image-id "$AMI" \
+        --instance-type "$INSTANCE_TYPE" \
+        --key-name "$KEY_NAME" \
+        --security-group-ids "$SG_ID" \
+        --iam-instance-profile "Arn=${IAM_PROFILE_ARN}" \
+        --block-device-mappings 'DeviceName=/dev/sda1,Ebs={VolumeSize=200,VolumeType=gp3,DeleteOnTermination=true}' \
+        --user-data "$(echo "$USERDATA" | base64 -d)" \
+        --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=l3tc-${RUN_ID}},{Key=l3tc-run-id,Value=${RUN_ID}}]" \
+        --query 'Instances[0].InstanceId' --output text)
 
-echo ""
-echo "============================================"
-echo "  Spot Fleet: ${FLEET_ID}"
-echo "  Run ID:     ${RUN_ID}"
-echo "  S3:         ${S3_RUN}/"
-echo ""
-echo "  Monitor:"
-echo "    aws s3 cp ${S3_RUN}/train.log - | tail -30"
-echo ""
-echo "  Cancel:"
-echo "    aws ec2 cancel-spot-fleet-requests --spot-fleet-request-ids ${FLEET_ID} --terminate-instances --region ${REGION}"
-echo "============================================"
-echo "${FLEET_ID}" > "/tmp/l3tc-fleet-${RUN_ID}.txt"
+    echo ""
+    echo "============================================"
+    echo "  On-Demand Instance: ${INSTANCE_ID}"
+    echo "  Run ID:             ${RUN_ID}"
+    echo "  S3:                 ${S3_RUN}/"
+    echo ""
+    echo "  Monitor:"
+    echo "    aws s3 cp ${S3_RUN}/train.log - | tail -30"
+    echo ""
+    echo "  Terminate:"
+    echo "    aws ec2 terminate-instances --instance-ids ${INSTANCE_ID} --region ${REGION}"
+    echo "============================================"
+    echo "${INSTANCE_ID}" > "/tmp/l3tc-instance-${RUN_ID}.txt"
+else
+    # Spot fleet (default)
+    LAUNCH_SPECS="{\"ImageId\":\"${AMI}\",\"InstanceType\":\"${INSTANCE_TYPE}\",\"KeyName\":\"${KEY_NAME}\",\"SecurityGroups\":[{\"GroupId\":\"${SG_ID}\"}],\"IamInstanceProfile\":{\"Arn\":\"${IAM_PROFILE_ARN}\"},\"BlockDeviceMappings\":[{\"DeviceName\":\"/dev/sda1\",\"Ebs\":{\"VolumeSize\":200,\"VolumeType\":\"gp3\",\"DeleteOnTermination\":true}}],\"UserData\":\"${USERDATA}\",\"TagSpecifications\":[{\"ResourceType\":\"instance\",\"Tags\":[{\"Key\":\"Name\",\"Value\":\"l3tc-${RUN_ID}\"},{\"Key\":\"l3tc-run-id\",\"Value\":\"${RUN_ID}\"}]}]}"
+
+    FLEET_ID=$(echo "{\"IamFleetRole\":\"arn:aws:iam::584956668248:role/aws-ec2-spot-fleet-tagging-role\",\"TargetCapacity\":1,\"SpotPrice\":\"3.50\",\"TerminateInstancesWithExpiration\":false,\"Type\":\"maintain\",\"AllocationStrategy\":\"capacityOptimized\",\"LaunchSpecifications\":[${LAUNCH_SPECS}]}" \
+        | aws ec2 request-spot-fleet --region "$REGION" --spot-fleet-request-config file:///dev/stdin --query 'SpotFleetRequestId' --output text)
+
+    echo ""
+    echo "============================================"
+    echo "  Spot Fleet: ${FLEET_ID}"
+    echo "  Run ID:     ${RUN_ID}"
+    echo "  S3:         ${S3_RUN}/"
+    echo ""
+    echo "  Monitor:"
+    echo "    aws s3 cp ${S3_RUN}/train.log - | tail -30"
+    echo ""
+    echo "  Cancel:"
+    echo "    aws ec2 cancel-spot-fleet-requests --spot-fleet-request-ids ${FLEET_ID} --terminate-instances --region ${REGION}"
+    echo "============================================"
+    echo "${FLEET_ID}" > "/tmp/l3tc-fleet-${RUN_ID}.txt"
+fi
