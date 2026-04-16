@@ -4,6 +4,27 @@ Speed and ratio levers identified via `l3tc profile` and code survey.
 Covers both compress throughput and bits-per-byte ratio. Items with
 `[NEW]` came from the 2026-04 survey; unmarked items predate.
 
+## Phase 12 status (2026-04)
+
+| # | item | status | result |
+|---|------|--------|--------|
+| #5 | precompute -exp(time_decay) | ✅ Phase 12a | trivial, ratio-neutral |
+| #8 | binary AC decode | ✅ Phase 12a | +5-10% decompress |
+| #4 | NEON sub_exp in time_mix | ✅ Phase 12a | replaces 4 scalar exp loops/layer |
+| #1 | head matvec pre-widen | ❌ reverted | regressed compress -12% on 32K vocab (L1 thrash); needs tiled rework |
+| #6 | INT8 attention/FFN blocks | ⏭ skipped | matvec_96x96_neon already ~3.2 µs/token total (~2%), not worth ratio risk |
+| — | NEON max_f32 (Pass 1 of cum_freqs) | ✅ Phase 12b | +11% compress, +13% decompress; new addition |
+| — | NEON sigmoid (safe form, vbslq select) | ✅ Phase 12c | +3-5% throughput; entropy bound exact |
+
+**Cumulative throughput gain on 1MB enwik6 (multi-core):**
+~32-66 KB/s baseline (high variance) → **~75 KB/s compress, ~80 KB/s
+decompress** (3-run mean, multi-core). Single-thread profile: forward
+177-204 µs/step, cum_freqs 25-29 µs/step (was ~80 µs).
+
+**Ratio:** 0.1699 held, entropy bound 0.163723 exact match with Python
+L3TC reference (no model-side regression).
+
+
 ## Current bottleneck breakdown
 
 From `l3tc profile` on fiction.txt (152 KB, single-thread, 6L × 96H × 32K):
