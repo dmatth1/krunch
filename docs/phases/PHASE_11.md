@@ -5,10 +5,10 @@ data types (prose, code, JSON, logs, CSV, XML) competitively
 with classical compressors, while keeping the speed advantage
 that motivated the original L3TC port.
 
-**Status as of 2026-04-16:** pivoted to speed-first approach.
-2L × 96H × 32K with retrained balanced tokenizer.
-Re-tokenizing 52 GB diverse corpus locally (parallel × 10
-workers, ~25 min). Then upload to S3 and train.
+**Status as of 2026-04-16:** corpus re-tokenized with balanced
+unigram 32K, **13.75B tokens / 51 GB** in 60 parts. Uploading
+to S3 (~45 min at 20 MiB/s). Then launch 2L × 96H × 32K
+training on g5.xlarge.
 
 ---
 
@@ -152,26 +152,40 @@ this vocab size).
 
 ---
 
-## Re-tokenization (in progress)
+## Re-tokenization (complete)
 
-The existing tokenized corpus uses the OLD Pile BPE 32K. We're
-re-tokenizing everything with the new balanced unigram via
-`scripts/retokenize_corpus.py`:
+Re-tokenized everything with the new balanced unigram via
+`scripts/retokenize_corpus.py` (10 parallel workers, byte-range
+partitioning):
 
-- **Pile (40 GB):** decode existing tokens with old SPM →
-  re-encode with new SPM. Validated: decode + re-encode
-  preserves token counts exactly (96.36% character similarity,
-  whitespace normalization only — no impact on training).
-- **Other 4 sources (12 GB raw):** tokenize fresh from raw
-  text files we already have locally.
+| component | docs | tokens | size | wall time |
+|---|---:|---:|---:|---:|
+| Pile (decode + re-encode) | 6.47M | 10.07B | 40.21 GB | 59 min |
+| nick007x diverse code | varies | ~1.0B | ~3 GB | ~3 min |
+| lumees structured 1+2 | 76,805 | 994M | 3.86 GB | 2 min |
+| Zenodo logs | 15,244 | 363M | 1.36 GB | 35s |
+| data.gov CSV | 15,324 | 414M | 1.68 GB | 42s |
+| **Total (concatenated)** | **6.6M+** | **13.75B** | **51 GB** | **66 min** |
 
-**Parallelization:** 10 workers (one per M1 core), each
-processing a byte range of the input file. Brought
-estimated time from 2.5 hours (single-thread) → ~25 minutes.
+**Decode + re-encode validation (Pile):** 96.36% character
+similarity (only whitespace normalization differs), and the
+new tokenizer produces the **exact same token count** on
+decoded vs original text — confirming the round-trip is
+lossless for training purposes.
 
-After completion: concatenate per-worker output → single
-training file (~65 GB tokens) → upload to S3 → launch
-training.
+**Parallelization performance debugging:** initial parallel
+version was no faster than single-thread because `f.tell()`
+calls inside the hot loop were forcing kernel syscalls and
+killing Python's readahead buffer (50% system CPU time).
+Fixed by tracking byte position via local counter — system
+time dropped 50%→18%, throughput 4 MB/s → 16 MB/s,
+ETA 3.3h → 66 min.
+
+**Final output:** `corpus_build/train_2l_corpus_balanced_32k.txt`
+(51 GB, 13.76B lines). Uploading to S3 at ~20 MiB/s.
+
+**S3 path (target):**
+`s3://dmatth1-bnn-checkpoints/l3tc/corpora/train_2l_corpus_balanced_32k.txt`
 
 ---
 

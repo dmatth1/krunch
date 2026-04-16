@@ -43,21 +43,18 @@ def _tokenize_text_worker(args):
     docs = 0
     tokens = 0
     t0 = time.time()
+    bytes_read = start_offset  # track locally — never call f.tell() in hot loop
     with open(in_path, 'r', encoding='utf-8', errors='replace') as fin:
         with open(out_path, 'w') as fout:
             fin.seek(start_offset)
             if start_offset > 0:
-                fin.readline()  # skip partial line
+                skip = fin.readline()  # skip partial line
+                bytes_read += len(skip.encode('utf-8'))
             buf, buf_bytes = [], 0
-            while True:
-                pos = fin.tell()
-                if pos >= end_offset:
-                    break
-                line = fin.readline()
-                if not line:
-                    break
+            for line in fin:
                 buf.append(line)
                 buf_bytes += len(line)
+                bytes_read += len(line.encode('utf-8'))
                 if buf_bytes >= 65536:
                     text = ''.join(buf)
                     ids = sp.encode_as_ids(text)
@@ -66,6 +63,8 @@ def _tokenize_text_worker(args):
                         tokens += len(ids)
                         docs += 1
                     buf, buf_bytes = [], 0
+                if bytes_read >= end_offset:
+                    break
             if buf:
                 text = ''.join(buf)
                 ids = sp.encode_as_ids(text)
@@ -118,33 +117,26 @@ def _retokenize_pile_worker(args):
     docs = 0
     tokens = 0
     t0 = time.time()
+    bytes_read = start_offset  # track locally — never call f.tell() in hot loop
 
     with open(in_path, 'r') as fin:
         with open(out_path, 'w') as fout:
             fin.seek(start_offset)
             # Align to next BOS (token "2") at line start
             if start_offset > 0:
-                fin.readline()  # skip partial line
-                # Now scan forward until we find a "2" line
-                while True:
-                    pos = fin.tell()
-                    line = fin.readline()
-                    if not line:
-                        return worker_id, 0, 0, time.time() - t0
+                skip = fin.readline()  # skip partial line
+                bytes_read += len(skip.encode('utf-8'))
+                # Scan forward (line by line) until we find a "2" line
+                for line in fin:
+                    bytes_read += len(line.encode('utf-8'))
                     if line.strip() == '2':
-                        # Rewind so the loop below picks this up
-                        fin.seek(pos)
+                        # We've consumed this BOS — start a new doc
                         break
 
             current_doc = []
-            doc_started = False
-            while True:
-                pos = fin.tell()
-                if pos >= end_offset and not current_doc:
-                    break
-                line = fin.readline()
-                if not line:
-                    break
+            past_end = False
+            for line in fin:
+                bytes_read += len(line.encode('utf-8'))
                 try:
                     tid = int(line.strip())
                 except ValueError:
@@ -162,13 +154,15 @@ def _retokenize_pile_worker(args):
                         except Exception:
                             pass
                         current_doc = []
-                    doc_started = True
-                    if pos >= end_offset:
-                        # Don't start a new doc past our end boundary
+                    if past_end:
+                        # We finished the last doc that started before our
+                        # end boundary; stop here
                         break
+                    if bytes_read >= end_offset:
+                        # Mark to stop after current doc completes
+                        past_end = True
                 else:
-                    if doc_started:
-                        current_doc.append(tid)
+                    current_doc.append(tid)
             # Flush final doc
             if current_doc:
                 try:
