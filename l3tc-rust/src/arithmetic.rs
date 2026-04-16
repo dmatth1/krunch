@@ -226,17 +226,15 @@ impl<R: Read> ArithmeticDecoder<R> {
         let value = ((offset + 1) * total - 1) / range;
 
         // Find the symbol whose cumulative range contains `value`.
-        // Linear search is fine for small vocabularies; we can
-        // switch to binary search later if the vocab gets large.
+        // cum_freqs is monotonically nondecreasing, so partition_point
+        // gives the first index where cum_freqs[i] > value; the symbol
+        // we want is one less. O(log V) instead of O(V) — the dominant
+        // decompress cost at vocab=32K, where linear scan was ~16K
+        // comparisons per token.
         let n = cum_freqs.len() - 1;
-        let mut symbol = 0u32;
-        while symbol < n as u32 {
-            let s = symbol as usize;
-            if (cum_freqs[s] as u128) <= value && value < cum_freqs[s + 1] as u128 {
-                break;
-            }
-            symbol += 1;
-        }
+        let symbol = cum_freqs
+            .partition_point(|&c| (c as u128) <= value)
+            .saturating_sub(1) as u32;
         if symbol >= n as u32 {
             return Err(Error::ZeroProbability { symbol });
         }

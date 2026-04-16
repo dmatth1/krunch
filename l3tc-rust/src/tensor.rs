@@ -360,6 +360,70 @@ unsafe fn exp_f32x4_neon(
     vmulq_f32(two_k, p)
 }
 
+/// `out[i] = exp(a[i] - b[i])` for every i. NEON-vectorized on
+/// aarch64; scalar `f32::exp` elsewhere.
+///
+/// Used in the RWKV time-mix state recurrence where the four
+/// per-token exp passes (e1 = exp(state_p − p), e2 = exp(ww − p),
+/// e1 = exp(ww − p_new), e2 = exp(k − p_new)) are guaranteed to
+/// have non-positive arguments because each `b` is the running
+/// max over the corresponding `a`. The NEON exp's `[-50, 0]`
+/// accuracy contract therefore holds without further clamping.
+///
+/// Same accuracy contract as [`softmax_shifted_exp_sum`]: max
+/// relative error ≈ 5e-7 (≈ 2 ULPs).
+pub fn sub_exp(a: &[f32], b: &[f32], out: &mut [f32]) {
+    debug_assert_eq!(a.len(), b.len());
+    debug_assert_eq!(a.len(), out.len());
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        #[allow(unsafe_code)]
+        unsafe {
+            sub_exp_neon(a, b, out);
+        }
+        return;
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        for i in 0..a.len() {
+            out[i] = (a[i] - b[i]).exp();
+        }
+    }
+}
+
+/// NEON implementation of [`sub_exp`]. 4-wide vectorized with a
+/// tail loop for `n % 4` elements.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(unsafe_code)]
+unsafe fn sub_exp_neon(a: &[f32], b: &[f32], out: &mut [f32]) {
+    use std::arch::aarch64::*;
+
+    let n = a.len();
+    let chunks = n / 4;
+    let a_p = a.as_ptr();
+    let b_p = b.as_ptr();
+    let o_p = out.as_mut_ptr();
+    let mut i = 0usize;
+    while i < chunks {
+        let off = i * 4;
+        let av = vld1q_f32(a_p.add(off));
+        let bv = vld1q_f32(b_p.add(off));
+        let diff = vsubq_f32(av, bv);
+        let e = exp_f32x4_neon(diff);
+        vst1q_f32(o_p.add(off), e);
+        i += 1;
+    }
+
+    let mut j = chunks * 4;
+    while j < n {
+        *o_p.add(j) = (*a_p.add(j) - *b_p.add(j)).exp();
+        j += 1;
+    }
+}
+
 /// NEON implementation of [`softmax_shifted_exp_sum`]. 4-wide
 /// vectorized over the vocab dimension with a tail loop for
 /// `n % 4` elements.
@@ -657,6 +721,15 @@ pub fn quantize_col_major_int8(
 /// widened i8 column — the inner loop widens i8 → f32 and does a
 /// scalar-broadcast FMA, which LLVM auto-vectorizes into NEON sxtl
 /// + scvtf + fmla. Memory traffic is 4× lower than the f32 path.
+///
+/// A "pre-widen" variant was tried (Phase 12 attempt #1: hoist the
+/// i8→f32 cast into a separate per-column pass over a 32K f32
+/// scratch). It regressed compress ~12% on the 32K-vocab head
+/// because the 128 KB widen buffer + 128 KB output buffer blow
+/// the M1 L1 (128 KB per perf core), causing each AXPY pass to
+/// re-fetch widen from L2. Tiled re-widening would fit, but the
+/// LLVM autovectorized fused loop is already close to bandwidth-
+/// bound, so the simple form below stays.
 pub fn matvec_col_major_int8(
     qmat: &[i8],
     scales: &[f32],
@@ -1152,6 +1225,57 @@ mod tests {
             sum_rel < 1e-5,
             "NEON exp sum relative error {sum_rel}; ours={sum_ours} ref={sum_ref}"
         );
+    }
+
+    #[test]
+    fn sub_exp_matches_libm() {
+        // time_mix uses sub_exp on inputs guaranteed to be ≤ 0
+        // (b is always max(state_p|ww|k, …) of a). Validate across
+        // that range plus a few clamped tails.
+        let n = 96; // hidden_size for L3TC-200K
+        let mut a = vec![0.0f32; n];
+        let mut b = vec![0.0f32; n];
+        for i in 0..n {
+            let t = i as f32 / n as f32;
+            // b > a everywhere → diff ≤ 0
+            b[i] = 5.0 + 10.0 * t;
+            a[i] = if i % 13 == 0 {
+                b[i] // diff = 0
+            } else if i % 7 == 0 {
+                b[i] - 5.0
+            } else if i % 5 == 0 {
+                b[i] - 25.0
+            } else {
+                b[i] - 60.0 // triggers the [-50, 0] clamp
+            };
+        }
+
+        let mut ours = vec![0.0f32; n];
+        sub_exp(&a, &b, &mut ours);
+
+        let clamp_floor = (-50.0f64).exp();
+        let mut max_rel = 0.0f64;
+        for i in 0..n {
+            let diff = (a[i] - b[i]) as f64;
+            let r = (a[i] - b[i]).exp() as f64;
+            if diff < -50.0 {
+                assert!(
+                    ours[i] >= 0.0 && ours[i] as f64 <= clamp_floor * 1.1,
+                    "clamped index {i}: diff={diff}, got {}",
+                    ours[i]
+                );
+                continue;
+            }
+            if r > 0.0 {
+                let rel = ((ours[i] as f64) - r).abs() / r;
+                if rel > max_rel {
+                    max_rel = rel;
+                }
+            }
+        }
+        // Same minimax accuracy contract as softmax: ~1e-5 worst-case
+        // observed after the polynomial + 2^k bit construction.
+        assert!(max_rel < 2e-5, "sub_exp max relative error {max_rel}");
     }
 
     #[test]

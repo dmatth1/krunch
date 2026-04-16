@@ -74,6 +74,10 @@ pub struct TimeMixParams {
     /// Decay vector: `(hidden_size,)`. Negative of this is exp'd in
     /// the recurrence to build the state decay per step.
     pub time_decay: Vec<f32>,
+    /// Precomputed `-exp(time_decay[i])` for the inner state update.
+    /// Held alongside `time_decay` so the hot path reads a constant
+    /// instead of recomputing one `exp()` per element per token.
+    pub neg_exp_time_decay: Vec<f32>,
     /// Initial time-first bias: `(hidden_size,)`.
     pub time_first: Vec<f32>,
     /// Mixing coefficient for key projection input.
@@ -318,8 +322,11 @@ impl Model {
             bias: take_1d(ckpt, "ln2.bias")?,
         };
 
+        let time_decay = take_1d(ckpt, "att.time_decay")?;
+        let neg_exp_time_decay = time_decay.iter().map(|&v| -v.exp()).collect();
         let att = TimeMixParams {
-            time_decay: take_1d(ckpt, "att.time_decay")?,
+            time_decay,
+            neg_exp_time_decay,
             time_first: take_1d(ckpt, "att.time_first")?,
             time_mix_k: take_1d(ckpt, "att.time_mix_k")?,
             time_mix_v: take_1d(ckpt, "att.time_mix_v")?,
@@ -622,14 +629,10 @@ impl<'a> Session<'a> {
         }
         // p = max(state_p, ww)
         tensor::max_elem(&state.state_p, &scratch.ww, &mut scratch.p);
-        // e1 = exp(state_p - p)
-        for i in 0..h {
-            scratch.e1[i] = (state.state_p[i] - scratch.p[i]).exp();
-        }
-        // e2 = exp(ww - p)
-        for i in 0..h {
-            scratch.e2[i] = (scratch.ww[i] - scratch.p[i]).exp();
-        }
+        // e1 = exp(state_p - p)   [NEON 4-wide]
+        tensor::sub_exp(&state.state_p[..h], &scratch.p[..h], &mut scratch.e1[..h]);
+        // e2 = exp(ww - p)        [NEON 4-wide]
+        tensor::sub_exp(&scratch.ww[..h], &scratch.p[..h], &mut scratch.e2[..h]);
         // a = e1 * state_a + e2 * v
         for i in 0..h {
             scratch.a[i] = scratch.e1[i] * state.state_a[i] + scratch.e2[i] * scratch.v[i];
@@ -640,22 +643,18 @@ impl<'a> Session<'a> {
         }
 
         // Update state for next step:
-        // ww = state_p + (-exp(time_decay))
+        // ww = state_p + (-exp(time_decay))   [decay term precomputed once at load]
         for i in 0..h {
-            scratch.ww[i] = state.state_p[i] + (-att.time_decay[i].exp());
+            scratch.ww[i] = state.state_p[i] + att.neg_exp_time_decay[i];
         }
         // p_new = max(ww, k)
         for i in 0..h {
             scratch.p[i] = scratch.ww[i].max(scratch.k[i]);
         }
-        // e1 = exp(ww - p_new)
-        for i in 0..h {
-            scratch.e1[i] = (scratch.ww[i] - scratch.p[i]).exp();
-        }
-        // e2 = exp(k - p_new)
-        for i in 0..h {
-            scratch.e2[i] = (scratch.k[i] - scratch.p[i]).exp();
-        }
+        // e1 = exp(ww - p_new)    [NEON 4-wide]
+        tensor::sub_exp(&scratch.ww[..h], &scratch.p[..h], &mut scratch.e1[..h]);
+        // e2 = exp(k - p_new)     [NEON 4-wide]
+        tensor::sub_exp(&scratch.k[..h], &scratch.p[..h], &mut scratch.e2[..h]);
 
         // state_a = e1 * state_a + e2 * v
         for i in 0..h {
@@ -756,6 +755,8 @@ mod tests {
                 },
                 att: TimeMixParams {
                     time_decay: vec![0.0; hidden],
+                    // -exp(0.0) = -1.0
+                    neg_exp_time_decay: vec![-1.0; hidden],
                     time_first: vec![0.0; hidden],
                     time_mix_k: vec![0.5; hidden],
                     time_mix_v: vec![0.5; hidden],
