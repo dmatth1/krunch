@@ -68,7 +68,10 @@ cli = ["dep:clap", "dep:anyhow"]
 
 [profile.release]
 opt-level = 3
-lto = "thin"
+# Fat (whole-program) LTO across all crates. Slower compile but
+# squeezes the last few % out of the inner-loop kernels, especially
+# the rayon dispatch and matrixmultiply boundary calls.
+lto = "fat"
 codegen-units = 1
 strip = "symbols"
 panic = "abort"

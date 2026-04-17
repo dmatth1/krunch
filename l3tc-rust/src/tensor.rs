@@ -1240,16 +1240,110 @@ pub fn layer_norm(x: &[f32], weight: &[f32], bias: &[f32], eps: f32, out: &mut [
     debug_assert_eq!(bias.len(), n);
     debug_assert_eq!(out.len(), n);
 
-    let mean = x.iter().sum::<f32>() / n as f32;
-    let mut var = 0.0f32;
-    for &v in x {
-        let d = v - mean;
+    #[cfg(target_arch = "aarch64")]
+    {
+        #[allow(unsafe_code)]
+        unsafe {
+            layer_norm_neon(x, weight, bias, eps, out);
+        }
+        return;
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let mean = x.iter().sum::<f32>() / n as f32;
+        let mut var = 0.0f32;
+        for &v in x {
+            let d = v - mean;
+            var += d * d;
+        }
+        var /= n as f32;
+        let inv_std = 1.0 / (var + eps).sqrt();
+        for i in 0..n {
+            out[i] = (x[i] - mean) * inv_std * weight[i] + bias[i];
+        }
+    }
+}
+
+/// NEON 4-wide layer norm. Three passes (mean, variance, output)
+/// over `n` elements; the reduction passes use `vaddvq_f32` for
+/// horizontal sum since LLVM doesn't autovec the scalar form
+/// (FP non-associativity blocks reordering).
+///
+/// Called 6 times per token on the 200K model (ln0, ln1×2, ln2×2,
+/// ln_out for 2 layers). Each call's reduction passes save ~50%
+/// vs scalar.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(unsafe_code)]
+unsafe fn layer_norm_neon(
+    x: &[f32],
+    weight: &[f32],
+    bias: &[f32],
+    eps: f32,
+    out: &mut [f32],
+) {
+    use std::arch::aarch64::*;
+
+    let n = x.len();
+    let chunks = n / 4;
+    let x_p = x.as_ptr();
+    let w_p = weight.as_ptr();
+    let b_p = bias.as_ptr();
+    let o_p = out.as_mut_ptr();
+
+    // Pass 1: mean.
+    let mut sum_v = vdupq_n_f32(0.0);
+    let mut i = 0usize;
+    while i < chunks {
+        sum_v = vaddq_f32(sum_v, vld1q_f32(x_p.add(i * 4)));
+        i += 1;
+    }
+    let mut sum = vaddvq_f32(sum_v);
+    let mut j = chunks * 4;
+    while j < n {
+        sum += *x_p.add(j);
+        j += 1;
+    }
+    let mean = sum / (n as f32);
+    let mean_v = vdupq_n_f32(mean);
+
+    // Pass 2: variance via fused (x-mean)² accumulation.
+    let mut var_v = vdupq_n_f32(0.0);
+    let mut i = 0usize;
+    while i < chunks {
+        let d = vsubq_f32(vld1q_f32(x_p.add(i * 4)), mean_v);
+        var_v = vfmaq_f32(var_v, d, d);
+        i += 1;
+    }
+    let mut var = vaddvq_f32(var_v);
+    let mut j = chunks * 4;
+    while j < n {
+        let d = *x_p.add(j) - mean;
         var += d * d;
+        j += 1;
     }
     var /= n as f32;
     let inv_std = 1.0 / (var + eps).sqrt();
-    for i in 0..n {
-        out[i] = (x[i] - mean) * inv_std * weight[i] + bias[i];
+    let inv_std_v = vdupq_n_f32(inv_std);
+
+    // Pass 3: out = (x - mean) * inv_std * weight + bias
+    let mut i = 0usize;
+    while i < chunks {
+        let off = i * 4;
+        let xv = vld1q_f32(x_p.add(off));
+        let wv = vld1q_f32(w_p.add(off));
+        let bv = vld1q_f32(b_p.add(off));
+        // (x - mean) * inv_std * weight = ((x-mean) * inv_std) * weight
+        let normed = vmulq_f32(vsubq_f32(xv, mean_v), inv_std_v);
+        let r = vfmaq_f32(bv, normed, wv);
+        vst1q_f32(o_p.add(off), r);
+        i += 1;
+    }
+    let mut j = chunks * 4;
+    while j < n {
+        *o_p.add(j) = (*x_p.add(j) - mean) * inv_std * *w_p.add(j) + *b_p.add(j);
+        j += 1;
     }
 }
 
