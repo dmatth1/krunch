@@ -41,6 +41,7 @@
 #![warn(clippy::all)]
 
 pub mod arithmetic;
+pub mod backend;
 pub mod bitio;
 pub mod checkpoint;
 pub mod codec;
@@ -49,6 +50,7 @@ pub mod rwkv;
 pub mod tensor;
 pub mod tokenizer;
 
+pub use backend::{Backend, GPU_AUTO_THRESHOLD_BYTES};
 pub use checkpoint::{Checkpoint, Tensor};
 pub use codec::{
     audit_compress, compress, decode_writer, decompress, decompress_bytes, dump_teacher,
