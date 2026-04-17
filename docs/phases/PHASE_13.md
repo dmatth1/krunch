@@ -4,29 +4,67 @@
 forward pass on Apple Metal. Default builds stay CPU-only with no
 GPU dependency; GPU is opt-in via cargo features.
 
-**Status as of 2026-04-17:** **sub-phases 13a-13f shipped.** End-to-end
-CLI compress/decompress via Metal works on real corpora with
-bit-identical round-trip. Major correctness finding (bit) below.
+**Status as of 2026-04-17:** **sub-phases 13a-13o shipped.** End-
+to-end CLI compress/decompress via Metal works on real corpora.
+Headline throughput **~48 KB/s compress on 1 MB enwik6** at
+batch=256 with the fused-layer kernel, ratio 0.1699 matching
+CPU exactly. ~320× over the Phase 13e bring-up but ~20× short
+of the 1-3 MB/s projection; remaining gap (and what would close
+it) documented below.
 
-**Phases 13g/13h/13i/13j shipped:** collapsing per-token GPU sync
-overhead plus N-segment lockstep batching. Measured headline on
-50 KB enwik6, L3TC-200K, M-series:
+**Phases 13g/13h/13i/13j/13k/13l/13m/13n/13o shipped:** collapsing
+per-token GPU sync overhead, N-segment lockstep batching,
+eliminating redundant copies, fusing activations into matvecs,
+folding the entire per-layer forward pass into a single MSL
+dispatch, and exploring multi-queue parallel dispatch.
 
-| phase | compress | change |
-|---|---:|---:|
-| pre-13h (lane-0 serial)        | 0.15 KB/s | baseline |
-| 13h (8-lane lockstep)          | 1.12 KB/s | +7.5× |
-| 13i (16-lane knee, sweep)      | 1.73 KB/s | +1.5× |
-| **13j (GPU-resident + chained)** | **~5.0 KB/s** | **+2.9×** |
+Progression on matched inputs:
 
-Cumulative **~33× over the original Phase 13e bring-up**, ratio
-held at 0.1791 across all sub-phases, byte-identical round trip.
-Still ~200× short of the 1 MB/s projection — the remaining gap is
-per-step GPU wall time (each token still triggers ~40 encoder
-dispatches inside the single command buffer; the dispatch-threads
-setup overhead now dominates). Next levers are kernel fusion
-(combine the elementwise glue kernels into one big per-token
-kernel) and larger batch scaling on multi-MB inputs.
+| phase | input | compress | change |
+|---|---|---:|---:|
+| pre-13h (lane-0 serial)        | 50 KB  | 0.15 KB/s | baseline |
+| 13h (8-lane lockstep)          | 50 KB  | 1.12 KB/s | +7.5× |
+| 13i (16-lane knee)             | 50 KB  | 1.73 KB/s | +1.5× |
+| 13j (GPU-resident + chained)   | 50 KB  | ~5.0 KB/s | +2.9× |
+| 13k (skip redundant copies)    | 50 KB  | ~5.0 KB/s |  flat |
+| 13l (matvec+act fusion)        | 50 KB  | ~5.0 KB/s |  flat |
+| 13n (layer-fused kernel)       | 50 KB  | ~5.0 KB/s |  flat (lane-starved) |
+| **13n (same kernel, 1 MB)**    | 1 MB   | **~48 KB/s** | **+10×** (full lanes) |
+| 13o (multi-queue dispatch)     | 1 MB   | ~48 KB/s  |  flat (no multi-queue gain on M-series) |
+
+Cumulative **~320× over the Phase 13e bring-up** on matched 1 MB
+enwik6 (0.15 KB/s → ~48 KB/s). Ratio matches CPU exactly (0.1699
+on 1 MB, 0.1792 on 50 KB — same as iter.sh reference), byte-
+identical round trip via auto-routed file header.
+
+Still ~20× short of the 1-3 MB/s projection. Per-token GPU wall
+time at batch=256 is ~10 ms. The fused-layer kernel per 13n does
+the whole per-layer compute (short+relu, ln1, time_mix, residual,
+ln2, channel_mix, adds) in ONE dispatch with threadgroup-shared
+layer_norm reductions — dropping dispatches from ~50/token to
+~11. Metal scheduler saturates a single command queue on this
+workload (13o confirmed additional queues don't parallelize).
+
+Remaining levers to close the gap (all multi-day engineering):
+
+1. **simdgroup_matrix 8×8 tiles** for the 7 per-layer 96×96
+   matvecs. Apple GPU's tensor-core equivalent. Projected 4-8×
+   on matmul throughput. Would need a ground-up rewrite of the
+   fused layer kernel using MSL simdgroup primitives.
+2. **INT8 block-matvec weights**. Head is already INT8 (Phase
+   12d); doing the same for w_key/w_value/w_receptance/w_output
+   and the ffn projections. Projected 1.5-2× from reduced
+   memory bandwidth. Ratio risk: calibrated offline quantization
+   of ~500 KB of float weights, could drift cum_freqs by
+   several ULPs per layer.
+3. **Smaller vocab** via tokenizer retrain. vocab=8K would cut
+   head matvec + cum_freqs compute by 2×, directly visible in
+   the bottleneck. Happens at training time (Phase 11 parallel
+   work).
+
+Without these the 200K model on Apple M-series is at its
+practical ceiling around 48-50 KB/s with the current
+architecture.
 
 **Major caveat from Phase 13e:** files compressed via Metal must be
 decompressed via Metal. Cross-backend interop (the original
