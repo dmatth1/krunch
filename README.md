@@ -31,7 +31,7 @@ post-Phase-13n fused-layer kernel at batch=256.
 | CPU 1 thread | 200K | **22.7 KB/s** | **23.6 KB/s** | 0.1699 | ~1.43 |
 | CPU 10 threads (rayon) | 200K | **172 KB/s** | **180 KB/s** | 0.1699 | ~1.43 |
 | CPU 10 threads (rayon) | 3.2M | **40 KB/s** | **41 KB/s** | 0.1337 | ~1.07 |
-| GPU Metal (200K, 256-lane + fused layers) | 200K | **~48 KB/s** | ~48 KB/s | 0.1699 | ~1.43 |
+| GPU Metal (200K, 256-lane + fused layers + pipelined) | 200K | **~100 KB/s** | ~48 KB/s | 0.1699 | ~1.43 |
 
 Metal ratio now matches CPU exactly (0.1699) — the Phase 13n
 fused-layer kernel keeps per-layer intermediate state in registers
@@ -43,14 +43,15 @@ CPU multi-thread scaling: ~7.5× over single-thread (memory-bandwidth
 bound from 10 threads up).
 
 **Phase 13 GPU backend status:** functional, bit-correct, and
-approximately ~28% of the single-thread CPU rate on 1 MB enwik6.
-End-to-end Metal compress on 1 MB: **~48 KB/s** at batch=256 with
-the post-13n fused-layer kernel (one MSL dispatch covers the whole
-per-layer forward pass). Ratio 0.1699 matches CPU. Cumulative
-across Phases 13e→13n: **~320× over the 0.15 KB/s bring-up** (and
-~10× over the 5 KB/s that the 50 KB lane-starved test was showing
-pre-Phase-13n). The 1-3 MB/s projection remains open — next levers
-are multi-queue parallel dispatch, simdgroup_matrix tiles for the
+approximately **~45% of the single-thread CPU rate** on 1 MB enwik6.
+End-to-end Metal compress on 1 MB: **~100 KB/s** at batch=256 with
+the post-13s pipelined path (GPU forward(t+1) overlapped with CPU
+AC encode(t)). Ratio 0.1699 matches CPU exactly. Cumulative across
+Phases 13e→13s: **~667× over the 0.15 KB/s bring-up**, landed via
+N-segment lockstep (13h), GPU-resident state + chained dispatch
+(13j), per-layer fused MSL kernel (13n), parallelized cum_freqs
+stages (13q), and GPU/CPU pipelining (13s). The 1-3 MB/s projection
+remains open — next levers are simdgroup_matrix tiles for the
 7 per-layer matvecs, or INT8-quantizing the 9216-element block
 projections. See [`docs/phases/PHASE_13.md`](docs/phases/PHASE_13.md)
 for the full architecture and the bit-equivalence finding.

@@ -28,7 +28,7 @@ use crate::backend::mtl::{
     TimeMixKernelMetal,
 };
 use crate::rwkv::{Block, Model};
-use metal::{Buffer, MTLResourceOptions};
+use metal::{Buffer, CommandBuffer, MTLResourceOptions};
 
 /// Allocate a GPU-visible buffer of `n * sizeof(T)` bytes, zero-filled.
 fn new_shared_buf_bytes(device: &metal::Device, bytes: u64) -> Buffer {
@@ -212,6 +212,13 @@ pub struct BatchedSession<'a> {
     /// Host-side copy of the `batch * vocab` u32 freqs table.
     /// Populated after `forward_batched` returns.
     pub freqs: Vec<u32>,
+
+    /// Phase 13s: pending async GPU submission. When `Some`, a
+    /// `forward_submit` has been issued without a matching
+    /// `forward_wait_and_readback`. Holding the owned CommandBuffer
+    /// here keeps the Rust-side lifetime right while the GPU runs
+    /// the token asynchronously alongside CPU-side work.
+    pending_cmd: Option<CommandBuffer>,
 }
 
 impl<'a> BatchedSession<'a> {
@@ -327,6 +334,7 @@ impl<'a> BatchedSession<'a> {
             freqs_buf: new_shared_buf_bytes(&device, bv_u32_bytes),
             logits: vec![0.0; bv],
             freqs: vec![0u32; bv],
+            pending_cmd: None,
         };
         // Initialize persistent state buffers.
         let mut s = session;
@@ -357,7 +365,31 @@ impl<'a> BatchedSession<'a> {
     /// buffers; only `prev_tokens` goes CPU→GPU and only `logits` +
     /// `freqs` come GPU→CPU per call.
     pub fn forward_batched(&mut self, prev_tokens: &[u32]) {
+        self.forward_submit(prev_tokens);
+        self.forward_wait_and_readback();
+    }
+
+    /// Phase 13s: async version of `forward_batched`. Encodes the
+    /// full per-token forward pipeline into a command buffer and
+    /// submits it to the GPU WITHOUT waiting. Follow up with
+    /// `forward_wait_and_readback()` when you need the freqs back
+    /// on CPU. Between submit and wait, the caller can do CPU-side
+    /// work (e.g. AC-encode the previous step's freqs) in parallel
+    /// with the GPU's forward compute.
+    ///
+    /// # Panics
+    /// Panics if a previous `forward_submit` hasn't been followed
+    /// by `forward_wait_and_readback`. Only one GPU forward pass
+    /// may be in flight at a time (state buffers are mutated in
+    /// place by the fused-layer kernel; overlapping calls would
+    /// race on the state).
+    pub fn forward_submit(&mut self, prev_tokens: &[u32]) {
         assert_eq!(prev_tokens.len(), self.batch);
+        assert!(
+            self.pending_cmd.is_none(),
+            "forward_submit called with pending work; call \
+             forward_wait_and_readback first"
+        );
         const PYTHON_FREQ_TOTAL: u32 = 10_000_000;
         let bh = (self.batch * self.h) as u32;
         let batch_u = self.batch;
@@ -475,21 +507,27 @@ impl<'a> BatchedSession<'a> {
         );
         } // end skip_cum guard
 
-        // 7. Single sync for the whole token.
+        // 7. Commit without waiting; retain ownership so the
+        //    caller can wait on it later.
         cmd_buf.commit();
-        cmd_buf.wait_until_completed();
+        self.pending_cmd = Some(cmd_buf.to_owned());
+    }
 
-        // 8. Read freqs (compress/decompress hot path only needs this —
-        //    ~1 MB copy at batch=16, vocab=16K). Logits readback is
-        //    deferred until a caller actually asks for them via
-        //    `sync_logits_host()`, so the hot path skips a second
-        //    `batch * vocab * 4` byte CPU copy per token.
-        //
-        //    L3TC_METAL_SKIP_READBACK=1 disables this readback for
-        //    profiling only — the resulting `self.freqs` is stale,
-        //    so AC encode will produce garbage. Bench use only.
-        if std::env::var("L3TC_METAL_SKIP_READBACK").is_err() {
-            read_u32(&self.freqs_buf, &mut self.freqs);
+    /// Phase 13s: block until the pending `forward_submit` finishes,
+    /// then copy the GPU freqs buffer into `self.freqs`. Becomes a
+    /// no-op if there's no pending submission.
+    pub fn forward_wait_and_readback(&mut self) {
+        if let Some(cmd) = self.pending_cmd.take() {
+            cmd.wait_until_completed();
+            // Read freqs (compress/decompress hot path only needs this
+            // — ~1 MB at batch=16, vocab=16K).
+            //
+            // L3TC_METAL_SKIP_READBACK=1 disables readback for
+            // profiling only — the resulting `self.freqs` is stale,
+            // so AC encode produces garbage. Bench use only.
+            if std::env::var("L3TC_METAL_SKIP_READBACK").is_err() {
+                read_u32(&self.freqs_buf, &mut self.freqs);
+            }
         }
     }
 
@@ -769,12 +807,48 @@ pub fn compress_segments_batched(
         let mut fwd_ns: u128 = 0;
         let mut ac_ns: u128 = 0;
 
+        // Phase 13s: pipeline GPU forward with CPU AC encode.
+        //
+        // Sequential baseline was:
+        //   for step in 1..max_len:
+        //     forward(step)   // blocking GPU, ~5 ms
+        //     ac_encode(step) // CPU, ~2-3 ms
+        //
+        // Pipelined version:
+        //   submit forward(1)
+        //   for step in 1..max_len:
+        //     wait+readback (finishes forward(step))
+        //     pre-stage prev_tokens for step+1
+        //     submit forward(step+1)      // runs on GPU
+        //     ac_encode(step)              // runs on CPU in parallel
+        //   drain last submission
+        //
+        // Saves ~min(fwd_time, ac_time) per step.
+
+        bs.forward_submit(&prev);
+
         for step in 1..max_len {
             let t_fwd = std::time::Instant::now();
-            bs.forward_batched(&prev);
-            bs.cum_freqs_batched();
+            bs.forward_wait_and_readback();
             if profile {
                 fwd_ns += t_fwd.elapsed().as_nanos();
+            }
+
+            // Prepare `prev` for the NEXT forward (step+1): each lane's
+            // `prev` is the token at this step's index (which each lane
+            // will encode below). Do this BEFORE AC encoding so we can
+            // issue the next GPU submission in parallel.
+            let has_next = step + 1 < max_len;
+            if has_next {
+                for lane in 0..n {
+                    let seg = &chunk[lane];
+                    if step < seg.len() {
+                        prev[lane] = seg[step];
+                    }
+                    // else: lane is past its segment; prev stays at whatever
+                    // last token was, but output is discarded anyway.
+                }
+                bs.forward_submit(&prev);
             }
 
             let t_ac = std::time::Instant::now();
@@ -792,12 +866,15 @@ pub fn compress_segments_batched(
                     cum.push(total);
                 }
                 encs[lane].encode_symbol(&cum, seg[step])?;
-                prev[lane] = seg[step];
+                // Note: prev[lane] was already set above for step+1's
+                // forward. No need to reset here.
             }
             if profile {
                 ac_ns += t_ac.elapsed().as_nanos();
             }
         }
+        // Drain any remaining submission.
+        bs.forward_wait_and_readback();
 
         if profile {
             let fwd_ms = fwd_ns as f64 / 1e6;
