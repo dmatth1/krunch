@@ -1527,10 +1527,24 @@ kernel void softmax_shifted_exp_sum_batched(
     sum_out[bb] = s;
 }
 
-// Pass 3a: per (batch, i), quantize exps to u32 freqs.
+// Pass 2b: per batch lane, derive scale[bb] = total / sum[bb].
+// One thread per lane. Cheap, but lets us chain stage 3 into the
+// same command buffer instead of stalling on the GPU/CPU boundary
+// for `batch` floats.
+kernel void scale_from_sum_batched(
+    device const float* sum_in    [[buffer(0)]],   // batch
+    device float*       scale_out [[buffer(1)]],   // batch
+    constant float&     total     [[buffer(2)]],
+    constant uint&      batch     [[buffer(3)]],
+    uint                bb        [[thread_position_in_grid]]
+) {
+    if (bb >= batch) return;
+    scale_out[bb] = total / sum_in[bb];
+}
+
+// Pass 3: per (batch, i), quantize exps to u32 freqs.
 //   freqs[bb, i] = max(1, round(exps[bb, i] * scale[bb]))
-// where scale[bb] = inv_sum[bb] * PYTHON_FREQ_TOTAL (precomputed
-// CPU-side from sum_out).
+// `scale` comes from `scale_from_sum_batched` in the same cmd_buf.
 kernel void quantize_exps_to_freqs_batched(
     device const float* exps   [[buffer(0)]],   // batch * vocab
     device const float* scale  [[buffer(1)]],   // batch
@@ -1560,23 +1574,25 @@ pub struct CumFreqsKernelMetal {
     queue: CommandQueue,
     pipeline_max: ComputePipelineState,
     pipeline_softmax: ComputePipelineState,
+    pipeline_scale: ComputePipelineState,
     pipeline_quantize: ComputePipelineState,
     vocab: usize,
     vocab_u32: u32,
 }
 
 impl CumFreqsKernelMetal {
-    /// Build all three pipelines for the cum_freqs path. Stateless;
+    /// Build all four pipelines for the cum_freqs path. Stateless;
     /// `vocab` fixes the per-lane element count.
     pub fn new(vocab: usize) -> Result<Self, MetalError> {
         let device = Device::system_default().ok_or(MetalError::NoDevice)?;
         let queue = device.new_command_queue();
-        let (pipeline_max, pipeline_softmax, pipeline_quantize) =
+        let (pipeline_max, pipeline_softmax, pipeline_scale, pipeline_quantize) =
             build_cum_freqs_pipelines(&device)?;
         Ok(Self {
             queue,
             pipeline_max,
             pipeline_softmax,
+            pipeline_scale,
             pipeline_quantize,
             vocab,
             vocab_u32: vocab as u32,
@@ -1586,7 +1602,16 @@ impl CumFreqsKernelMetal {
     /// End-to-end batched cum_freqs path: logits → freqs.
     /// `logits` is `batch * vocab`; `freqs_out` is `batch * vocab`
     /// `u32`. Internally allocates per-call buffers for max + sum +
-    /// exps + scale; these never cross back to CPU until the end.
+    /// exps + scale.
+    ///
+    /// Phase 13g: all four GPU stages (max, softmax_exp_sum, scale,
+    /// quantize) are encoded into a single command buffer and a
+    /// single `commit_and_wait` runs the whole chain. Previously each
+    /// stage took its own commit + wait (3 round-trips); now there's
+    /// just one. The scale step used to live on the CPU between
+    /// stages 2 and 3, but pulling it into a tiny kernel removes the
+    /// mandatory sync between them — we trade one trivial dispatch
+    /// for the GPU/CPU stall it used to cost.
     pub fn forward_batched(
         &self,
         logits: &[f32],
@@ -1614,10 +1639,15 @@ impl CumFreqsKernelMetal {
         let scale_buf = device.new_buffer(small_bytes, MTLResourceOptions::StorageModeShared);
         let freqs_buf = device.new_buffer(u32_bytes, MTLResourceOptions::StorageModeShared);
         let batch_u32 = batch as u32;
+        let scale_total = python_freq_total as f32;
+
+        // Single command buffer chains all four stages. Each encoder
+        // ends before the next starts so Metal sequences the work,
+        // but there's no GPU↔CPU sync between them.
+        let cmd_buf = self.queue.new_command_buffer();
 
         // Stage 1: max per lane.
         {
-            let cmd_buf = self.queue.new_command_buffer();
             let encoder = cmd_buf.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(&self.pipeline_max);
             encoder.set_buffer(0, Some(&logits_buf), 0);
@@ -1642,12 +1672,10 @@ impl CumFreqsKernelMetal {
                 MTLSize { width: tg_width, height: 1, depth: 1 },
             );
             encoder.end_encoding();
-            commit_and_wait(cmd_buf);
         }
 
         // Stage 2: shifted exp + sum per lane.
         {
-            let cmd_buf = self.queue.new_command_buffer();
             let encoder = cmd_buf.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(&self.pipeline_softmax);
             encoder.set_buffer(0, Some(&logits_buf), 0);
@@ -1674,24 +1702,39 @@ impl CumFreqsKernelMetal {
                 MTLSize { width: tg_width, height: 1, depth: 1 },
             );
             encoder.end_encoding();
-            commit_and_wait(cmd_buf);
         }
 
-        // Compute scales CPU-side: scale[bb] = (1 / sum[bb]) * PYTHON_FREQ_TOTAL
-        // (faster than a separate kernel for `batch` scalars).
-        let scale_total = python_freq_total as f32;
-        unsafe {
-            let sum_ptr = sum_buf.contents() as *const f32;
-            let scale_ptr = scale_buf.contents() as *mut f32;
-            for bb in 0..batch {
-                let s = *sum_ptr.add(bb);
-                *scale_ptr.add(bb) = scale_total / s;
-            }
+        // Stage 2b: scale = total / sum, on-GPU so we don't have to
+        // wait for sum_buf to land on the CPU before kicking stage 3.
+        {
+            let encoder = cmd_buf.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&self.pipeline_scale);
+            encoder.set_buffer(0, Some(&sum_buf), 0);
+            encoder.set_buffer(1, Some(&scale_buf), 0);
+            encoder.set_bytes(
+                2,
+                std::mem::size_of::<f32>() as u64,
+                &scale_total as *const f32 as *const std::ffi::c_void,
+            );
+            encoder.set_bytes(
+                3,
+                std::mem::size_of::<u32>() as u64,
+                &batch_u32 as *const u32 as *const std::ffi::c_void,
+            );
+            let tg_width = self
+                .pipeline_scale
+                .thread_execution_width()
+                .max(1)
+                .min(batch as u64);
+            encoder.dispatch_threads(
+                MTLSize { width: batch as u64, height: 1, depth: 1 },
+                MTLSize { width: tg_width, height: 1, depth: 1 },
+            );
+            encoder.end_encoding();
         }
 
         // Stage 3: quantize exps to u32 freqs per (batch, vocab).
         {
-            let cmd_buf = self.queue.new_command_buffer();
             let encoder = cmd_buf.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(&self.pipeline_quantize);
             encoder.set_buffer(0, Some(&exps_buf), 0);
@@ -1721,8 +1764,10 @@ impl CumFreqsKernelMetal {
                 MTLSize { width: tg_width, height: 1, depth: 1 },
             );
             encoder.end_encoding();
-            commit_and_wait(cmd_buf);
         }
+
+        // Single sync for the whole chain.
+        commit_and_wait(cmd_buf);
 
         // Read back freqs.
         unsafe {
@@ -1735,7 +1780,12 @@ impl CumFreqsKernelMetal {
 fn build_cum_freqs_pipelines(
     device: &Device,
 ) -> Result<
-    (ComputePipelineState, ComputePipelineState, ComputePipelineState),
+    (
+        ComputePipelineState,
+        ComputePipelineState,
+        ComputePipelineState,
+        ComputePipelineState,
+    ),
     MetalError,
 > {
     let library = device
@@ -1752,6 +1802,7 @@ fn build_cum_freqs_pipelines(
     Ok((
         mk("max_f32_batched")?,
         mk("softmax_shifted_exp_sum_batched")?,
+        mk("scale_from_sum_batched")?,
         mk("quantize_exps_to_freqs_batched")?,
     ))
 }

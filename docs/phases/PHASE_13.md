@@ -4,9 +4,16 @@
 forward pass on Apple Metal. Default builds stay CPU-only with no
 GPU dependency; GPU is opt-in via cargo features.
 
-**Status as of 2026-04-17:** **all six sub-phases shipped.** End-to-end
+**Status as of 2026-04-17:** **sub-phases 13a-13f shipped.** End-to-end
 CLI compress/decompress via Metal works on real corpora with
 bit-identical round-trip. Major correctness finding (bit) below.
+
+**Phase 13g (chained dispatch) in progress:** the cum_freqs path
+now chains all 4 GPU stages into a single `commit_and_wait`. The
+broader forward-pass refactor (pull state into persistent Metal
+buffers, chain ~30 per-token kernels into one command buffer)
+is the structural change still required to hit the 1-3 MB/s
+projected throughput.
 
 **Major caveat from Phase 13e:** files compressed via Metal must be
 decompressed via Metal. Cross-backend interop (the original
@@ -300,6 +307,66 @@ CPU-only builds error out clearly when given a GPU-encoded file:
 Verified end-to-end: `cargo test --features=metal --lib` passes
 all 56 tests. CLI smoke test: 4 KB enwik6 → Metal compress →
 auto-detect Metal decompress → byte-identical.
+
+### Phase 13g — Chained dispatch (eliminate per-kernel sync) 🚧 in progress
+
+The Phase 13e bring-up shipped each Metal kernel as its own
+`commit_and_wait` block. That made each kernel self-contained and
+trivial to test, at the cost of one CPU↔GPU sync per kernel call.
+For a 2-layer 96H forward pass that's roughly **30 GPU sync
+barriers per token**, which dominates the per-token wall time
+(~30 ms on M-series vs CPU's 0.18 ms — the ~5 MB/s aggregate
+projected from the head microbench is gated on collapsing those
+syncs).
+
+The fix is to encode multiple stages into one `MTLCommandBuffer`
+and call `commit_and_wait` once at the end of a logical pipeline.
+
+**Step 1 — `CumFreqsKernelMetal::forward_batched` chained ✅ shipped**
+
+The cum_freqs path was the cleanest place to validate the pattern:
+3 kernels (max → softmax+sum → quantize) plus a tiny CPU-side
+`scale = total / sum` step in between. Refactor:
+
+- Promoted the scale step to its own MSL kernel
+  (`scale_from_sum_batched` — one thread per lane). That removes
+  the mandatory CPU stall between stages 2 and 3.
+- All four encoders (max, softmax+sum, scale, quantize) now share
+  one command buffer, with one `commit_and_wait` at the end.
+- 3 syncs → 1 sync per cum_freqs call.
+
+Correctness: existing `cum_freqs_batched_metal_matches_cpu` and
+`batched_session_cum_freqs_matches_cpu` tests pass unchanged. End-
+to-end `codec_metal_round_trip_50kb` round-trips bit-identically.
+Wall-time on 8 KB Metal compress: 0.19 KB/s (vs ~0.15 KB/s prior;
+small at this scope because cum_freqs is only ~3 of the 30 per-
+token syncs).
+
+**Step 2 — extend the pattern to the forward pass 🚧 next**
+
+The bigger win requires that the rest of the forward pass kernels
+chain too. Per-layer the natural groupings are:
+
+- `time_mix`: 3 attention matvecs (att_k/att_v/att_r) + sigmoid
+  + step1 + step2 + output projection — currently 8 separate
+  commits, no CPU work between them except the elementwise
+  `rwkv = r * a / b` after step2.
+- `channel_mix`: ffn_r + sigmoid + ffn_k + (relu, square) + ffn_v
+  — currently 5 commits.
+
+Blocker: each kernel currently takes `&[f32]` slices and allocates
+fresh GPU buffers per call. To chain into one cmd_buf we need:
+
+1. `BatchedSession` to hold persistent Metal `Buffer` fields for
+   per-token state (currently `Vec<f32>`).
+2. Each kernel to expose a `dispatch_into(cmd_buf, &input_buf,
+   &output_buf, ...)` API that encodes without committing.
+3. A handful of CPU-side glue ops (embedding lookup, time_mix
+   blends, relu/square, residual add) either move to GPU kernels
+   too or stay CPU-side at the cost of mid-cmd-buf syncs.
+
+This is structurally the path to the projected 1-3 MB/s on
+M-series. Not yet attempted.
 
 ---
 

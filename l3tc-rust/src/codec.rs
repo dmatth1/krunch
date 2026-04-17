@@ -174,6 +174,11 @@ const FLAG_RAW_STORE: u8 = 0x01;
 /// a clear error message.
 ///
 /// CPU-encoded files (this bit unset) decode on either backend.
+///
+/// `bin/l3tc.rs` independently reads the same bit (`0x02`) when
+/// auto-detecting the backend so it doesn't have to depend on a
+/// metal-only symbol — keep the two values in sync.
+#[cfg(feature = "metal")]
 pub(crate) const FLAG_GPU_ENCODED: u8 = 0x02;
 
 /// Per-segment flag bit: "raw fallback bytes follow the unks".
