@@ -88,6 +88,12 @@ enum Command {
         /// would desync the AC).
         #[arg(long, default_value = "cpu")]
         backend: String,
+        /// Metal-only: number of segments processed in GPU lockstep
+        /// per BatchedSession chunk. Higher = more amortization of
+        /// per-token dispatch overhead, until GPU occupancy saturates.
+        /// Ignored for `--backend=cpu`.
+        #[arg(long, default_value_t = 8)]
+        metal_batch: usize,
     },
     /// Decompress a file produced by `compress`.
     Decompress {
@@ -315,6 +321,7 @@ fn main() -> ExitCode {
             time,
             verify,
             backend,
+            metal_batch,
         } => run_compress(
             &input,
             output.as_deref(),
@@ -324,6 +331,7 @@ fn main() -> ExitCode {
             time,
             verify,
             &backend,
+            metal_batch,
         ),
         Command::Decompress {
             input,
@@ -497,6 +505,7 @@ fn run_compress(
     print_time: bool,
     verify: bool,
     backend: &str,
+    metal_batch: usize,
 ) -> Result<()> {
     let default_out = input.with_extension({
         let ext = input.extension().and_then(|s| s.to_str()).unwrap_or("");
@@ -539,13 +548,14 @@ fn run_compress(
         "metal" => {
             let text = std::fs::read_to_string(input)
                 .with_context(|| format!("reading input {input:?}"))?;
-            // Phase 13h: 8-lane lockstep amortizes per-token GPU
-            // dispatch overhead across all active segments. Single-
-            // segment inputs (rare on real corpora) fall back to a
-            // 1-lane chunk and behave like the pre-13h serial path.
-            let bytes =
-                l3tc::codec::compress_with_metal(&text, &tokenizer, &model, segment_bytes, 8)
-                    .with_context(|| "metal compression failed")?;
+            let bytes = l3tc::codec::compress_with_metal(
+                &text,
+                &tokenizer,
+                &model,
+                segment_bytes,
+                metal_batch.max(1),
+            )
+            .with_context(|| "metal compression failed")?;
             std::fs::write(output, &bytes)
                 .with_context(|| format!("writing output {output:?}"))?;
         }
