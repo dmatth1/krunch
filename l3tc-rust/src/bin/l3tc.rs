@@ -99,6 +99,13 @@ enum Command {
         /// (e.g. 32 for 50 KB / ~13 segments).
         #[arg(long, default_value_t = 256)]
         metal_batch: usize,
+        /// Metal-only: number of parallel BatchedSession workers.
+        /// Each worker has its own Metal command queue; the segment
+        /// list is split across workers. On Apple M-series with
+        /// multiple GPU cores this lets the scheduler run independent
+        /// compute streams in parallel. Default 1 (serial).
+        #[arg(long, default_value_t = 1)]
+        metal_workers: usize,
     },
     /// Decompress a file produced by `compress`.
     Decompress {
@@ -347,6 +354,7 @@ fn main() -> ExitCode {
             verify,
             backend,
             metal_batch,
+            metal_workers,
         } => run_compress(
             &input,
             output.as_deref(),
@@ -357,6 +365,7 @@ fn main() -> ExitCode {
             verify,
             &backend,
             metal_batch,
+            metal_workers,
         ),
         Command::Decompress {
             input,
@@ -585,6 +594,7 @@ fn run_compress(
     verify: bool,
     backend: &str,
     metal_batch: usize,
+    metal_workers: usize,
 ) -> Result<()> {
     let default_out = input.with_extension({
         let ext = input.extension().and_then(|s| s.to_str()).unwrap_or("");
@@ -627,12 +637,13 @@ fn run_compress(
         "metal" => {
             let text = std::fs::read_to_string(input)
                 .with_context(|| format!("reading input {input:?}"))?;
-            let bytes = l3tc::codec::compress_with_metal(
+            let bytes = l3tc::codec::compress_with_metal_workers(
                 &text,
                 &tokenizer,
                 &model,
                 segment_bytes,
                 metal_batch.max(1),
+                metal_workers.max(1),
             )
             .with_context(|| "metal compression failed")?;
             std::fs::write(output, &bytes)

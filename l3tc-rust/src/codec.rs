@@ -293,13 +293,27 @@ pub fn compress_with_metal(
     segment_bytes: usize,
     batch_size: usize,
 ) -> Result<Vec<u8>> {
-    use crate::backend::batched::compress_segments_batched;
+    compress_with_metal_workers(text, tokenizer, model, segment_bytes, batch_size, 1)
+}
+
+/// Phase 13o: parallel-worker variant of [`compress_with_metal`].
+/// Spawns `n_workers` independent `BatchedSession`s, each with its
+/// own Metal command queue, and splits the segment list across
+/// them. Matches `compress_with_metal` exactly when `n_workers <= 1`.
+#[cfg(feature = "metal")]
+pub fn compress_with_metal_workers(
+    text: &str,
+    tokenizer: &Tokenizer,
+    model: &Model,
+    segment_bytes: usize,
+    batch_size: usize,
+    n_workers: usize,
+) -> Result<Vec<u8>> {
+    use crate::backend::batched::compress_segments_batched_parallel;
 
     let segments = tokenizer.encode_file(text, segment_bytes)?;
     let total_bytes = text.len() as u64;
 
-    // Build per-segment AC bodies via the GPU path. Raw-fallback
-    // segments bypass the model entirely (same behaviour as CPU).
     let raw_fallback_indices: Vec<bool> =
         segments.iter().map(|s| s.needs_raw_fallback).collect();
     let token_inputs: Vec<Vec<u32>> = segments
@@ -307,7 +321,12 @@ pub fn compress_with_metal(
         .map(|s| if s.needs_raw_fallback { Vec::new() } else { s.tokens.clone() })
         .collect();
 
-    let mut bodies = compress_segments_batched(model, &token_inputs, batch_size.max(1))?;
+    let mut bodies = compress_segments_batched_parallel(
+        model,
+        &token_inputs,
+        batch_size.max(1),
+        n_workers.max(1),
+    )?;
     // Replace raw-fallback bodies with empty (codec uses the raw
     // bytes instead of the AC body for those segments).
     for (i, is_raw) in raw_fallback_indices.iter().enumerate() {

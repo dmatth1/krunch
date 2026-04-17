@@ -809,6 +809,80 @@ pub fn compress_segments_batched(
     Ok(all_outputs)
 }
 
+/// Phase 13o: parallel variant of [`compress_segments_batched`] that
+/// spawns `n_workers` threads, each owning its own `BatchedSession`
+/// (and therefore its own Metal command queue). Each worker handles
+/// a contiguous strip of the input segments; results are concatenated
+/// back in input order. For `n_workers <= 1` this is a straight
+/// delegation to the single-threaded version.
+///
+/// The effective parallel fan-out is `n_workers * batch_size` — e.g.
+/// 2 workers × batch=128 = 256 concurrent lanes, distributed across
+/// 2 independent GPU command streams. On Apple M-series this gives
+/// the GPU scheduler more concurrent work to dispatch on separate
+/// compute cores.
+pub fn compress_segments_batched_parallel(
+    model: &Model,
+    segments: &[Vec<u32>],
+    batch_size: usize,
+    n_workers: usize,
+) -> Result<Vec<Vec<u8>>, crate::Error> {
+    if n_workers <= 1 || segments.len() <= 1 {
+        return compress_segments_batched(model, segments, batch_size);
+    }
+    let n_segs = segments.len();
+    let per_worker = (n_segs + n_workers - 1) / n_workers;
+
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = segments
+            .chunks(per_worker)
+            .map(|chunk| {
+                scope.spawn(move || {
+                    // Each worker re-owns a fresh slice view; the
+                    // Model reference is shared read-only across
+                    // threads (immutable weights).
+                    compress_segments_batched(model, chunk, batch_size)
+                })
+            })
+            .collect();
+        let mut out: Vec<Vec<u8>> = Vec::with_capacity(n_segs);
+        for h in handles {
+            let partial = h.join().expect("compress worker thread panicked")?;
+            out.extend(partial);
+        }
+        Ok(out)
+    })
+}
+
+/// Phase 13o counterpart to [`compress_segments_batched_parallel`].
+pub fn decompress_segments_batched_parallel(
+    model: &Model,
+    bodies: &[(Vec<u8>, u32, u32)],
+    batch_size: usize,
+    n_workers: usize,
+) -> Result<Vec<Vec<u32>>, crate::Error> {
+    if n_workers <= 1 || bodies.len() <= 1 {
+        return decompress_segments_batched(model, bodies, batch_size);
+    }
+    let n_bodies = bodies.len();
+    let per_worker = (n_bodies + n_workers - 1) / n_workers;
+
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = bodies
+            .chunks(per_worker)
+            .map(|chunk| {
+                scope.spawn(move || decompress_segments_batched(model, chunk, batch_size))
+            })
+            .collect();
+        let mut out: Vec<Vec<u32>> = Vec::with_capacity(n_bodies);
+        for h in handles {
+            let partial = h.join().expect("decompress worker thread panicked")?;
+            out.extend(partial);
+        }
+        Ok(out)
+    })
+}
+
 /// Inverse of [`compress_segments_batched`]. Same lockstep N-lane
 /// batching: chunk the bodies into groups of `batch_size`, run a
 /// single GPU forward + cum_freqs per step across every active lane,
