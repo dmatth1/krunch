@@ -171,13 +171,21 @@ const SEG_FLAG_RAW_FALLBACK: u8 = 0x01;
 
 /// Default segment length in bytes.
 ///
-/// L3TC's Python reference uses 2048. Empirically 4096 gives ~2%
-/// better compression ratio at the cost of ~15% throughput on
-/// small files (where fewer segments means less segment-level
-/// parallelism) and a small throughput improvement on large files
-/// (better model context flow per segment). 4096 is a good
-/// compromise default; users who want maximum ratio on large
-/// files can set `--segment-bytes 8192` or higher from the CLI.
+/// L3TC's Python reference uses 2048. Empirically (Phase 12g sweep
+/// on enwik6, clean-system 5-run mean):
+///
+/// | bytes | ratio  | compress KB/s | decompress KB/s |
+/// |------:|-------:|--------------:|----------------:|
+/// |  2048 | 0.1730 |           174 |             181 |
+/// |  4096 | 0.1699 |           168 |             179 |
+/// |  8192 | 0.1683 |           158 |             176 |
+/// | 16384 | 0.1675 |           144 |             172 |
+///
+/// 4096 stays the default. Speed is a non-negotiable goal in
+/// CLAUDE.md, and bigger segments lose ~6% compress per doubling
+/// (rayon parallelism becomes load-imbalanced on 1MB inputs at
+/// ≤125 segments × 10 cores). Users who want maximum ratio at
+/// the cost of ~6% compress can pass `--segment-bytes 8192`.
 pub const DEFAULT_SEGMENT_BYTES: usize = 4096;
 
 /// Compress text to bytes.
