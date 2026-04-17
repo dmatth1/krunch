@@ -231,6 +231,53 @@ kernel void head_matvec_int8_batched(
     }
     out[b * rows + i] = acc;
 }
+
+// Phase 13r: SIMD-parallel variant. 32 threads cooperate on one
+// output row — each does cols/32 = 3 FMAs (for cols=96), then
+// simd_shuffle_xor reduces across the SIMD group. Threadgroup is
+// (ROWS_PER_TG=8) rows × 32 threads = 256 threads total; dispatch
+// threadgroups = (rows/ROWS_PER_TG, batch). This multiplies the
+// effective thread count for the head matvec by 32× (cols), so the
+// GPU actually has enough work to use all compute units instead of
+// serializing on one thread per output row.
+kernel void head_matvec_int8_batched_simd(
+    device const char*  qmat    [[buffer(0)]],
+    device const float* scales  [[buffer(1)]],
+    device const float* x       [[buffer(2)]],
+    device float*       out     [[buffer(3)]],
+    constant uint&      rows    [[buffer(4)]],
+    constant uint&      cols    [[buffer(5)]],
+    constant uint&      batch   [[buffer(6)]],
+    uint3               tid3    [[thread_position_in_threadgroup]],
+    uint3               tg_pos3 [[threadgroup_position_in_grid]]
+) {
+    const uint ROWS_PER_TG = 8u;
+    const uint SIMD = 32u;
+    uint tid = tid3.x;
+    uint row_off = tid / SIMD;           // 0..ROWS_PER_TG-1
+    uint j_off   = tid % SIMD;           // 0..31, lane inside the SIMD
+    uint i = tg_pos3.x * ROWS_PER_TG + row_off;
+    uint b = tg_pos3.y;
+    if (i >= rows || b >= batch) return;
+
+    device const float* xb = x + (b * cols);
+    float acc = 0.0f;
+    // Each lane handles a strided subset of the cols axis.
+    for (uint j = j_off; j < cols; j += SIMD) {
+        float xs = xb[j] * scales[j];
+        acc = fma(xs, (float)qmat[j * rows + i], acc);
+    }
+    // Reduce across the 32-thread SIMD group via shuffle_xor (butterfly).
+    // Note: `simd_shuffle_xor` takes a `ushort` mask, not `uint`.
+    acc += simd_shuffle_xor(acc, ushort(16));
+    acc += simd_shuffle_xor(acc, ushort(8));
+    acc += simd_shuffle_xor(acc, ushort(4));
+    acc += simd_shuffle_xor(acc, ushort(2));
+    acc += simd_shuffle_xor(acc, ushort(1));
+    if (j_off == 0u) {
+        out[b * rows + i] = acc;
+    }
+}
 "#;
 
 /// A reusable Metal pipeline for the head INT8 matvec, holding the
@@ -245,6 +292,7 @@ pub struct HeadKernelMetal {
     queue: CommandQueue,
     pipeline: ComputePipelineState,
     pipeline_batched: ComputePipelineState,
+    pipeline_batched_simd: ComputePipelineState,
     qmat_buf: Buffer,
     scales_buf: Buffer,
     x_buf: Buffer,
@@ -264,7 +312,8 @@ impl HeadKernelMetal {
         assert_eq!(scales.len(), cols, "scales shape");
         let device = Device::system_default().ok_or(MetalError::NoDevice)?;
         let queue = device.new_command_queue();
-        let (pipeline, pipeline_batched) = build_head_pipelines(&device)?;
+        let (pipeline, pipeline_batched, pipeline_batched_simd) =
+            build_head_pipelines(&device)?;
         let qmat_buf = device.new_buffer_with_data(
             qmat.as_ptr() as *const std::ffi::c_void,
             std::mem::size_of_val(qmat) as u64,
@@ -289,6 +338,7 @@ impl HeadKernelMetal {
             queue,
             pipeline,
             pipeline_batched,
+            pipeline_batched_simd,
             qmat_buf,
             scales_buf,
             x_buf,
@@ -336,6 +386,17 @@ impl HeadKernelMetal {
 
     /// Phase 13j: encode the batched head matvec into a caller-
     /// provided command buffer (no commit/wait).
+    ///
+    /// Phase 13r attempt: the SIMD-parallel variant (32 threads per
+    /// row cooperating with simd_shuffle_xor) compiles cleanly but
+    /// is ~2× SLOWER than the 1-thread-per-row kernel on M-series at
+    /// batch=256. Suspected cause: 512K threadgroups of 256 threads
+    /// each saturates GPU's threadgroup-scheduling path worse than
+    /// 16K×256 trivial threadgroups of 1 thread. Kept the pipeline
+    /// around (`pipeline_batched_simd` is still built) for future
+    /// experimentation but `encode_into` uses the faster 1-thread
+    /// kernel. The SIMD kernel MSL remains in the source so a future
+    /// tile-based rewrite can start from it.
     pub fn encode_into(
         &self,
         cmd_buf: &CommandBufferRef,
@@ -440,7 +501,14 @@ impl HeadKernelMetal {
 
 fn build_head_pipelines(
     device: &Device,
-) -> Result<(ComputePipelineState, ComputePipelineState), MetalError> {
+) -> Result<
+    (
+        ComputePipelineState,
+        ComputePipelineState,
+        ComputePipelineState,
+    ),
+    MetalError,
+> {
     let library = device
         .new_library_with_source(HEAD_MATVEC_KERNEL_MSL, &metal::CompileOptions::new())
         .map_err(MetalError::LibraryCompile)?;
@@ -452,7 +520,11 @@ fn build_head_pipelines(
             .new_compute_pipeline_state_with_function(&f)
             .map_err(MetalError::PipelineCreate)
     };
-    Ok((mk("head_matvec_int8")?, mk("head_matvec_int8_batched")?))
+    Ok((
+        mk("head_matvec_int8")?,
+        mk("head_matvec_int8_batched")?,
+        mk("head_matvec_int8_batched_simd")?,
+    ))
 }
 
 // ===================================================================
@@ -1635,27 +1707,41 @@ static inline float poly_exp(float x) {
     return p * two_k;
 }
 
-// Pass 1: per batch lane, find the max over `vocab` logits.
-// One thread per batch lane; loops over the lane's logits.
+// Phase 13q: parallel variants. Each threadgroup is TPL threads
+// handling ONE batch lane's 16K logits, with a threadgroup
+// shared-memory reduction for max / sum. This replaces the
+// original 1-thread-per-lane versions, which were massively
+// underutilizing the GPU (only `batch` threads in flight for
+// these two stages — on batch=256 that's 256 threads, a single
+// GPU wave, while each did 16K sequential iterations).
+#define CUM_TPL 128u
+
 kernel void max_f32_batched(
     device const float* logits  [[buffer(0)]],   // batch * vocab
     device float*       max_out [[buffer(1)]],   // batch
     constant uint&      vocab   [[buffer(2)]],
     constant uint&      batch   [[buffer(3)]],
-    uint                bb      [[thread_position_in_grid]]
+    uint                tid     [[thread_position_in_threadgroup]],
+    uint                bb      [[threadgroup_position_in_grid]]
 ) {
     if (bb >= batch) return;
     device const float* lp = logits + (bb * vocab);
-    float m = lp[0];
-    for (uint i = 1; i < vocab; ++i) {
+    // Stride-TPL scan for this thread's chunk of logits.
+    float m = -INFINITY;
+    for (uint i = tid; i < vocab; i += CUM_TPL) {
         m = fmax(m, lp[i]);
     }
-    max_out[bb] = m;
+    // Threadgroup reduction (pair-wise, log2 steps).
+    threadgroup float sh[CUM_TPL];
+    sh[tid] = m;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint step = CUM_TPL / 2u; step > 0u; step >>= 1) {
+        if (tid < step) sh[tid] = fmax(sh[tid], sh[tid + step]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0u) max_out[bb] = sh[0];
 }
 
-// Pass 2: per batch lane, compute exps and their sum.
-// exps[bb, i] = exp(logits[bb, i] - max[bb]); sum[bb] = Σ exps[bb, i].
-// One thread per batch lane.
 kernel void softmax_shifted_exp_sum_batched(
     device const float* logits  [[buffer(0)]],   // batch * vocab
     device const float* max_in  [[buffer(1)]],   // batch
@@ -1663,19 +1749,27 @@ kernel void softmax_shifted_exp_sum_batched(
     device float*       sum_out [[buffer(3)]],   // batch
     constant uint&      vocab   [[buffer(4)]],
     constant uint&      batch   [[buffer(5)]],
-    uint                bb      [[thread_position_in_grid]]
+    uint                tid     [[thread_position_in_threadgroup]],
+    uint                bb      [[threadgroup_position_in_grid]]
 ) {
     if (bb >= batch) return;
     device const float* lp = logits + (bb * vocab);
     device float*       ep = exps   + (bb * vocab);
     float m = max_in[bb];
     float s = 0.0f;
-    for (uint i = 0; i < vocab; ++i) {
+    for (uint i = tid; i < vocab; i += CUM_TPL) {
         float e = poly_exp(lp[i] - m);
         ep[i] = e;
         s += e;
     }
-    sum_out[bb] = s;
+    threadgroup float sh[CUM_TPL];
+    sh[tid] = s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint step = CUM_TPL / 2u; step > 0u; step >>= 1) {
+        if (tid < step) sh[tid] += sh[tid + step];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0u) sum_out[bb] = sh[0];
 }
 
 // Pass 2b: per batch lane, derive scale[bb] = total / sum[bb].
@@ -1832,7 +1926,9 @@ impl CumFreqsKernelMetal {
         let batch_u32 = batch as u32;
         let scale_total = python_freq_total as f32;
 
-        // Stage 1: max per lane.
+        // Stage 1: max per lane (Phase 13q: one threadgroup per lane,
+        // CUM_TPL=128 threads cooperating with threadgroup reduction).
+        const CUM_TPL: u64 = 128;
         {
             let encoder = cmd_buf.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(&self.pipeline_max);
@@ -1848,19 +1944,16 @@ impl CumFreqsKernelMetal {
                 std::mem::size_of::<u32>() as u64,
                 &batch_u32 as *const u32 as *const std::ffi::c_void,
             );
-            let tg_width = self
-                .pipeline_max
-                .thread_execution_width()
-                .max(1)
-                .min(batch as u64);
-            encoder.dispatch_threads(
+            encoder.dispatch_thread_groups(
                 MTLSize { width: batch as u64, height: 1, depth: 1 },
-                MTLSize { width: tg_width, height: 1, depth: 1 },
+                MTLSize { width: CUM_TPL, height: 1, depth: 1 },
             );
             encoder.end_encoding();
         }
 
-        // Stage 2: shifted exp + sum per lane.
+        // Stage 2: shifted exp + sum per lane (Phase 13q: TPL threads
+        // per lane, each handles vocab/TPL elements, threadgroup
+        // reduction for the sum).
         {
             let encoder = cmd_buf.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(&self.pipeline_softmax);
@@ -1878,14 +1971,9 @@ impl CumFreqsKernelMetal {
                 std::mem::size_of::<u32>() as u64,
                 &batch_u32 as *const u32 as *const std::ffi::c_void,
             );
-            let tg_width = self
-                .pipeline_softmax
-                .thread_execution_width()
-                .max(1)
-                .min(batch as u64);
-            encoder.dispatch_threads(
+            encoder.dispatch_thread_groups(
                 MTLSize { width: batch as u64, height: 1, depth: 1 },
-                MTLSize { width: tg_width, height: 1, depth: 1 },
+                MTLSize { width: CUM_TPL, height: 1, depth: 1 },
             );
             encoder.end_encoding();
         }

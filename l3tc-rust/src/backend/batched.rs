@@ -449,14 +449,19 @@ impl<'a> BatchedSession<'a> {
         } // end unfused path
 
         // 4. Final layer norm.
+        let skip_head = std::env::var("L3TC_SKIP_HEAD").is_ok();
+        let skip_cum = std::env::var("L3TC_SKIP_CUMFREQS").is_ok();
         self.ln_out
             .encode_into(cmd_buf, &self.x_buf, &self.normed_buf, batch_u);
 
         // 5. Head matvec: produces `batch * vocab` logits.
-        self.head
-            .encode_into(cmd_buf, &self.normed_buf, &self.logits_buf, batch_u);
+        if !skip_head {
+            self.head
+                .encode_into(cmd_buf, &self.normed_buf, &self.logits_buf, batch_u);
+        }
 
         // 6. cum_freqs: logits → freqs (u32).
+        if !skip_cum {
         self.cum_freqs.encode_into(
             cmd_buf,
             &self.logits_buf,
@@ -468,6 +473,7 @@ impl<'a> BatchedSession<'a> {
             batch_u,
             PYTHON_FREQ_TOTAL,
         );
+        } // end skip_cum guard
 
         // 7. Single sync for the whole token.
         cmd_buf.commit();
@@ -478,7 +484,13 @@ impl<'a> BatchedSession<'a> {
         //    deferred until a caller actually asks for them via
         //    `sync_logits_host()`, so the hot path skips a second
         //    `batch * vocab * 4` byte CPU copy per token.
-        read_u32(&self.freqs_buf, &mut self.freqs);
+        //
+        //    L3TC_METAL_SKIP_READBACK=1 disables this readback for
+        //    profiling only — the resulting `self.freqs` is stale,
+        //    so AC encode will produce garbage. Bench use only.
+        if std::env::var("L3TC_METAL_SKIP_READBACK").is_err() {
+            read_u32(&self.freqs_buf, &mut self.freqs);
+        }
     }
 
     /// Copy the most recent GPU-side logits into the host-side

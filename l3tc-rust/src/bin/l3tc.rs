@@ -307,6 +307,22 @@ enum Command {
         #[arg(long, default_value = "checkpoints/l3tc_200k.bin")]
         model: PathBuf,
     },
+
+    /// Phase 13p: isolate per-stage cost inside a single forward
+    /// pass. Times head matvec alone, cum_freqs alone, etc. so we
+    /// know which stage to attack next.
+    #[cfg(feature = "metal")]
+    MetalBenchStages {
+        /// Iterations per stage (warm-up is 10% of this).
+        #[arg(long, default_value_t = 200)]
+        iters: usize,
+        /// Batch size.
+        #[arg(long, default_value_t = 256)]
+        batch: usize,
+        /// Path to the converted L3TC model binary.
+        #[arg(long, default_value = "checkpoints/l3tc_200k.bin")]
+        model: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
@@ -343,6 +359,10 @@ fn main() -> ExitCode {
         #[cfg(feature = "metal")]
         Command::MetalBenchForward { iters, batch, model } => {
             run_metal_bench_forward(iters, batch, &model)
+        }
+        #[cfg(feature = "metal")]
+        Command::MetalBenchStages { iters, batch, model } => {
+            run_metal_bench_stages(iters, batch, &model)
         }
         Command::Compress {
             input,
@@ -434,6 +454,76 @@ fn main() -> ExitCode {
 }
 
 #[cfg(feature = "metal")]
+#[cfg(feature = "metal")]
+fn run_metal_bench_stages(
+    iters: usize,
+    batch: usize,
+    model_path: &Path,
+) -> anyhow::Result<()> {
+    use l3tc::backend::mtl::{CumFreqsKernelMetal, HeadKernelMetal, MetalError};
+    use l3tc::checkpoint::Checkpoint;
+    use l3tc::rwkv::Model;
+
+    let mut ckpt = Checkpoint::load(model_path)
+        .map_err(|e| anyhow::anyhow!("loading checkpoint {model_path:?}: {e}"))?;
+    let model = Model::from_checkpoint(&mut ckpt)
+        .map_err(|e| anyhow::anyhow!("building model: {e}"))?;
+
+    let h = model.hidden_size;
+    let vocab = model.vocab_size;
+
+    // Head matvec: (h → vocab) per lane, batch lanes.
+    let head = match HeadKernelMetal::new(&model.head_q, &model.head_scales, vocab, h) {
+        Ok(k) => k,
+        Err(MetalError::NoDevice) => return Err(anyhow::anyhow!("no Metal device")),
+        Err(e) => return Err(anyhow::anyhow!("head init: {e}")),
+    };
+
+    // Cum_freqs: (vocab logits → u32 freqs) per lane.
+    let cum = match CumFreqsKernelMetal::new(vocab) {
+        Ok(k) => k,
+        Err(e) => return Err(anyhow::anyhow!("cum init: {e}")),
+    };
+
+    let warmup = (iters / 10).max(5);
+    let x_in = vec![0.0f32; batch * h];
+    let mut logits_out = vec![0.0f32; batch * vocab];
+    let logits_in = vec![0.0f32; batch * vocab];
+    let mut freqs_out = vec![0u32; batch * vocab];
+
+    for _ in 0..warmup {
+        head.forward_batched(&x_in, &mut logits_out, batch);
+    }
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        head.forward_batched(&x_in, &mut logits_out, batch);
+    }
+    let head_elapsed = t0.elapsed();
+    let head_per = head_elapsed / iters as u32;
+
+    for _ in 0..warmup {
+        cum.forward_batched(&logits_in, &mut freqs_out, batch, 10_000_000);
+    }
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        cum.forward_batched(&logits_in, &mut freqs_out, batch, 10_000_000);
+    }
+    let cum_elapsed = t0.elapsed();
+    let cum_per = cum_elapsed / iters as u32;
+
+    println!("Metal per-stage bench");
+    println!("  h={h}, vocab={vocab}, batch={batch}, iters={iters}");
+    println!(
+        "  head.forward_batched (in-isolation, incl. upload/commit/wait/readback):"
+    );
+    println!("    per-call: {head_per:?}  ({:.1} µs)", head_per.as_secs_f64() * 1e6);
+    println!(
+        "  cum_freqs.forward_batched (in-isolation, incl. upload/commit/wait/readback):"
+    );
+    println!("    per-call: {cum_per:?}  ({:.1} µs)", cum_per.as_secs_f64() * 1e6);
+    Ok(())
+}
+
 #[cfg(feature = "metal")]
 fn run_metal_bench_forward(
     iters: usize,
