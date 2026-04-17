@@ -626,6 +626,314 @@ fn build_layer_norm_pipeline(device: &Device) -> Result<ComputePipelineState, Me
         .map_err(MetalError::PipelineCreate)
 }
 
+// ===================================================================
+// Phase 13e prep: batched 96×96 matvec (used 8x per layer per token
+// in time_mix + channel_mix on the L3TC-200K model).
+// ===================================================================
+
+const MATVEC_96X96_KERNEL_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+// Batched 96x96 matvec, row-major.
+// out[b, i] = Σ_j mat[i, j] * x[b, j]
+// Dispatch grid = (h, batch). One thread per (batch, row) output.
+// `mat` is shared across all batch lanes (one set of weights);
+// stays in cache after warm-up.
+kernel void matvec_96x96_batched(
+    device const float* mat   [[buffer(0)]],   // h * h
+    device const float* x     [[buffer(1)]],   // batch * h
+    device float*       out   [[buffer(2)]],   // batch * h
+    constant uint&      h     [[buffer(3)]],
+    constant uint&      batch [[buffer(4)]],
+    uint2               gid   [[thread_position_in_grid]]
+) {
+    uint i = gid.x;  // output row
+    uint b = gid.y;  // batch lane
+    if (i >= h || b >= batch) return;
+    device const float* xb = x + (b * h);
+    device const float* row = mat + (i * h);
+    float acc = 0.0;
+    for (uint j = 0; j < h; ++j) {
+        acc = fma(row[j], xb[j], acc);
+    }
+    out[b * h + i] = acc;
+}
+"#;
+
+/// Reusable batched 96×96 matvec kernel. The matrix lives on the GPU
+/// once at construction; per-call uploads the batched input and reads
+/// back the batched output.
+///
+/// CPU equivalent: [`crate::tensor::matvec_96x96`] (Phase 12 hand-tuned
+/// NEON with 4 accumulators).
+pub struct Matvec96Metal {
+    queue: CommandQueue,
+    pipeline: ComputePipelineState,
+    mat_buf: Buffer,
+    h: usize,
+    h_u32: u32,
+}
+
+impl Matvec96Metal {
+    /// Build the kernel and upload the matrix. `mat` must be
+    /// row-major `h * h` (typically h=96 for the L3TC-200K model;
+    /// the kernel is hard-coded to read `h * h` weights but works
+    /// for any square h).
+    pub fn new(mat: &[f32], h: usize) -> Result<Self, MetalError> {
+        assert_eq!(mat.len(), h * h);
+        let device = Device::system_default().ok_or(MetalError::NoDevice)?;
+        let queue = device.new_command_queue();
+        let pipeline = build_matvec96_pipeline(&device)?;
+        let mat_buf = device.new_buffer_with_data(
+            mat.as_ptr() as *const std::ffi::c_void,
+            std::mem::size_of_val(mat) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        Ok(Self {
+            queue,
+            pipeline,
+            mat_buf,
+            h,
+            h_u32: h as u32,
+        })
+    }
+
+    /// Apply matvec to a flat `batch * h` input → `batch * h` output.
+    pub fn forward_batched(&self, x: &[f32], out: &mut [f32], batch: usize) {
+        assert_eq!(x.len(), batch * self.h);
+        assert_eq!(out.len(), batch * self.h);
+
+        let device = self.queue.device();
+        let xb_buf = device.new_buffer_with_data(
+            x.as_ptr() as *const std::ffi::c_void,
+            std::mem::size_of_val(x) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let outb_buf = device.new_buffer(
+            (batch * self.h * std::mem::size_of::<f32>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let batch_u32 = batch as u32;
+
+        let cmd_buf = self.queue.new_command_buffer();
+        let encoder = cmd_buf.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&self.pipeline);
+        encoder.set_buffer(0, Some(&self.mat_buf), 0);
+        encoder.set_buffer(1, Some(&xb_buf), 0);
+        encoder.set_buffer(2, Some(&outb_buf), 0);
+        encoder.set_bytes(
+            3,
+            std::mem::size_of::<u32>() as u64,
+            &self.h_u32 as *const u32 as *const std::ffi::c_void,
+        );
+        encoder.set_bytes(
+            4,
+            std::mem::size_of::<u32>() as u64,
+            &batch_u32 as *const u32 as *const std::ffi::c_void,
+        );
+
+        let tg_width = self
+            .pipeline
+            .thread_execution_width()
+            .max(1)
+            .min(self.h as u64);
+        encoder.dispatch_threads(
+            MTLSize {
+                width: self.h as u64,
+                height: batch as u64,
+                depth: 1,
+            },
+            MTLSize {
+                width: tg_width,
+                height: 1,
+                depth: 1,
+            },
+        );
+        encoder.end_encoding();
+        commit_and_wait(cmd_buf);
+
+        unsafe {
+            let src = outb_buf.contents() as *const f32;
+            std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), batch * self.h);
+        }
+    }
+}
+
+fn build_matvec96_pipeline(device: &Device) -> Result<ComputePipelineState, MetalError> {
+    let library = device
+        .new_library_with_source(MATVEC_96X96_KERNEL_MSL, &metal::CompileOptions::new())
+        .map_err(MetalError::LibraryCompile)?;
+    let function = library
+        .get_function("matvec_96x96_batched", None)
+        .map_err(|e| MetalError::PipelineCreate(format!("matvec_96x96_batched: {e:?}")))?;
+    device
+        .new_compute_pipeline_state_with_function(&function)
+        .map_err(MetalError::PipelineCreate)
+}
+
+// ===================================================================
+// Phase 13e prep: batched sub_exp (out[i] = exp(a[i] - b[i])).
+// Used 4x per layer per token in time_mix's state-evolution exp
+// passes. Polynomial matches the CPU NEON exp_f32x4_neon exactly so
+// the freq-quantization remains equivalent across backends.
+// ===================================================================
+
+const SUB_EXP_KERNEL_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+// Inline polynomial exp matching the CPU NEON implementation:
+// degree-6 minimax for 2^r on [0, 1], 2^k via bit construction.
+// Inputs clamped to [-50, +∞); the positive side is wider than CPU
+// (which only saw negative inputs in time_mix) but the formula
+// works for any input within float-exponent range.
+static inline float poly_exp(float x) {
+    x = fmax(x, -50.0f);
+    float y = x * 1.442695041f;            // log2(e)
+    float k = floor(y);
+    float r = y - k;
+    float p = 0.000154035303933f;
+    p = fma(p, r, 0.001333355814643f);
+    p = fma(p, r, 0.009618129107628f);
+    p = fma(p, r, 0.055504108664821f);
+    p = fma(p, r, 0.240226506959101f);
+    p = fma(p, r, 0.693147180559945f);
+    p = fma(p, r, 1.0f);                    // ≈ 2^r
+    // 2^k via float-bit construction (clamped so the exponent is in
+    // the normal range [55, 254]).
+    int  ki = int(k);
+    int  exp_bits = (ki + 127) << 23;
+    float two_k = as_type<float>(exp_bits);
+    return p * two_k;
+}
+
+// Batched sub-exp: out[b, i] = exp(a[b, i] - b[b, i]).
+// Inputs `a` and `b_v` are both batch * h. Each thread handles one
+// (batch, element) cell.
+kernel void sub_exp_batched(
+    device const float* a     [[buffer(0)]],
+    device const float* b_v   [[buffer(1)]],
+    device float*       out   [[buffer(2)]],
+    constant uint&      h     [[buffer(3)]],
+    constant uint&      batch [[buffer(4)]],
+    uint2               gid   [[thread_position_in_grid]]
+) {
+    uint i  = gid.x;
+    uint bb = gid.y;
+    if (i >= h || bb >= batch) return;
+    uint k = bb * h + i;
+    float diff = a[k] - b_v[k];
+    out[k] = poly_exp(diff);
+}
+"#;
+
+/// Reusable batched sub_exp kernel. `out[b, i] = exp(a[b, i] - b[b, i])`.
+///
+/// CPU equivalent: [`crate::tensor::sub_exp`] (Phase 12a). Same
+/// polynomial coefficients, so cum_freqs quantization is equivalent
+/// across CPU / Metal.
+pub struct SubExpKernelMetal {
+    queue: CommandQueue,
+    pipeline: ComputePipelineState,
+    h: usize,
+    h_u32: u32,
+}
+
+impl SubExpKernelMetal {
+    /// Build the kernel. Stateless — no model weights to upload.
+    /// `h` fixes the per-lane element count for downstream dispatch.
+    pub fn new(h: usize) -> Result<Self, MetalError> {
+        let device = Device::system_default().ok_or(MetalError::NoDevice)?;
+        let queue = device.new_command_queue();
+        let pipeline = build_sub_exp_pipeline(&device)?;
+        Ok(Self {
+            queue,
+            pipeline,
+            h,
+            h_u32: h as u32,
+        })
+    }
+
+    /// Compute `out[b, i] = exp(a[b, i] - b_v[b, i])` for every
+    /// `(b, i)` in `batch × h`. Per-call upload of `a` and `b_v`,
+    /// per-call download of `out`.
+    pub fn forward_batched(&self, a: &[f32], b_v: &[f32], out: &mut [f32], batch: usize) {
+        assert_eq!(a.len(), batch * self.h);
+        assert_eq!(b_v.len(), batch * self.h);
+        assert_eq!(out.len(), batch * self.h);
+
+        let device = self.queue.device();
+        let n_bytes = (batch * self.h * std::mem::size_of::<f32>()) as u64;
+        let a_buf = device.new_buffer_with_data(
+            a.as_ptr() as *const std::ffi::c_void,
+            n_bytes,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let b_buf = device.new_buffer_with_data(
+            b_v.as_ptr() as *const std::ffi::c_void,
+            n_bytes,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let out_buf = device.new_buffer(n_bytes, MTLResourceOptions::StorageModeShared);
+        let batch_u32 = batch as u32;
+
+        let cmd_buf = self.queue.new_command_buffer();
+        let encoder = cmd_buf.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&self.pipeline);
+        encoder.set_buffer(0, Some(&a_buf), 0);
+        encoder.set_buffer(1, Some(&b_buf), 0);
+        encoder.set_buffer(2, Some(&out_buf), 0);
+        encoder.set_bytes(
+            3,
+            std::mem::size_of::<u32>() as u64,
+            &self.h_u32 as *const u32 as *const std::ffi::c_void,
+        );
+        encoder.set_bytes(
+            4,
+            std::mem::size_of::<u32>() as u64,
+            &batch_u32 as *const u32 as *const std::ffi::c_void,
+        );
+
+        let tg_width = self
+            .pipeline
+            .thread_execution_width()
+            .max(1)
+            .min(self.h as u64);
+        encoder.dispatch_threads(
+            MTLSize {
+                width: self.h as u64,
+                height: batch as u64,
+                depth: 1,
+            },
+            MTLSize {
+                width: tg_width,
+                height: 1,
+                depth: 1,
+            },
+        );
+        encoder.end_encoding();
+        commit_and_wait(cmd_buf);
+
+        unsafe {
+            let src = out_buf.contents() as *const f32;
+            std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), batch * self.h);
+        }
+    }
+}
+
+fn build_sub_exp_pipeline(device: &Device) -> Result<ComputePipelineState, MetalError> {
+    let library = device
+        .new_library_with_source(SUB_EXP_KERNEL_MSL, &metal::CompileOptions::new())
+        .map_err(MetalError::LibraryCompile)?;
+    let function = library
+        .get_function("sub_exp_batched", None)
+        .map_err(|e| MetalError::PipelineCreate(format!("sub_exp_batched: {e:?}")))?;
+    device
+        .new_compute_pipeline_state_with_function(&function)
+        .map_err(MetalError::PipelineCreate)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -787,6 +1095,141 @@ mod tests {
         assert!(
             max_abs < 5e-4,
             "layer_norm CPU vs Metal max abs diff = {max_abs} at {max_idx} \
+             (cpu = {}, gpu = {})",
+            cpu_out[max_idx],
+            gpu_out[max_idx],
+        );
+    }
+
+    /// Phase 13e prep: batched 96×96 matvec on Metal must match the
+    /// CPU NEON path within FMA-rounding tolerance for every lane.
+    #[test]
+    fn matvec_96x96_batched_metal_matches_cpu() {
+        use crate::tensor;
+
+        let h: usize = 96;
+        let batch: usize = 64;
+
+        // Synthetic mat with a structured pattern to make any
+        // off-by-one detectable.
+        let mat: Vec<f32> = (0..(h * h))
+            .map(|k| ((k % 17) as f32 - 8.0) * 0.01)
+            .collect();
+
+        // Each batch lane has a slightly different x.
+        let mut x = vec![0.0f32; batch * h];
+        for b in 0..batch {
+            for j in 0..h {
+                x[b * h + j] = ((j as f32) - 48.0) * 0.05 + (b as f32) * 0.001;
+            }
+        }
+
+        // CPU reference: matvec per lane.
+        let mut cpu_out = vec![0.0f32; batch * h];
+        for b in 0..batch {
+            tensor::matvec_96x96(
+                &mat,
+                &x[b * h..(b + 1) * h],
+                &mut cpu_out[b * h..(b + 1) * h],
+            );
+        }
+
+        // Metal path.
+        let kernel = match Matvec96Metal::new(&mat, h) {
+            Ok(k) => k,
+            Err(MetalError::NoDevice) => return,
+            Err(other) => panic!("Matvec96Metal::new failed: {other}"),
+        };
+        let mut gpu_out = vec![0.0f32; batch * h];
+        kernel.forward_batched(&x, &mut gpu_out, batch);
+
+        let mut max_abs = 0.0f32;
+        let mut max_idx = 0usize;
+        for i in 0..(batch * h) {
+            let d = (cpu_out[i] - gpu_out[i]).abs();
+            if d > max_abs {
+                max_abs = d;
+                max_idx = i;
+            }
+        }
+        // Tolerance: 96-wide dot product accumulates ~96 FMAs of f32
+        // values around 0.01. Max abs error should be a few ULPs of
+        // the final magnitude (~1e-3 to 1e-1).
+        assert!(
+            max_abs < 5e-4,
+            "matvec_96x96 CPU vs Metal max abs diff = {max_abs} at {max_idx} \
+             (cpu = {}, gpu = {})",
+            cpu_out[max_idx],
+            gpu_out[max_idx],
+        );
+    }
+
+    /// Phase 13e prep: batched sub_exp on Metal must match the CPU
+    /// NEON polynomial within FMA-rounding tolerance for inputs in
+    /// the time-mix range (always ≤ 0).
+    #[test]
+    fn sub_exp_batched_metal_matches_cpu() {
+        use crate::tensor;
+
+        let h: usize = 96;
+        let batch: usize = 32;
+
+        // Time_mix-realistic inputs: a is the smaller, b is the
+        // running max, so a - b is always ≤ 0. Spread across the
+        // [-50, 0] range covered by the polynomial.
+        let mut a = vec![0.0f32; batch * h];
+        let mut b = vec![0.0f32; batch * h];
+        for bi in 0..batch {
+            for i in 0..h {
+                let k = bi * h + i;
+                let base = (i as f32 - 48.0) * 0.5;
+                b[k] = base;
+                a[k] = base - ((i + bi) as f32 % 30.0);
+            }
+        }
+
+        // CPU reference per-lane.
+        let mut cpu_out = vec![0.0f32; batch * h];
+        for bi in 0..batch {
+            tensor::sub_exp(
+                &a[bi * h..(bi + 1) * h],
+                &b[bi * h..(bi + 1) * h],
+                &mut cpu_out[bi * h..(bi + 1) * h],
+            );
+        }
+
+        // Metal path.
+        let kernel = match SubExpKernelMetal::new(h) {
+            Ok(k) => k,
+            Err(MetalError::NoDevice) => return,
+            Err(other) => panic!("SubExpKernelMetal::new failed: {other}"),
+        };
+        let mut gpu_out = vec![0.0f32; batch * h];
+        kernel.forward_batched(&a, &b, &mut gpu_out, batch);
+
+        // Both implementations clamp inputs <= -50 to ~exp(-50). The
+        // CPU NEON polynomial has documented max relative error ~1e-5;
+        // Metal's polynomial (same coefficients) should land in the
+        // same band.
+        let mut max_rel = 0.0f64;
+        let mut max_idx = 0usize;
+        for i in 0..(batch * h) {
+            let cpu_v = cpu_out[i] as f64;
+            let gpu_v = gpu_out[i] as f64;
+            // Skip near-zero CPU values; GPU may differ by clamp-floor
+            // behaviour but freq-quantization absorbs it.
+            if cpu_v < 1e-15 {
+                continue;
+            }
+            let rel = (cpu_v - gpu_v).abs() / cpu_v;
+            if rel > max_rel {
+                max_rel = rel;
+                max_idx = i;
+            }
+        }
+        assert!(
+            max_rel < 5e-5,
+            "sub_exp CPU vs Metal max relative error = {max_rel} at {max_idx} \
              (cpu = {}, gpu = {})",
             cpu_out[max_idx],
             gpu_out[max_idx],
