@@ -743,18 +743,117 @@ pub fn matvec_col_major_int8(
     debug_assert_eq!(x.len(), cols);
     debug_assert_eq!(out.len(), rows);
 
-    for v in out.iter_mut() {
-        *v = 0.0;
+    #[cfg(target_arch = "aarch64")]
+    {
+        #[allow(unsafe_code)]
+        unsafe {
+            matvec_col_major_int8_neon(qmat, scales, x, out, rows, cols);
+        }
+        return;
     }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        for v in out.iter_mut() {
+            *v = 0.0;
+        }
+        for j in 0..cols {
+            let xs = x[j] * scales[j];
+            if xs == 0.0 {
+                continue;
+            }
+            let col = &qmat[j * rows..(j + 1) * rows];
+            for i in 0..rows {
+                out[i] += xs * (col[i] as f32);
+            }
+        }
+    }
+}
+
+/// Explicit NEON 16-wide kernel for the head matvec.
+///
+/// Processes one column at a time (broadcast-FMA pattern). The
+/// inner loop loads 16 i8 elements (one int8x16), widens to four
+/// f32x4 vectors via sxtl chain, then 4 FMAs against the
+/// broadcasted `xs` accumulating into the output buffer in place.
+///
+/// vs the autovectorized form: this guarantees the chosen 16-wide
+/// unroll, the load/widen interleaving, and the in-place FMA on
+/// the output without spilling to a temporary scratch (which the
+/// pre-widen variant tried and lost to L1 thrash at 32K vocab).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(unsafe_code)]
+unsafe fn matvec_col_major_int8_neon(
+    qmat: &[i8],
+    scales: &[f32],
+    x: &[f32],
+    out: &mut [f32],
+    rows: usize,
+    cols: usize,
+) {
+    use std::arch::aarch64::*;
+
+    // Zero the output (NEON 4-wide).
+    let out_p = out.as_mut_ptr();
+    let zero = vdupq_n_f32(0.0);
+    let row_chunks = rows / 4;
+    {
+        let mut k = 0usize;
+        while k < row_chunks {
+            vst1q_f32(out_p.add(k * 4), zero);
+            k += 1;
+        }
+        let mut t = row_chunks * 4;
+        while t < rows {
+            *out_p.add(t) = 0.0;
+            t += 1;
+        }
+    }
+
+    let qmat_p = qmat.as_ptr();
+    let n16 = rows / 16;
 
     for j in 0..cols {
         let xs = x[j] * scales[j];
         if xs == 0.0 {
             continue;
         }
-        let col = &qmat[j * rows..(j + 1) * rows];
-        for i in 0..rows {
-            out[i] += xs * (col[i] as f32);
+        let xs_v = vdupq_n_f32(xs);
+        let col_p = qmat_p.add(j * rows);
+
+        // Main loop: 16 i8 per iteration.
+        let mut k = 0usize;
+        while k < n16 {
+            let off = k * 16;
+            let i8v = vld1q_s8(col_p.add(off));
+            // i8x16 → 2 × i16x8
+            let lo16 = vmovl_s8(vget_low_s8(i8v));
+            let hi16 = vmovl_high_s8(i8v);
+            // Each i16x8 → 2 × i32x4 → 2 × f32x4
+            let f0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo16)));
+            let f1 = vcvtq_f32_s32(vmovl_high_s16(lo16));
+            let f2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi16)));
+            let f3 = vcvtq_f32_s32(vmovl_high_s16(hi16));
+
+            let o0 = vld1q_f32(out_p.add(off));
+            let o1 = vld1q_f32(out_p.add(off + 4));
+            let o2 = vld1q_f32(out_p.add(off + 8));
+            let o3 = vld1q_f32(out_p.add(off + 12));
+
+            vst1q_f32(out_p.add(off),      vfmaq_f32(o0, f0, xs_v));
+            vst1q_f32(out_p.add(off + 4),  vfmaq_f32(o1, f1, xs_v));
+            vst1q_f32(out_p.add(off + 8),  vfmaq_f32(o2, f2, xs_v));
+            vst1q_f32(out_p.add(off + 12), vfmaq_f32(o3, f3, xs_v));
+            k += 1;
+        }
+
+        // Tail (rows % 16). For 16K and 32K vocab this never runs;
+        // kept for correctness on other shapes.
+        let mut i = n16 * 16;
+        while i < rows {
+            *out_p.add(i) += xs * (*col_p.add(i) as f32);
+            i += 1;
         }
     }
 }
