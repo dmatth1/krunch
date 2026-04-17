@@ -1984,6 +1984,409 @@ fn build_cum_freqs_pipelines(
 }
 
 // ===================================================================
+// Phase 13n: fused-layer kernel. One dispatch handles the entire
+// per-layer forward pass for a 2-layer, h=96 model: short+relu,
+// ln1, time_mix input blends, 3 attention matvecs (with sigmoid on
+// r), time_mix step1 + step2 state evolution, rwkv = r*a/b +
+// att_output matvec, residual add, ln2, channel_mix blends,
+// ffn_r/ffn_k/ffn_v matvecs (with sigmoid + relu_square fused),
+// ffn_out mul, x += ffn_out + short. Each threadgroup is 96
+// threads handling one batch lane; layer_norm reductions happen
+// in threadgroup shared memory; all intermediate values stay in
+// registers (no extra device-memory round trips).
+// ===================================================================
+const FORWARD_LAYER_96H_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+#define H 96u
+
+static inline float poly_exp(float x) {
+    x = fmax(x, -50.0f);
+    float y = x * 1.442695041f;
+    float k = floor(y);
+    float r = y - k;
+    float p = 0.000154035303933f;
+    p = fma(p, r, 0.001333355814643f);
+    p = fma(p, r, 0.009618129107628f);
+    p = fma(p, r, 0.055504108664821f);
+    p = fma(p, r, 0.240226506959101f);
+    p = fma(p, r, 0.693147180559945f);
+    p = fma(p, r, 1.0f);
+    int  ki = int(k);
+    int  exp_bits = (ki + 127) << 23;
+    float two_k = as_type<float>(exp_bits);
+    return p * two_k;
+}
+
+static inline float safe_sigmoid(float x) {
+    float e = poly_exp(-fabs(x));
+    float denom = 1.0f + e;
+    return (x >= 0.0f) ? (1.0f / denom) : (e / denom);
+}
+
+// Threadgroup reduction helper: sum the 96 values in `sh` into sh[0].
+// Works for any power-of-2 >= 96; we pad to 128 threads logically by
+// having threads >= 96 contribute 0. Here h is fixed at 96.
+static inline float tg_sum_96(threadgroup float* sh, uint tid) {
+    // Pair-wise reduction 96 → 48 → 24 → 12 → 6 → 3 → 1 (using
+    // power-of-two strides, guarded for out-of-range).
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 64u; stride > 0u; stride >>= 1) {
+        if (tid < stride && tid + stride < H) {
+            sh[tid] += sh[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    return sh[0];
+}
+
+kernel void forward_layer_96h(
+    device float*       x_buf       [[buffer(0)]],    // batch * h (in/out)
+    device const float* ln1_w       [[buffer(1)]],    // h
+    device const float* ln1_b       [[buffer(2)]],    // h
+    device const float* ln2_w       [[buffer(3)]],    // h
+    device const float* ln2_b       [[buffer(4)]],    // h
+    device const float* w_short     [[buffer(5)]],    // h * h (row-major)
+    device const float* w_att_k     [[buffer(6)]],
+    device const float* w_att_v     [[buffer(7)]],
+    device const float* w_att_r     [[buffer(8)]],
+    device const float* w_att_out   [[buffer(9)]],
+    device const float* w_ffn_k     [[buffer(10)]],
+    device const float* w_ffn_v     [[buffer(11)]],
+    device const float* w_ffn_r     [[buffer(12)]],
+    device const float* att_mix_k   [[buffer(13)]],
+    device const float* att_mix_v   [[buffer(14)]],
+    device const float* att_mix_r   [[buffer(15)]],
+    device const float* ffn_mix_k   [[buffer(16)]],
+    device const float* ffn_mix_r   [[buffer(17)]],
+    device const float* time_first  [[buffer(18)]],
+    device const float* neg_exp_dec [[buffer(19)]],
+    device float*       state_x     [[buffer(20)]],   // batch * h (in/out)
+    device float*       state_a     [[buffer(21)]],
+    device float*       state_b     [[buffer(22)]],
+    device float*       state_p     [[buffer(23)]],
+    device float*       state_ffn   [[buffer(24)]],
+    constant uint&      batch       [[buffer(25)]],
+    constant float&     ln_eps      [[buffer(26)]],
+    uint                tid         [[thread_position_in_threadgroup]],
+    uint                lane        [[threadgroup_position_in_grid]]
+) {
+    if (lane >= batch || tid >= H) return;
+    uint gid = lane * H + tid;
+
+    // Local registers for this thread's channel. `x_local` persists
+    // through the whole kernel; we write it back to x_buf at the end.
+    float x_local = x_buf[gid];
+
+    // Shared scratch reused across reductions + matvec input staging.
+    threadgroup float sh[H];
+
+    // ---- short = relu(w_short @ x) ----
+    sh[tid] = x_local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float short_local = 0.0f;
+    {
+        device const float* row = w_short + tid * H;
+        for (uint j = 0; j < H; ++j) {
+            short_local = fma(row[j], sh[j], short_local);
+        }
+    }
+    short_local = fmax(0.0f, short_local);
+
+    // ---- ln1(x) → normed (per-channel value, register only) ----
+    sh[tid] = x_local;
+    float mean = tg_sum_96(sh, tid) / float(H);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float dev = x_local - mean;
+    sh[tid] = dev * dev;
+    float var = tg_sum_96(sh, tid) / float(H);
+    float inv_std = rsqrt(var + ln_eps);
+    float normed = dev * inv_std * ln1_w[tid] + ln1_b[tid];
+
+    // ---- time_mix blends xk/xv/xr + state_x update ----
+    float sx = state_x[gid];
+    float mk = att_mix_k[tid];
+    float mv = att_mix_v[tid];
+    float mr = att_mix_r[tid];
+    float xk = normed * mk + sx * (1.0f - mk);
+    float xv = normed * mv + sx * (1.0f - mv);
+    float xr = normed * mr + sx * (1.0f - mr);
+    state_x[gid] = normed;
+
+    // ---- 3 attention matvecs (staged through sh one at a time) ----
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sh[tid] = xk;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float k_local = 0.0f;
+    {
+        device const float* row = w_att_k + tid * H;
+        for (uint j = 0; j < H; ++j) k_local = fma(row[j], sh[j], k_local);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sh[tid] = xv;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float v_local = 0.0f;
+    {
+        device const float* row = w_att_v + tid * H;
+        for (uint j = 0; j < H; ++j) v_local = fma(row[j], sh[j], v_local);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sh[tid] = xr;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float r_local = 0.0f;
+    {
+        device const float* row = w_att_r + tid * H;
+        for (uint j = 0; j < H; ++j) r_local = fma(row[j], sh[j], r_local);
+    }
+    r_local = safe_sigmoid(r_local);
+
+    // ---- time_mix step1 + step2 ----
+    float sp = state_p[gid];
+    float sa = state_a[gid];
+    float sb = state_b[gid];
+    float tfirst = time_first[tid];
+    float nd = neg_exp_dec[tid];
+
+    // step1: uses OLD state_p/a/b, produces a1,b1 for mul_div.
+    float ww1 = tfirst + k_local;
+    float p1  = fmax(sp, ww1);
+    float e1_1 = poly_exp(sp - p1);
+    float e2_1 = poly_exp(ww1 - p1);
+    float a1 = fma(e2_1, v_local, e1_1 * sa);
+    float b1 = fma(e1_1, sb, e2_1);
+
+    // step2: updates state_p/a/b in place.
+    float ww2 = sp + nd;
+    float p2  = fmax(ww2, k_local);
+    float e1_2 = poly_exp(ww2 - p2);
+    float e2_2 = poly_exp(k_local - p2);
+    state_a[gid] = fma(e2_2, v_local, e1_2 * sa);
+    state_b[gid] = fma(e1_2, sb, e2_2);
+    state_p[gid] = p2;
+
+    // ---- rwkv = att_out @ (r * a1 / b1) ----
+    float rwkv_input = r_local * a1 / b1;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sh[tid] = rwkv_input;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float rwkv_local = 0.0f;
+    {
+        device const float* row = w_att_out + tid * H;
+        for (uint j = 0; j < H; ++j) rwkv_local = fma(row[j], sh[j], rwkv_local);
+    }
+
+    // ---- x += rwkv ----
+    x_local += rwkv_local;
+
+    // ---- ln2(x) → normed2 ----
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sh[tid] = x_local;
+    float mean2 = tg_sum_96(sh, tid) / float(H);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float dev2 = x_local - mean2;
+    sh[tid] = dev2 * dev2;
+    float var2 = tg_sum_96(sh, tid) / float(H);
+    float inv_std2 = rsqrt(var2 + ln_eps);
+    float normed2 = dev2 * inv_std2 * ln2_w[tid] + ln2_b[tid];
+
+    // ---- channel_mix blends xk/xr + state_ffn update ----
+    float sffn = state_ffn[gid];
+    float fmk = ffn_mix_k[tid];
+    float fmr = ffn_mix_r[tid];
+    float ck = normed2 * fmk + sffn * (1.0f - fmk);
+    float cr = normed2 * fmr + sffn * (1.0f - fmr);
+    state_ffn[gid] = normed2;
+
+    // ---- ffn_r matvec + sigmoid ----
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sh[tid] = cr;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float fr = 0.0f;
+    {
+        device const float* row = w_ffn_r + tid * H;
+        for (uint j = 0; j < H; ++j) fr = fma(row[j], sh[j], fr);
+    }
+    fr = safe_sigmoid(fr);
+
+    // ---- ffn_k matvec + relu_square ----
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sh[tid] = ck;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float fk = 0.0f;
+    {
+        device const float* row = w_ffn_k + tid * H;
+        for (uint j = 0; j < H; ++j) fk = fma(row[j], sh[j], fk);
+    }
+    {
+        float v = fmax(0.0f, fk);
+        fk = v * v;
+    }
+
+    // ---- ffn_v matvec ----
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sh[tid] = fk;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float fv = 0.0f;
+    {
+        device const float* row = w_ffn_v + tid * H;
+        for (uint j = 0; j < H; ++j) fv = fma(row[j], sh[j], fv);
+    }
+
+    // ---- x += ffn_out + short  where ffn_out = fr * fv ----
+    x_local += fr * fv + short_local;
+    x_buf[gid] = x_local;
+}
+"#;
+
+/// Fused single-layer forward-pass kernel. One MSL dispatch covers
+/// the entire per-layer computation (short+relu, ln1, time_mix,
+/// residual add, ln2, channel_mix, residual add + short add). Each
+/// threadgroup is 96 threads handling one batch lane; reductions
+/// use threadgroup shared memory.
+///
+/// Cuts the per-layer dispatch count from ~17 (blend3, 3 matvecs,
+/// sigmoid, step1, step2, mul_div, att_out, add, ln, blend2,
+/// ffn_r+sig, ffn_k+relu_sq, ffn_v, mul, 2 adds) down to ONE.
+pub struct ForwardLayerKernelMetal {
+    queue: CommandQueue,
+    pipeline: ComputePipelineState,
+    ln1_w: Buffer,
+    ln1_b: Buffer,
+    ln2_w: Buffer,
+    ln2_b: Buffer,
+    w_short: Buffer,
+    w_att_k: Buffer,
+    w_att_v: Buffer,
+    w_att_r: Buffer,
+    w_att_out: Buffer,
+    w_ffn_k: Buffer,
+    w_ffn_v: Buffer,
+    w_ffn_r: Buffer,
+    att_mix_k: Buffer,
+    att_mix_v: Buffer,
+    att_mix_r: Buffer,
+    ffn_mix_k: Buffer,
+    ffn_mix_r: Buffer,
+    time_first: Buffer,
+    neg_exp_dec: Buffer,
+}
+
+impl ForwardLayerKernelMetal {
+    /// Build one fused-layer kernel for the given block. `h` is
+    /// expected to be 96 (hard-coded in MSL as `H`); other sizes
+    /// fall back to the unfused path.
+    pub fn new(block: &crate::rwkv::Block, device: &Device) -> Result<Self, MetalError> {
+        let queue = device.new_command_queue();
+        let library = device
+            .new_library_with_source(FORWARD_LAYER_96H_MSL, &metal::CompileOptions::new())
+            .map_err(MetalError::LibraryCompile)?;
+        let function = library
+            .get_function("forward_layer_96h", None)
+            .map_err(|e| {
+                MetalError::PipelineCreate(format!("forward_layer_96h: {e:?}"))
+            })?;
+        let pipeline = device
+            .new_compute_pipeline_state_with_function(&function)
+            .map_err(MetalError::PipelineCreate)?;
+        let upload = |data: &[f32]| -> Buffer {
+            device.new_buffer_with_data(
+                data.as_ptr() as *const std::ffi::c_void,
+                std::mem::size_of_val(data) as u64,
+                MTLResourceOptions::StorageModeShared,
+            )
+        };
+        Ok(Self {
+            queue,
+            pipeline,
+            ln1_w: upload(&block.ln1.weight),
+            ln1_b: upload(&block.ln1.bias),
+            ln2_w: upload(&block.ln2.weight),
+            ln2_b: upload(&block.ln2.bias),
+            w_short: upload(&block.w_short),
+            w_att_k: upload(&block.att.w_key),
+            w_att_v: upload(&block.att.w_value),
+            w_att_r: upload(&block.att.w_receptance),
+            w_att_out: upload(&block.att.w_output),
+            w_ffn_k: upload(&block.ffn.w_key),
+            w_ffn_v: upload(&block.ffn.w_value),
+            w_ffn_r: upload(&block.ffn.w_receptance),
+            att_mix_k: upload(&block.att.time_mix_k),
+            att_mix_v: upload(&block.att.time_mix_v),
+            att_mix_r: upload(&block.att.time_mix_r),
+            ffn_mix_k: upload(&block.ffn.time_mix_k),
+            ffn_mix_r: upload(&block.ffn.time_mix_r),
+            time_first: upload(&block.att.time_first),
+            neg_exp_dec: upload(&block.att.neg_exp_time_decay),
+        })
+    }
+
+    /// Encode the fused forward-layer dispatch into a command buffer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_into(
+        &self,
+        cmd_buf: &CommandBufferRef,
+        x_buf: &Buffer,
+        state_x: &Buffer,
+        state_a: &Buffer,
+        state_b: &Buffer,
+        state_p: &Buffer,
+        state_ffn: &Buffer,
+        batch: usize,
+        ln_eps: f32,
+    ) {
+        let batch_u32 = batch as u32;
+        let encoder = cmd_buf.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&self.pipeline);
+        encoder.set_buffer(0, Some(x_buf), 0);
+        encoder.set_buffer(1, Some(&self.ln1_w), 0);
+        encoder.set_buffer(2, Some(&self.ln1_b), 0);
+        encoder.set_buffer(3, Some(&self.ln2_w), 0);
+        encoder.set_buffer(4, Some(&self.ln2_b), 0);
+        encoder.set_buffer(5, Some(&self.w_short), 0);
+        encoder.set_buffer(6, Some(&self.w_att_k), 0);
+        encoder.set_buffer(7, Some(&self.w_att_v), 0);
+        encoder.set_buffer(8, Some(&self.w_att_r), 0);
+        encoder.set_buffer(9, Some(&self.w_att_out), 0);
+        encoder.set_buffer(10, Some(&self.w_ffn_k), 0);
+        encoder.set_buffer(11, Some(&self.w_ffn_v), 0);
+        encoder.set_buffer(12, Some(&self.w_ffn_r), 0);
+        encoder.set_buffer(13, Some(&self.att_mix_k), 0);
+        encoder.set_buffer(14, Some(&self.att_mix_v), 0);
+        encoder.set_buffer(15, Some(&self.att_mix_r), 0);
+        encoder.set_buffer(16, Some(&self.ffn_mix_k), 0);
+        encoder.set_buffer(17, Some(&self.ffn_mix_r), 0);
+        encoder.set_buffer(18, Some(&self.time_first), 0);
+        encoder.set_buffer(19, Some(&self.neg_exp_dec), 0);
+        encoder.set_buffer(20, Some(state_x), 0);
+        encoder.set_buffer(21, Some(state_a), 0);
+        encoder.set_buffer(22, Some(state_b), 0);
+        encoder.set_buffer(23, Some(state_p), 0);
+        encoder.set_buffer(24, Some(state_ffn), 0);
+        encoder.set_bytes(
+            25,
+            std::mem::size_of::<u32>() as u64,
+            &batch_u32 as *const u32 as *const std::ffi::c_void,
+        );
+        encoder.set_bytes(
+            26,
+            std::mem::size_of::<f32>() as u64,
+            &ln_eps as *const f32 as *const std::ffi::c_void,
+        );
+        // Grid: (96 * batch threads, arranged as `batch` threadgroups
+        // of 96 threads each).
+        encoder.dispatch_thread_groups(
+            MTLSize { width: batch as u64, height: 1, depth: 1 },
+            MTLSize { width: 96, height: 1, depth: 1 },
+        );
+        encoder.end_encoding();
+        let _ = &self.queue; // field silences dead-code; queue reserved for standalone tests
+    }
+}
+
+// ===================================================================
 // Phase 13j: elementwise glue + embedding gather kernels.
 //
 // These were previously done CPU-side between GPU kernels in

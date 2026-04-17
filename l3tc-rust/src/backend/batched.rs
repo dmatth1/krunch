@@ -23,8 +23,9 @@
 //! decompress on `Session` and vice versa.
 
 use crate::backend::mtl::{
-    CumFreqsKernelMetal, GlueKernelsMetal, HeadKernelMetal, LayerNormKernelMetal,
-    Matvec96Metal, MetalError, SigmoidKernelMetal, SubExpKernelMetal, TimeMixKernelMetal,
+    CumFreqsKernelMetal, ForwardLayerKernelMetal, GlueKernelsMetal, HeadKernelMetal,
+    LayerNormKernelMetal, Matvec96Metal, MetalError, SigmoidKernelMetal, SubExpKernelMetal,
+    TimeMixKernelMetal,
 };
 use crate::rwkv::{Block, Model};
 use metal::{Buffer, MTLResourceOptions};
@@ -159,7 +160,15 @@ pub struct BatchedSession<'a> {
     glue: GlueKernelsMetal,
 
     // Per-layer kernels (includes per-layer blend weight buffers).
+    // Retained for the fallback path and for the bench tools; the
+    // hot `forward_batched` uses `layers_fused` when h == 96.
     layers: Vec<LayerKernels>,
+
+    // Phase 13n: one fused-layer kernel per transformer block, used
+    // when the model has h = 96 (the 200K default). Each fused kernel
+    // executes the whole per-layer forward pass in ONE dispatch,
+    // replacing ~17 separate kernel calls.
+    layers_fused: Option<Vec<ForwardLayerKernelMetal>>,
 
     // Persistent GPU state. All `batch * h` f32 (lane-major).
     // One buffer per layer.
@@ -229,6 +238,19 @@ impl<'a> BatchedSession<'a> {
             layers.push(LayerKernels::new(block, h, &device)?);
         }
 
+        // Phase 13n: build fused-layer kernels when h == 96 (the
+        // size the MSL kernel is hard-coded for). Other sizes fall
+        // back to the unfused path.
+        let layers_fused = if h == 96 {
+            let mut v = Vec::with_capacity(num_layers);
+            for block in &model.blocks {
+                v.push(ForwardLayerKernelMetal::new(block, &device)?);
+            }
+            Some(v)
+        } else {
+            None
+        };
+
         let bh = batch * h;
         let bh_bytes = (bh * std::mem::size_of::<f32>()) as u64;
         let bv = batch * vocab;
@@ -272,6 +294,7 @@ impl<'a> BatchedSession<'a> {
             sigmoid,
             glue,
             layers,
+            layers_fused,
             state_a,
             state_b,
             state_p,
@@ -362,13 +385,29 @@ impl<'a> BatchedSession<'a> {
 
         // 3. Per-layer block.
         //
+        // Phase 13n: if the fused-layer kernel is available (model
+        // has h = 96), each layer runs as ONE dispatch instead of
+        // ~17 separate kernels. Collapses per-token dispatch count
+        // from ~50 down to ~6 (embed + ln0 + copy + N_layers +
+        // ln_out + head + cum_freqs_4).
+        if let Some(fused) = &self.layers_fused {
+            for layer in 0..self.model.num_layers() {
+                fused[layer].encode_into(
+                    cmd_buf,
+                    &self.x_buf,
+                    &self.state_x[layer],
+                    &self.state_a[layer],
+                    &self.state_b[layer],
+                    &self.state_p[layer],
+                    &self.state_ffn[layer],
+                    self.batch,
+                    1e-5_f32,
+                );
+            }
+        } else {
+        // --- unfused fallback path (non-h=96 models) ---
+        //
         // Phase 13k: eliminate the two `residual = x` copies per layer.
-        // Since time_mix and channel_mix only read `normed` (produced
-        // by ln1/ln2) and per-lane state buffers — neither touches
-        // `x` — we can leave `x` alone and just add `rwkv` and
-        // `ffn_out` into it in-place after each block. That drops 4
-        // elementwise encoders per token (2 per layer) without any
-        // correctness change.
         for layer in 0..self.model.num_layers() {
             // Phase 13l: short = relu(short_weight @ x), fused.
             self.layers[layer].short.encode_into_act(
@@ -407,6 +446,7 @@ impl<'a> BatchedSession<'a> {
             self.glue
                 .encode_add_inplace(cmd_buf, &self.x_buf, &self.short_buf, bh);
         }
+        } // end unfused path
 
         // 4. Final layer norm.
         self.ln_out
