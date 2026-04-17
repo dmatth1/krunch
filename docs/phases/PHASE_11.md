@@ -225,6 +225,58 @@ compress, small-file penalty).
   g6e.xlarge (L40S 48 GB) for 12L+ at vocab 32K.
 - **torch.compile disabled** — L2Wrap can't be traced by dynamo.
 
+## Lessons from the 2L launch (saving $25+ on future runs)
+
+The exp_2l_balanced_32k launch took ~22h of debug time before
+training started cleanly. Issues + fixes:
+
+1. **Pre-build .npy cache locally + upload to S3 alongside corpus.**
+   The training script's text→binary cache build was the long pole:
+   `np.fromfile(sep="\n")` on 51 GB took 4+ hours single-threaded.
+   Even with pandas chunked parsing it took 26 min. Building locally
+   and uploading the .npy means future runs skip the entire build
+   phase — saves $25+ per run.
+   - Updated `scripts/spot-train-userdata.sh.template` to prefer
+     `.npy` from S3 if available (commit 63c4a38).
+   - Pre-build via `scripts/retokenize_corpus.py` produces the .npy
+     directly (it tokenizes + writes binary).
+   - For this corpus, `.npy` is at
+     `s3://dmatth1-bnn-checkpoints/l3tc/corpora/train_2l_corpus_balanced_32k.npy`
+     (55 GB) and `val_*.npy` (400 KB).
+
+2. **Stale at jobs from AMI bake fire on first boot.** The AMI was
+   baked Apr 10 with `at now + 3 hours: shutdown -h now` for safety.
+   Past-due jobs fire when `atd` starts on a fresh instance, killing
+   it ~30 sec after boot. Cloud-init's userdata cleanup runs too late
+   (after `atd`). One workaround: re-launch the same instance (jobs
+   already fired the first time, queue is now empty). Better fix:
+   re-bake the AMI after clearing `at` queue with
+   `for j in $(sudo atq | awk '{print $1}'); do sudo atrm $j; done`,
+   then snapshot.
+
+3. **Userdata template gotchas:**
+   - `set -e` + `pipefail` killed the script if `atq` failed in
+     cloud-init's environment. Dropped `e` (commit 6209241).
+   - Sed-replacing `__GITHUB_PAT__` in a comment line leaked the PAT
+     into the user-data file delivered to AWS metadata service.
+     Removed the comment (commit 6209241). **Rotated the leaked PAT.**
+   - Without `PYTHONUNBUFFERED=1`, training step lines don't flush
+     for ~10+ min. Already in the template.
+
+4. **EC2-to-S3 transfer is fast — use it.** Local→S3 was 20 MiB/s
+   (residential), but EC2→S3 same-region is 100-150 MiB/s. So pre-
+   building the .npy ON the instance and uploading from there is
+   faster than pre-building locally + uploading.
+
+5. **Spot vs on-demand for training:**
+   - On-demand g5.xlarge: $1.006/hr.
+   - Spot typically $0.30-0.40/hr (60-70% off).
+   - With prebuilt .npy on S3, spot reclaim recovery is ~10 min
+     (re-download from S3, no rebuild). Worth the savings on multi-hour
+     runs.
+   - Always wait for the first checkpoint (every 5000 steps) before
+     switching from on-demand to spot — avoids re-doing early training.
+
 ---
 
 ## Decision tree after this run
