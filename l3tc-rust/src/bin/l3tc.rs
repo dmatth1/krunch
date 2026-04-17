@@ -283,6 +283,22 @@ enum Command {
         #[arg(long, default_value_t = 200)]
         iters: usize,
     },
+
+    /// Phase 13m: isolate the Metal forward_batched per-token cost
+    /// with no CPU AC work between calls. Runs N forward passes on
+    /// a BatchedSession and reports mean time per token.
+    #[cfg(feature = "metal")]
+    MetalBenchForward {
+        /// Number of tokens to run through forward_batched.
+        #[arg(long, default_value_t = 200)]
+        iters: usize,
+        /// Batch size (lockstep lanes).
+        #[arg(long, default_value_t = 32)]
+        batch: usize,
+        /// Path to the converted L3TC model binary.
+        #[arg(long, default_value = "checkpoints/l3tc_200k.bin")]
+        model: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
@@ -316,6 +332,10 @@ fn main() -> ExitCode {
         }
         #[cfg(feature = "metal")]
         Command::MetalBenchHead { iters } => run_metal_bench_head(iters),
+        #[cfg(feature = "metal")]
+        Command::MetalBenchForward { iters, batch, model } => {
+            run_metal_bench_forward(iters, batch, &model)
+        }
         Command::Compress {
             input,
             output,
@@ -404,6 +424,60 @@ fn main() -> ExitCode {
 }
 
 #[cfg(feature = "metal")]
+#[cfg(feature = "metal")]
+fn run_metal_bench_forward(
+    iters: usize,
+    batch: usize,
+    model_path: &Path,
+) -> anyhow::Result<()> {
+    use l3tc::backend::batched::BatchedSession;
+    use l3tc::backend::mtl::MetalError;
+    use l3tc::checkpoint::Checkpoint;
+    use l3tc::rwkv::Model;
+
+    let mut ckpt = Checkpoint::load(model_path)
+        .map_err(|e| anyhow::anyhow!("loading checkpoint {model_path:?}: {e}"))?;
+    let model = Model::from_checkpoint(&mut ckpt)
+        .map_err(|e| anyhow::anyhow!("building model: {e}"))?;
+
+    let mut bs = match BatchedSession::new(&model, batch) {
+        Ok(s) => s,
+        Err(MetalError::NoDevice) => {
+            return Err(anyhow::anyhow!("no Metal device available"));
+        }
+        Err(e) => return Err(anyhow::anyhow!("BatchedSession::new: {e}")),
+    };
+
+    let prev: Vec<u32> = (0..batch).map(|b| (b as u32) % 16u32).collect();
+
+    // Warm up (pipeline JIT, GPU buffers).
+    let warmup = 20.min(iters / 5).max(5);
+    for _ in 0..warmup {
+        bs.forward_batched(&prev);
+    }
+
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        bs.forward_batched(&prev);
+    }
+    let total = t0.elapsed();
+    let per_tok = total / iters as u32;
+    let per_lane = per_tok / batch as u32;
+
+    println!("Metal forward_batched bench");
+    println!("  model       : {model_path:?}");
+    println!("  batch       : {batch}");
+    println!("  iters       : {iters} (after {warmup} warm-up)");
+    println!("  total       : {total:?}");
+    println!("  per-token   : {per_tok:?}");
+    println!("  per-lane-tok: {per_lane:?}  ({:.0} µs)", per_lane.as_secs_f64() * 1e6);
+    println!(
+        "  aggregate   : ~{:.1} KB/s (assuming 2 B/token across {batch} lanes)",
+        (batch * 2) as f64 / per_tok.as_secs_f64() / 1000.0
+    );
+    Ok(())
+}
+
 fn run_metal_bench_head(iters: usize) -> anyhow::Result<()> {
     use l3tc::backend::mtl::{HeadKernelMetal, MetalError};
     use l3tc::tensor;
