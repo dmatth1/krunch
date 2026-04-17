@@ -360,6 +360,270 @@ unsafe fn exp_f32x4_neon(
     vmulq_f32(two_k, p)
 }
 
+/// Fused RWKV time-mix attention "step 1" — pre-state-update.
+///
+/// For every i:
+/// ```text
+/// ww[i]  = time_first[i] + k[i]
+/// p[i]   = max(state_p[i], ww[i])
+/// e1     = exp(state_p[i] - p[i])
+/// e2     = exp(ww[i] - p[i])
+/// a[i]   = e1 * state_a[i] + e2 * v[i]
+/// b[i]   = e1 * state_b[i] + e2
+/// ```
+///
+/// This replaces 5 separate passes over hidden-sized scratch
+/// buffers (and their intermediate `e1`/`e2` stores) with a
+/// single fused NEON loop that keeps `e1`, `e2`, `ww`, `p` in
+/// registers. Halves the L1 read/write traffic in this stretch
+/// of `time_mix`.
+///
+/// All input buffers are length `h`; outputs are length `h`.
+/// `h` is debug-asserted to be a multiple of 4 (NEON chunk).
+#[inline]
+pub fn time_mix_step1(
+    state_p: &[f32],
+    time_first: &[f32],
+    k: &[f32],
+    state_a: &[f32],
+    state_b: &[f32],
+    v: &[f32],
+    ww: &mut [f32],
+    p: &mut [f32],
+    a: &mut [f32],
+    b: &mut [f32],
+) {
+    let n = state_p.len();
+    debug_assert_eq!(time_first.len(), n);
+    debug_assert_eq!(k.len(), n);
+    debug_assert_eq!(state_a.len(), n);
+    debug_assert_eq!(state_b.len(), n);
+    debug_assert_eq!(v.len(), n);
+    debug_assert_eq!(ww.len(), n);
+    debug_assert_eq!(p.len(), n);
+    debug_assert_eq!(a.len(), n);
+    debug_assert_eq!(b.len(), n);
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        #[allow(unsafe_code)]
+        unsafe {
+            time_mix_step1_neon(state_p, time_first, k, state_a, state_b, v, ww, p, a, b);
+        }
+        return;
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        for i in 0..n {
+            let www = time_first[i] + k[i];
+            let pp = state_p[i].max(www);
+            let e1 = (state_p[i] - pp).exp();
+            let e2 = (www - pp).exp();
+            ww[i] = www;
+            p[i] = pp;
+            a[i] = e1 * state_a[i] + e2 * v[i];
+            b[i] = e1 * state_b[i] + e2;
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(unsafe_code)]
+unsafe fn time_mix_step1_neon(
+    state_p: &[f32],
+    time_first: &[f32],
+    k: &[f32],
+    state_a: &[f32],
+    state_b: &[f32],
+    v: &[f32],
+    ww: &mut [f32],
+    p: &mut [f32],
+    a: &mut [f32],
+    b: &mut [f32],
+) {
+    use std::arch::aarch64::*;
+
+    let n = state_p.len();
+    let chunks = n / 4;
+    let sp_p = state_p.as_ptr();
+    let tf_p = time_first.as_ptr();
+    let k_p = k.as_ptr();
+    let sa_p = state_a.as_ptr();
+    let sb_p = state_b.as_ptr();
+    let v_p = v.as_ptr();
+    let ww_p = ww.as_mut_ptr();
+    let p_p = p.as_mut_ptr();
+    let a_p = a.as_mut_ptr();
+    let b_p = b.as_mut_ptr();
+
+    let mut i = 0usize;
+    while i < chunks {
+        let off = i * 4;
+        let sp = vld1q_f32(sp_p.add(off));
+        let tf = vld1q_f32(tf_p.add(off));
+        let kv = vld1q_f32(k_p.add(off));
+        let sa = vld1q_f32(sa_p.add(off));
+        let sb = vld1q_f32(sb_p.add(off));
+        let vv = vld1q_f32(v_p.add(off));
+
+        let www = vaddq_f32(tf, kv);
+        let pp = vmaxq_f32(sp, www);
+        // e1 = exp(sp - pp); e2 = exp(www - pp). Both args ≤ 0
+        // because pp = max(sp, www).
+        let e1 = exp_f32x4_neon(vsubq_f32(sp, pp));
+        let e2 = exp_f32x4_neon(vsubq_f32(www, pp));
+        // a = e2*v + e1*sa  (note FMA order: vfmaq(acc, x, y) = acc + x*y)
+        let av = vfmaq_f32(vmulq_f32(e2, vv), e1, sa);
+        // b = e2 + e1*sb
+        let bv = vfmaq_f32(e2, e1, sb);
+
+        vst1q_f32(ww_p.add(off), www);
+        vst1q_f32(p_p.add(off), pp);
+        vst1q_f32(a_p.add(off), av);
+        vst1q_f32(b_p.add(off), bv);
+        i += 1;
+    }
+
+    // Tail (n % 4) — h is always a multiple of 4 (96, 256) for
+    // L3TC variants, but kept for correctness.
+    let mut j = chunks * 4;
+    while j < n {
+        let www = *tf_p.add(j) + *k_p.add(j);
+        let pp = (*sp_p.add(j)).max(www);
+        let e1 = (*sp_p.add(j) - pp).exp();
+        let e2 = (www - pp).exp();
+        *ww_p.add(j) = www;
+        *p_p.add(j) = pp;
+        *a_p.add(j) = e1 * *sa_p.add(j) + e2 * *v_p.add(j);
+        *b_p.add(j) = e1 * *sb_p.add(j) + e2;
+        j += 1;
+    }
+}
+
+/// Fused RWKV time-mix attention "step 2" — post-state-update.
+///
+/// For every i:
+/// ```text
+/// ww[i]       = state_p[i] + neg_exp_decay[i]
+/// p_new[i]    = max(ww[i], k[i])
+/// e1          = exp(ww[i] - p_new[i])
+/// e2          = exp(k[i] - p_new[i])
+/// state_a[i]  = e1 * state_a[i] + e2 * v[i]
+/// state_b[i]  = e1 * state_b[i] + e2
+/// state_p[i]  = p_new[i]
+/// ```
+///
+/// Same fusion idea as `time_mix_step1`. Reads `state_a`,
+/// `state_b`, `state_p` and overwrites them in place.
+#[inline]
+pub fn time_mix_step2(
+    neg_exp_decay: &[f32],
+    k: &[f32],
+    v: &[f32],
+    state_p: &mut [f32],
+    state_a: &mut [f32],
+    state_b: &mut [f32],
+    ww: &mut [f32],
+) {
+    let n = state_p.len();
+    debug_assert_eq!(neg_exp_decay.len(), n);
+    debug_assert_eq!(k.len(), n);
+    debug_assert_eq!(v.len(), n);
+    debug_assert_eq!(state_a.len(), n);
+    debug_assert_eq!(state_b.len(), n);
+    debug_assert_eq!(ww.len(), n);
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        #[allow(unsafe_code)]
+        unsafe {
+            time_mix_step2_neon(neg_exp_decay, k, v, state_p, state_a, state_b, ww);
+        }
+        return;
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        for i in 0..n {
+            let www = state_p[i] + neg_exp_decay[i];
+            let p_new = www.max(k[i]);
+            let e1 = (www - p_new).exp();
+            let e2 = (k[i] - p_new).exp();
+            state_a[i] = e1 * state_a[i] + e2 * v[i];
+            state_b[i] = e1 * state_b[i] + e2;
+            state_p[i] = p_new;
+            ww[i] = www;
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(unsafe_code)]
+unsafe fn time_mix_step2_neon(
+    neg_exp_decay: &[f32],
+    k: &[f32],
+    v: &[f32],
+    state_p: &mut [f32],
+    state_a: &mut [f32],
+    state_b: &mut [f32],
+    ww: &mut [f32],
+) {
+    use std::arch::aarch64::*;
+
+    let n = state_p.len();
+    let chunks = n / 4;
+    let nd_p = neg_exp_decay.as_ptr();
+    let k_p = k.as_ptr();
+    let v_p = v.as_ptr();
+    let sp_p = state_p.as_mut_ptr();
+    let sa_p = state_a.as_mut_ptr();
+    let sb_p = state_b.as_mut_ptr();
+    let ww_p = ww.as_mut_ptr();
+
+    let mut i = 0usize;
+    while i < chunks {
+        let off = i * 4;
+        let sp = vld1q_f32(sp_p.add(off));
+        let nd = vld1q_f32(nd_p.add(off));
+        let kv = vld1q_f32(k_p.add(off));
+        let vv = vld1q_f32(v_p.add(off));
+        let sa = vld1q_f32(sa_p.add(off));
+        let sb = vld1q_f32(sb_p.add(off));
+
+        let www = vaddq_f32(sp, nd);
+        let p_new = vmaxq_f32(www, kv);
+        // e1 = exp(www - p_new); e2 = exp(kv - p_new). Both ≤ 0.
+        let e1 = exp_f32x4_neon(vsubq_f32(www, p_new));
+        let e2 = exp_f32x4_neon(vsubq_f32(kv, p_new));
+        // state_a = e1*sa + e2*v
+        let new_sa = vfmaq_f32(vmulq_f32(e2, vv), e1, sa);
+        // state_b = e1*sb + e2
+        let new_sb = vfmaq_f32(e2, e1, sb);
+
+        vst1q_f32(sa_p.add(off), new_sa);
+        vst1q_f32(sb_p.add(off), new_sb);
+        vst1q_f32(sp_p.add(off), p_new);
+        vst1q_f32(ww_p.add(off), www);
+        i += 1;
+    }
+
+    let mut j = chunks * 4;
+    while j < n {
+        let www = *sp_p.add(j) + *nd_p.add(j);
+        let p_new = www.max(*k_p.add(j));
+        let e1 = (www - p_new).exp();
+        let e2 = (*k_p.add(j) - p_new).exp();
+        *sa_p.add(j) = e1 * *sa_p.add(j) + e2 * *v_p.add(j);
+        *sb_p.add(j) = e1 * *sb_p.add(j) + e2;
+        *sp_p.add(j) = p_new;
+        *ww_p.add(j) = www;
+        j += 1;
+    }
+}
+
 /// `out[i] = exp(a[i] - b[i])` for every i. NEON-vectorized on
 /// aarch64; scalar `f32::exp` elsewhere.
 ///

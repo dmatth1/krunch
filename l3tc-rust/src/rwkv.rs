@@ -385,8 +385,6 @@ struct Scratch {
     r: Vec<f32>,
     ww: Vec<f32>,
     p: Vec<f32>,
-    e1: Vec<f32>,
-    e2: Vec<f32>,
     a: Vec<f32>,
     b: Vec<f32>,
     rwkv: Vec<f32>,
@@ -416,8 +414,6 @@ impl Scratch {
             r: h(),
             ww: h(),
             p: h(),
-            e1: h(),
-            e2: h(),
             a: h(),
             b: h(),
             rwkv: h(),
@@ -623,49 +619,36 @@ impl<'a> Session<'a> {
         tensor::matvec_square(&att.w_receptance, &scratch.xr, &mut scratch.r, h);
         tensor::sigmoid_inplace(&mut scratch.r);
 
-        // ww = time_first + k
-        for i in 0..h {
-            scratch.ww[i] = att.time_first[i] + scratch.k[i];
-        }
-        // p = max(state_p, ww)
-        tensor::max_elem(&state.state_p, &scratch.ww, &mut scratch.p);
-        // e1 = exp(state_p - p)   [NEON 4-wide]
-        tensor::sub_exp(&state.state_p[..h], &scratch.p[..h], &mut scratch.e1[..h]);
-        // e2 = exp(ww - p)        [NEON 4-wide]
-        tensor::sub_exp(&scratch.ww[..h], &scratch.p[..h], &mut scratch.e2[..h]);
-        // a = e1 * state_a + e2 * v
-        for i in 0..h {
-            scratch.a[i] = scratch.e1[i] * state.state_a[i] + scratch.e2[i] * scratch.v[i];
-        }
-        // b = e1 * state_b + e2
-        for i in 0..h {
-            scratch.b[i] = scratch.e1[i] * state.state_b[i] + scratch.e2[i];
-        }
+        // Step 1 (pre-state-update): ww = tf + k; p = max(state_p, ww);
+        // a = exp(state_p-p)*state_a + exp(ww-p)*v;
+        // b = exp(state_p-p)*state_b + exp(ww-p).
+        // Fused into one NEON loop — keeps e1/e2 in registers instead
+        // of round-tripping through `scratch.e1`/`e2`.
+        tensor::time_mix_step1(
+            &state.state_p[..h],
+            &att.time_first[..h],
+            &scratch.k[..h],
+            &state.state_a[..h],
+            &state.state_b[..h],
+            &scratch.v[..h],
+            &mut scratch.ww[..h],
+            &mut scratch.p[..h],
+            &mut scratch.a[..h],
+            &mut scratch.b[..h],
+        );
 
-        // Update state for next step:
-        // ww = state_p + (-exp(time_decay))   [decay term precomputed once at load]
-        for i in 0..h {
-            scratch.ww[i] = state.state_p[i] + att.neg_exp_time_decay[i];
-        }
-        // p_new = max(ww, k)
-        for i in 0..h {
-            scratch.p[i] = scratch.ww[i].max(scratch.k[i]);
-        }
-        // e1 = exp(ww - p_new)    [NEON 4-wide]
-        tensor::sub_exp(&scratch.ww[..h], &scratch.p[..h], &mut scratch.e1[..h]);
-        // e2 = exp(k - p_new)     [NEON 4-wide]
-        tensor::sub_exp(&scratch.k[..h], &scratch.p[..h], &mut scratch.e2[..h]);
-
-        // state_a = e1 * state_a + e2 * v
-        for i in 0..h {
-            state.state_a[i] = scratch.e1[i] * state.state_a[i] + scratch.e2[i] * scratch.v[i];
-        }
-        // state_b = e1 * state_b + e2
-        for i in 0..h {
-            state.state_b[i] = scratch.e1[i] * state.state_b[i] + scratch.e2[i];
-        }
-        // state_p = p_new
-        state.state_p.copy_from_slice(&scratch.p);
+        // Step 2 (post-state-update): ww = state_p + neg_exp_decay;
+        // p_new = max(ww, k); state_{a,b} updated; state_p = p_new.
+        // Fused, in-place over the state buffers.
+        tensor::time_mix_step2(
+            &att.neg_exp_time_decay[..h],
+            &scratch.k[..h],
+            &scratch.v[..h],
+            &mut state.state_p[..h],
+            &mut state.state_a[..h],
+            &mut state.state_b[..h],
+            &mut scratch.ww[..h],
+        );
 
         // rwkv = r * a / b
         for i in 0..h {
