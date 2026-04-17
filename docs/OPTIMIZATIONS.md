@@ -16,10 +16,22 @@ Covers both compress throughput and bits-per-byte ratio. Items with
 | — | NEON max_f32 (Pass 1 of cum_freqs) | ✅ Phase 12b | +11% compress, +13% decompress; new addition |
 | — | NEON sigmoid (safe form, vbslq select) | ✅ Phase 12c | +3-5% throughput; entropy bound exact |
 
-**Cumulative throughput gain on 1MB enwik6 (multi-core):**
-~32-66 KB/s baseline (high variance) → **~75 KB/s compress, ~80 KB/s
-decompress** (3-run mean, multi-core). Single-thread profile: forward
-177-204 µs/step, cum_freqs 25-29 µs/step (was ~80 µs).
+**Cumulative throughput gain on 1MB enwik6, clean system, 3-run mean:**
+
+| state | compress | decompress | scaling |
+|---|---:|---:|---:|
+| CLAUDE.md baseline (pre-Phase-12) | 131 KB/s | 128 KB/s | — |
+| Phase 12 (rayon=10, default) | **151 KB/s** | **157 KB/s** | +15% / +22% |
+| Single-thread | 20.1 KB/s | (n/m) | 7.5× MT scaling |
+
+Memory-bandwidth bound from 10 threads up — `RAYON_NUM_THREADS` 10/12/16/20
+all measure 151-152 KB/s, no benefit from oversubscription on a clean system.
+
+**Process noise:** the earlier `~32-80 KB/s` numbers in commit messages
+reflected concurrent Python workers (Phase 11 corpus retokenization,
+~10 processes pegging cores). Once those drained, the real numbers
+are 4-5× higher. The Phase 12 commits' improvement deltas are still
+correct in *relative* terms.
 
 **Ratio:** 0.1699 held, entropy bound 0.163723 exact match with Python
 L3TC reference (no model-side regression).
