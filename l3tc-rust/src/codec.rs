@@ -1449,23 +1449,24 @@ fn logits_to_cum_freqs_scratch(
     // hot loop vs the prior single-pass scalar version.
     let inv_sum = 1.0f32 / sum;
     let scale = inv_sum * PYTHON_FREQ_TOTAL as f32;
-    let freqs: &mut [u32] = freqs;
     tensor::quantize_exps_to_freqs(exps, scale, freqs);
 
+    // Plain `+=` instead of `saturating_add`: max achievable total
+    // is `PYTHON_FREQ_TOTAL + n ≈ 10M + 32K`, well below u64::MAX
+    // (1.8e19). The saturating variant compiled to extra cmp+csel
+    // per element on aarch64; the plain add is one instruction.
     cum[0] = 0;
     let mut total: u64 = 0;
     for i in 0..n {
-        total = total.saturating_add(freqs[i] as u64);
+        total += freqs[i] as u64;
         cum[i + 1] = total;
     }
 
     // Sanity: total must be ≤ MAX_TOTAL for the AC to accept it.
-    // With PYTHON_FREQ_TOTAL = 10M and n ≤ 32768, the max
-    // achievable total is ~10M + 32768 (every freq rounds up by 1
-    // and the max(1) clamp pushes near-zero freqs to 1). Both are
-    // far below MAX_TOTAL = 2^62, so this never triggers — but
-    // saturating_add + runtime check ensures safety even if the
-    // invariant is violated (e.g., corrupted model weights).
+    // With PYTHON_FREQ_TOTAL = 10M and n ≤ 32768, total is bounded
+    // by ~10M + 32K. MAX_TOTAL is 2^62, so this never triggers in
+    // practice — kept as a defensive check against corrupted model
+    // weights producing freqs outside the documented range.
     if total > MAX_TOTAL as u64 {
         uniform_fallback(n, cum);
     }
