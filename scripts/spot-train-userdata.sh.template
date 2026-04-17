@@ -1,9 +1,10 @@
 #!/bin/bash
-set -euo pipefail
+set -uo pipefail
 exec > /var/log/l3tc-train.log 2>&1
 
-# Placeholders replaced by launch-spot-train.sh:
-#   __GITHUB_PAT__, __RUN_ID__, __S3_RUN__, __TRAIN_ARGS__
+# NOTE: do not list placeholder names in comments — sed replaces them
+# globally and would leak secrets into logs. Placeholders are documented
+# in scripts/launch-spot-train.sh instead.
 
 echo "=== l3tc spot training ==="
 echo "run: __RUN_ID__"
