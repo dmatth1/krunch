@@ -397,6 +397,99 @@ impl<'a> BatchedSession<'a> {
     }
 }
 
+/// Compress a single tokenized segment through `BatchedSession`,
+/// returning the AC body bytes. The session is reset before
+/// processing.
+///
+/// **Backend interop note:** files compressed via `BatchedSession`
+/// are bit-identical only when decoded via `BatchedSession`. The
+/// FP arithmetic in the GPU forward pass diverges from CPU NEON by
+/// a few ULPs per layer, which can shift a few freq-table entries
+/// at borderline `round()` boundaries. Within a single backend the
+/// cum_freqs are deterministic so the AC stays in sync; across
+/// backends, the AC desyncs.
+///
+/// In other words: GPU encode → GPU decode works. CPU encode → CPU
+/// decode works. Mixed does not. The auto-routing layer in
+/// [`crate::backend::Backend::auto`] uses the same backend for both
+/// halves of a round trip on a given machine.
+pub fn compress_one_segment_batched(
+    session: &mut BatchedSession<'_>,
+    tokens: &[u32],
+) -> Result<Vec<u8>, crate::Error> {
+    use crate::arithmetic::ArithmeticEncoder;
+
+    session.reset();
+    if tokens.len() < 2 {
+        let mut buf = Vec::new();
+        let mut enc = ArithmeticEncoder::new(&mut buf);
+        enc.finish()?;
+        return Ok(buf);
+    }
+    let vocab = session.vocab;
+    let mut buf = Vec::with_capacity(tokens.len());
+    {
+        let mut enc = ArithmeticEncoder::new(&mut buf);
+        let mut prev = vec![tokens[0]; session.batch];
+        for i in 1..tokens.len() {
+            prev[0] = tokens[i - 1];
+            session.forward_batched(&prev);
+            session.cum_freqs_batched();
+            let mut cum = Vec::with_capacity(vocab + 1);
+            cum.push(0u64);
+            let mut total: u64 = 0;
+            for j in 0..vocab {
+                total += session.freqs[j] as u64;
+                cum.push(total);
+            }
+            enc.encode_symbol(&cum, tokens[i])?;
+        }
+        enc.finish()?;
+    }
+    Ok(buf)
+}
+
+/// Decompress one segment via `BatchedSession`. Inverse of
+/// [`compress_one_segment_batched`]. `n_tokens` includes the
+/// BOS-equivalent first token (which is supplied as `bos_token`
+/// since the file format itself doesn't ship it).
+pub fn decompress_one_segment_batched(
+    session: &mut BatchedSession<'_>,
+    ac_body: &[u8],
+    n_tokens: u32,
+    bos_token: u32,
+) -> Result<Vec<u32>, crate::Error> {
+    use crate::arithmetic::ArithmeticDecoder;
+
+    session.reset();
+    let mut tokens = Vec::with_capacity(n_tokens as usize);
+    tokens.push(bos_token);
+    if n_tokens <= 1 {
+        return Ok(tokens);
+    }
+
+    let mut dec = ArithmeticDecoder::new(ac_body)?;
+    let vocab = session.vocab;
+    let mut prev_batch = vec![bos_token; session.batch];
+    let mut prev = bos_token;
+    for _ in 1..n_tokens {
+        prev_batch[0] = prev;
+        session.forward_batched(&prev_batch);
+        session.cum_freqs_batched();
+        let mut cum = Vec::with_capacity(vocab + 1);
+        cum.push(0u64);
+        let mut total: u64 = 0;
+        for j in 0..vocab {
+            total += session.freqs[j] as u64;
+            cum.push(total);
+        }
+        let tok = dec.decode_symbol(&cum)?;
+        tokens.push(tok);
+        prev = tok;
+    }
+    Ok(tokens)
+}
+
 // CPU helpers for the small element-wise ops not yet on GPU.
 // For Phase 13e validation these are kept on CPU since per-call
 // they're cheap (96-element loops).
@@ -586,6 +679,71 @@ mod tests {
             max_total < 10_000,
             "per-lane cum_freqs total drift = {max_total} \
              (max single-element diff = {max_diff}) — too large"
+        );
+    }
+
+    /// End-to-end Phase 13e round-trip: compress AND decompress a
+    /// token sequence via BatchedSession (Metal). This is the
+    /// canonical correctness test for the within-backend invariant.
+    /// Cross-backend (GPU encode → CPU decode) does NOT round-trip
+    /// because the GPU forward pass diverges from CPU NEON by a
+    /// few ULPs — see compress_one_segment_batched docs.
+    #[test]
+    fn batched_round_trip_metal_self() {
+        let model_path = "checkpoints/l3tc_200k.bin";
+        if !std::path::Path::new(model_path).exists() {
+            return;
+        }
+        let mut ckpt = match Checkpoint::load(model_path) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let model = match Model::from_checkpoint(&mut ckpt) {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+
+        let tokens: Vec<u32> = (0..256)
+            .map(|t| ((t * 31 + 11) % model.vocab_size) as u32)
+            .collect();
+        let bos = tokens[0];
+
+        let mut bs = match BatchedSession::new(&model, 1) {
+            Ok(s) => s,
+            Err(MetalError::NoDevice) => return,
+            Err(other) => panic!("BatchedSession::new failed: {other}"),
+        };
+
+        // Encode.
+        let ac_bytes = compress_one_segment_batched(&mut bs, &tokens)
+            .expect("batched compress");
+
+        // Decode using the same backend (must reset state internally).
+        let decoded = decompress_one_segment_batched(
+            &mut bs,
+            &ac_bytes,
+            tokens.len() as u32,
+            bos,
+        )
+        .expect("batched decompress");
+
+        assert_eq!(decoded.len(), tokens.len(), "length mismatch");
+        let mut mismatches = 0usize;
+        for i in 0..tokens.len() {
+            if decoded[i] != tokens[i] {
+                mismatches += 1;
+                if mismatches <= 5 {
+                    eprintln!(
+                        "  mismatch at {}: encoded={}, decoded={}",
+                        i, tokens[i], decoded[i]
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            mismatches, 0,
+            "GPU encode → GPU decode round-trip failed: {mismatches}/{} tokens",
+            tokens.len()
         );
     }
 }
