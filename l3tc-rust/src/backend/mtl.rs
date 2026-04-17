@@ -1,7 +1,7 @@
 //! Metal backend — Phase 13.
 //!
-//! Currently contains only the smoke test. Phase 13c will add the
-//! head-matvec kernel; Phase 13d the rest of the forward pass.
+//! Smoke test (Phase 13b) + head matvec kernel (Phase 13c).
+//! Phase 13d will add the rest of the forward pass.
 
 use std::error::Error;
 use std::fmt;
@@ -168,6 +168,168 @@ fn commit_and_wait(cmd_buf: &CommandBufferRef) {
     cmd_buf.wait_until_completed();
 }
 
+// ===================================================================
+// Phase 13c: head matvec INT8 kernel
+// ===================================================================
+
+/// MSL kernel for the INT8 head matvec — `out[i] = sum_j (x[j] *
+/// scales[j] * qmat[j*rows + i])` where `qmat` is column-major and
+/// `i` is the output row, `j` indexes input columns.
+///
+/// One thread per output row. Adjacent threads read adjacent
+/// `qmat[j*rows + i]` entries, so the per-`j` read is fully
+/// coalesced (16 KB sequential per iteration on 16K vocab).
+const HEAD_MATVEC_KERNEL_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void head_matvec_int8(
+    device const char*  qmat   [[buffer(0)]],   // i8, column-major rows*cols
+    device const float* scales [[buffer(1)]],   // length cols
+    device const float* x      [[buffer(2)]],   // length cols
+    device float*       out    [[buffer(3)]],   // length rows
+    constant uint&      rows   [[buffer(4)]],
+    constant uint&      cols   [[buffer(5)]],
+    uint                i      [[thread_position_in_grid]]
+) {
+    if (i >= rows) return;
+    float acc = 0.0;
+    for (uint j = 0; j < cols; ++j) {
+        float xs = x[j] * scales[j];
+        acc = fma(xs, (float)qmat[j * rows + i], acc);
+    }
+    out[i] = acc;
+}
+"#;
+
+/// A reusable Metal pipeline for the head INT8 matvec, holding the
+/// model weights (qmat + per-column scales) once on the GPU. Per-token
+/// `forward` only uploads the small input vector and downloads the
+/// logits.
+///
+/// Equivalent CPU kernel: [`crate::tensor::matvec_col_major_int8`]
+/// (Phase 12d hand-tuned NEON).
+pub struct HeadKernelMetal {
+    queue: CommandQueue,
+    pipeline: ComputePipelineState,
+    qmat_buf: Buffer,
+    scales_buf: Buffer,
+    rows: usize,
+    cols: usize,
+}
+
+impl HeadKernelMetal {
+    /// Build the kernel and upload model weights to the GPU.
+    /// `qmat` must be column-major i8 of length `rows * cols`.
+    /// `scales` must be f32 of length `cols`.
+    pub fn new(qmat: &[i8], scales: &[f32], rows: usize, cols: usize) -> Result<Self, MetalError> {
+        assert_eq!(qmat.len(), rows * cols, "qmat shape");
+        assert_eq!(scales.len(), cols, "scales shape");
+        let device = Device::system_default().ok_or(MetalError::NoDevice)?;
+        let queue = device.new_command_queue();
+        let pipeline = build_head_pipeline(&device)?;
+        let qmat_buf = device.new_buffer_with_data(
+            qmat.as_ptr() as *const std::ffi::c_void,
+            std::mem::size_of_val(qmat) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let scales_buf = device.new_buffer_with_data(
+            scales.as_ptr() as *const std::ffi::c_void,
+            std::mem::size_of_val(scales) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        Ok(Self {
+            queue,
+            pipeline,
+            qmat_buf,
+            scales_buf,
+            rows,
+            cols,
+        })
+    }
+
+    /// One forward pass: upload `x`, dispatch the kernel, copy result
+    /// into `out`. Blocks until the GPU finishes.
+    ///
+    /// `x.len()` must equal `cols`; `out.len()` must equal `rows`.
+    pub fn forward(&self, x: &[f32], out: &mut [f32]) {
+        assert_eq!(x.len(), self.cols, "x shape");
+        assert_eq!(out.len(), self.rows, "out shape");
+
+        let device = self.queue.device();
+        let x_buf = device.new_buffer_with_data(
+            x.as_ptr() as *const std::ffi::c_void,
+            std::mem::size_of_val(x) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let out_buf = device.new_buffer(
+            (self.rows * std::mem::size_of::<f32>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        let rows_u32 = self.rows as u32;
+        let cols_u32 = self.cols as u32;
+
+        let cmd_buf = self.queue.new_command_buffer();
+        let encoder = cmd_buf.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&self.pipeline);
+        encoder.set_buffer(0, Some(&self.qmat_buf), 0);
+        encoder.set_buffer(1, Some(&self.scales_buf), 0);
+        encoder.set_buffer(2, Some(&x_buf), 0);
+        encoder.set_buffer(3, Some(&out_buf), 0);
+        encoder.set_bytes(
+            4,
+            std::mem::size_of::<u32>() as u64,
+            &rows_u32 as *const u32 as *const std::ffi::c_void,
+        );
+        encoder.set_bytes(
+            5,
+            std::mem::size_of::<u32>() as u64,
+            &cols_u32 as *const u32 as *const std::ffi::c_void,
+        );
+
+        let tg_width = self
+            .pipeline
+            .thread_execution_width()
+            .max(1)
+            .min(self.rows as u64);
+        encoder.dispatch_threads(
+            MTLSize {
+                width: self.rows as u64,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: tg_width,
+                height: 1,
+                depth: 1,
+            },
+        );
+        encoder.end_encoding();
+        commit_and_wait(cmd_buf);
+
+        // Copy back. On Apple Silicon's unified memory this is just a
+        // `memcpy` from the GPU-visible page — no PCIe transfer.
+        let out_ptr = out_buf.contents() as *const f32;
+        // SAFETY: out_buf was created with `rows * sizeof(f32)` bytes
+        // and the dispatch waited for completion before we read.
+        let src: &[f32] = unsafe { std::slice::from_raw_parts(out_ptr, self.rows) };
+        out.copy_from_slice(src);
+    }
+}
+
+fn build_head_pipeline(device: &Device) -> Result<ComputePipelineState, MetalError> {
+    let library = device
+        .new_library_with_source(HEAD_MATVEC_KERNEL_MSL, &metal::CompileOptions::new())
+        .map_err(MetalError::LibraryCompile)?;
+    let function = library
+        .get_function("head_matvec_int8", None)
+        .map_err(|e| MetalError::PipelineCreate(format!("{e:?}")))?;
+    device
+        .new_compute_pipeline_state_with_function(&function)
+        .map_err(MetalError::PipelineCreate)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,5 +355,80 @@ mod tests {
             Err(MetalError::NoDevice) => {}
             Err(other) => panic!("Metal smoke test failed: {other}"),
         }
+    }
+
+    /// Phase 13c: head matvec output on Metal must match the CPU
+    /// NEON path within FMA-rounding tolerance. Uses the same shape
+    /// as the L3TC-200K head (16384 × 96).
+    #[test]
+    fn head_matvec_metal_matches_cpu() {
+        use crate::tensor;
+
+        let rows: usize = 16384;
+        let cols: usize = 96;
+
+        // Deterministic synthetic weights — `qmat` spans the full i8
+        // range, `scales` in a realistic [1e-4, 1e-2] range like a
+        // quantized projection.
+        let mut qmat = vec![0i8; rows * cols];
+        for j in 0..cols {
+            for i in 0..rows {
+                qmat[j * rows + i] =
+                    (((i as i32 * 31 + j as i32 * 7) % 251) - 125) as i8;
+            }
+        }
+        let scales: Vec<f32> = (0..cols)
+            .map(|j| 1e-4 + (j as f32) * 1e-5)
+            .collect();
+        // Input vector with mixed magnitudes.
+        let x: Vec<f32> = (0..cols)
+            .map(|j| ((j as f32) - 48.0) * 0.05)
+            .collect();
+
+        // CPU reference (Phase 12d hand-tuned NEON).
+        let mut cpu_out = vec![0.0f32; rows];
+        tensor::matvec_col_major_int8(&qmat, &scales, &x, &mut cpu_out, rows, cols);
+
+        // Metal path.
+        let kernel = match HeadKernelMetal::new(&qmat, &scales, rows, cols) {
+            Ok(k) => k,
+            Err(MetalError::NoDevice) => return,
+            Err(other) => panic!("HeadKernelMetal::new failed: {other}"),
+        };
+        let mut gpu_out = vec![0.0f32; rows];
+        kernel.forward(&x, &mut gpu_out);
+
+        // Tolerance: f32 FMA reordering between CPU NEON and GPU
+        // produces small differences. Empirical rule of thumb is a
+        // few ULPs scaled by sum magnitude. Use a generous absolute
+        // tolerance — the freq-quantization downstream absorbs much
+        // larger differences. Compare to the CPU magnitude scale.
+        let mut max_abs = 0.0f32;
+        let mut max_rel = 0.0f32;
+        let mut max_idx = 0usize;
+        for i in 0..rows {
+            let abs = (cpu_out[i] - gpu_out[i]).abs();
+            let rel = abs / cpu_out[i].abs().max(1e-3);
+            if abs > max_abs {
+                max_abs = abs;
+                max_idx = i;
+            }
+            if rel > max_rel {
+                max_rel = rel;
+            }
+        }
+        // Reference range here is roughly [-50, 50]. Tolerance of
+        // ~5e-3 absolute / ~5e-4 relative is safely below the
+        // freq-quantization step of 0.5 (since round(p * 10M) is
+        // 0.5 / 10M ≈ 5e-8 in p-space, and these are pre-softmax
+        // logits of order 10).
+        assert!(
+            max_abs < 5e-3,
+            "head matvec CPU vs Metal max abs diff = {max_abs} \
+             (rel = {max_rel}) at index {max_idx} \
+             (cpu = {}, gpu = {})",
+            cpu_out[max_idx],
+            gpu_out[max_idx],
+        );
     }
 }
