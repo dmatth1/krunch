@@ -37,12 +37,31 @@ ORIG_ARGS="$TRAIN_ARGS"
 TRAIN_FILE=$(echo "$TRAIN_ARGS" | grep -oP '(?<=--train-file )\S+')
 if [[ "$TRAIN_FILE" == s3://* ]]; then
     LOCAL_TRAIN="data/train_data/$(basename $TRAIN_FILE)"
+    LOCAL_NPY="${LOCAL_TRAIN%.txt}.npy"
+    NPY_S3="${TRAIN_FILE%.txt}.npy"
     mkdir -p data/train_data
-    if [ ! -f "$LOCAL_TRAIN" ]; then
-        echo "downloading corpus: $TRAIN_FILE"
-        aws s3 cp "$TRAIN_FILE" "$LOCAL_TRAIN" --quiet
+
+    # Prefer prebuilt .npy cache from S3 (much faster than rebuilding).
+    # If .npy exists, download it + create placeholder .txt with old
+    # mtime so the training script's cache-freshness check uses the
+    # cache instead of rebuilding from the (missing) .txt file.
+    if aws s3 ls "$NPY_S3" >/dev/null 2>&1; then
+        if [ ! -f "$LOCAL_NPY" ]; then
+            echo "downloading prebuilt .npy cache: $NPY_S3"
+            aws s3 cp "$NPY_S3" "$LOCAL_NPY" --quiet
+        fi
+        echo "placeholder .txt for cache check"
+        echo "" > "$LOCAL_TRAIN"
+        touch -t 200001010000 "$LOCAL_TRAIN"
+        ls -lh "$LOCAL_TRAIN" "$LOCAL_NPY"
+    else
+        # Fallback: download .txt, training script will build cache
+        if [ ! -f "$LOCAL_TRAIN" ]; then
+            echo "downloading corpus (no prebuilt .npy): $TRAIN_FILE"
+            aws s3 cp "$TRAIN_FILE" "$LOCAL_TRAIN" --quiet
+        fi
+        ls -lh "$LOCAL_TRAIN"
     fi
-    ls -lh "$LOCAL_TRAIN"
     TRAIN_ARGS=$(echo "$TRAIN_ARGS" | sed "s|$TRAIN_FILE|$LOCAL_TRAIN|g")
     TRAIN_FILE="$LOCAL_TRAIN"
 fi
@@ -59,14 +78,26 @@ if [ -n "$TOK_S3" ]; then
     TRAIN_ARGS=$(echo "$TRAIN_ARGS" | sed "s|--tokenizer-s3 $TOK_S3||g")
 fi
 
-# Val split
-if [ -n "$TRAIN_FILE" ] && [ -f "$TRAIN_FILE" ]; then
-    VAL_FILE="data/val_data/val_$(basename $TRAIN_FILE)"
-    mkdir -p data/val_data
+# Val split: prefer prebuilt val.npy + val.txt from S3 if available
+mkdir -p data/val_data
+VAL_FILE="data/val_data/val_$(basename $TRAIN_FILE)"
+VAL_NPY="${VAL_FILE%.txt}.npy"
+VAL_S3_BASE="$(dirname $NPY_S3)/val_$(basename ${NPY_S3%.npy}).txt"
+VAL_S3_NPY="${VAL_S3_BASE%.txt}.npy"
+
+if aws s3 ls "$VAL_S3_NPY" >/dev/null 2>&1; then
+    aws s3 cp "$VAL_S3_NPY" "$VAL_NPY" --quiet
+    aws s3 cp "$VAL_S3_BASE" "$VAL_FILE" --quiet 2>/dev/null || echo "" > "$VAL_FILE"
+    touch -t 200001010000 "$VAL_FILE"
+    echo "val: prebuilt cache + small txt placeholder"
+elif [ -n "$TRAIN_FILE" ] && [ -f "$TRAIN_FILE" ] && [ -s "$TRAIN_FILE" ]; then
+    # Build val from end of train.txt (only works if train.txt has real content)
     if [ ! -f "$VAL_FILE" ]; then
         tail -n 100000 "$TRAIN_FILE" > "$VAL_FILE"
     fi
     echo "val: $(wc -l < $VAL_FILE) lines"
+else
+    echo "WARN: no val data available (no prebuilt val.npy on S3 and no train.txt content)"
 fi
 
 # Resume from S3 checkpoint if exists
