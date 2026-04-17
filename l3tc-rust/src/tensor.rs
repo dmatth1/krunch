@@ -202,10 +202,10 @@ unsafe fn matvec_96x96_neon(mat: &[f32], x: &[f32], out: &mut [f32]) {
 /// forward-pass throughput on the 200K hot path.
 #[inline(always)]
 pub fn matvec_square(mat: &[f32], x: &[f32], out: &mut [f32], n: usize) {
-    if n == 96 {
-        matvec_96x96(mat, x, out);
-    } else {
-        matvec(mat, x, out);
+    match n {
+        96 => matvec_96x96(mat, x, out),
+        256 => matvec_256x256(mat, x, out),
+        _ => matvec(mat, x, out),
     }
 }
 
@@ -236,6 +236,87 @@ pub fn matvec_96x96(mat: &[f32], x: &[f32], out: &mut [f32]) {
     #[cfg(not(target_arch = "aarch64"))]
     {
         matvec_scalar(mat, x, out, 96, 96);
+    }
+}
+
+/// Hand-tuned 256×256 matvec, dispatched from [`matvec_square`] for
+/// the L3TC-3.2M opt-in tier (hidden_size = 256).
+///
+/// Unlike the 96×96 kernel we can't preload all of `x` into registers
+/// (256 elements would need 64 NEON registers; aarch64 has 32). Instead
+/// the kernel streams `x` and the row together — `x` is 1 KB so it
+/// stays in L1, and the matrix row reads are sequential and prefetched.
+/// Four independent FMA accumulators per row break the reduction
+/// dependency so the inner 64-FMA loop pipelines without serialization.
+///
+/// Replaces the generic scalar matvec on the 256×256 attention
+/// projections (5 calls per layer × 3 layers = 15 calls per token on
+/// 3.2M). Phase 4d flagged this as a TODO; shipped here as Phase 12g.
+#[inline]
+pub fn matvec_256x256(mat: &[f32], x: &[f32], out: &mut [f32]) {
+    assert_eq!(mat.len(), 256 * 256, "matvec_256x256: mat must be 256x256");
+    assert_eq!(x.len(), 256, "matvec_256x256: x must be 256");
+    assert_eq!(out.len(), 256, "matvec_256x256: out must be 256");
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        #[allow(unsafe_code)]
+        unsafe {
+            matvec_256x256_neon(mat, x, out);
+        }
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        matvec_scalar(mat, x, out, 256, 256);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(unsafe_code)]
+unsafe fn matvec_256x256_neon(mat: &[f32], x: &[f32], out: &mut [f32]) {
+    use std::arch::aarch64::*;
+
+    let mat_p = mat.as_ptr();
+    let x_p = x.as_ptr();
+    let out_p = out.as_mut_ptr();
+
+    for i in 0..256usize {
+        let row = mat_p.add(i * 256);
+
+        let mut a0 = vdupq_n_f32(0.0);
+        let mut a1 = vdupq_n_f32(0.0);
+        let mut a2 = vdupq_n_f32(0.0);
+        let mut a3 = vdupq_n_f32(0.0);
+
+        // 64 chunks (64 * 4 = 256), interleaved across 4 accumulators
+        // for FMA pipelining. Inner stride of 16 elements per group of
+        // 4 FMAs keeps prefetcher happy.
+        let mut k = 0usize;
+        while k < 64 {
+            let off = k * 4;
+            a0 = vfmaq_f32(a0, vld1q_f32(row.add(off)), vld1q_f32(x_p.add(off)));
+            a1 = vfmaq_f32(
+                a1,
+                vld1q_f32(row.add(off + 4)),
+                vld1q_f32(x_p.add(off + 4)),
+            );
+            a2 = vfmaq_f32(
+                a2,
+                vld1q_f32(row.add(off + 8)),
+                vld1q_f32(x_p.add(off + 8)),
+            );
+            a3 = vfmaq_f32(
+                a3,
+                vld1q_f32(row.add(off + 12)),
+                vld1q_f32(x_p.add(off + 12)),
+            );
+            k += 4;
+        }
+
+        let acc = vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3));
+        *out_p.add(i) = vaddvq_f32(acc);
     }
 }
 
