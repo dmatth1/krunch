@@ -43,6 +43,17 @@ pub fn matvec(mat: &[f32], x: &[f32], out: &mut [f32]) {
         "matvec: mat shape mismatch (expected {rows}*{cols}, got {})",
         mat.len()
     );
+    // 3.2M FFN-shape fast paths. Both shapes fall through this
+    // dispatcher rather than matvec_square because the FFN is
+    // rectangular (intermediate_size != hidden_size).
+    if rows == 256 && cols == 512 {
+        matvec_256x512(mat, x, out);
+        return;
+    }
+    if rows == 512 && cols == 256 {
+        matvec_512x256(mat, x, out);
+        return;
+    }
     if rows >= MATVEC_BLAS_THRESHOLD {
         matvec_sgemm(mat, x, out, rows, cols);
     } else {
@@ -313,6 +324,113 @@ unsafe fn matvec_256x256_neon(mat: &[f32], x: &[f32], out: &mut [f32]) {
                 vld1q_f32(x_p.add(off + 12)),
             );
             k += 4;
+        }
+
+        let acc = vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3));
+        *out_p.add(i) = vaddvq_f32(acc);
+    }
+}
+
+/// Hand-tuned 256×512 matvec — 3.2M FFN value projection
+/// (`out[256] = mat[256,512] @ x[512]`). Replaces the generic
+/// scalar path which doesn't autovectorize tightly across 512
+/// cols.
+#[inline]
+pub fn matvec_256x512(mat: &[f32], x: &[f32], out: &mut [f32]) {
+    assert_eq!(mat.len(), 256 * 512, "matvec_256x512: mat must be 256x512");
+    assert_eq!(x.len(), 512, "matvec_256x512: x must be 512");
+    assert_eq!(out.len(), 256, "matvec_256x512: out must be 256");
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        #[allow(unsafe_code)]
+        unsafe {
+            matvec_rect_neon::<256, 512>(mat, x, out);
+        }
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        matvec_scalar(mat, x, out, 256, 512);
+    }
+}
+
+/// Hand-tuned 512×256 matvec — 3.2M FFN key projection
+/// (`out[512] = mat[512,256] @ x[256]`). Replaces sgemm at this
+/// shape; the 4-accumulator NEON kernel beats the BLAS fallback
+/// at this size because there's no batching to amortize sgemm's
+/// per-call setup.
+#[inline]
+pub fn matvec_512x256(mat: &[f32], x: &[f32], out: &mut [f32]) {
+    assert_eq!(mat.len(), 512 * 256, "matvec_512x256: mat must be 512x256");
+    assert_eq!(x.len(), 256, "matvec_512x256: x must be 256");
+    assert_eq!(out.len(), 512, "matvec_512x256: out must be 512");
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        #[allow(unsafe_code)]
+        unsafe {
+            matvec_rect_neon::<512, 256>(mat, x, out);
+        }
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        matvec_scalar(mat, x, out, 512, 256);
+    }
+}
+
+/// Generic NEON matvec for `(ROWS, COLS)` where COLS is a multiple
+/// of 16. Used by [`matvec_256x256`], [`matvec_256x512`],
+/// [`matvec_512x256`] via const-generic dispatch — LLVM specializes
+/// the inner loop for each instantiation, so the kernel is
+/// monomorphized per shape with no runtime overhead.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(unsafe_code)]
+unsafe fn matvec_rect_neon<const ROWS: usize, const COLS: usize>(
+    mat: &[f32],
+    x: &[f32],
+    out: &mut [f32],
+) {
+    use std::arch::aarch64::*;
+
+    let mat_p = mat.as_ptr();
+    let x_p = x.as_ptr();
+    let out_p = out.as_mut_ptr();
+
+    // 4 chunks of 4 = 16 elements per inner step. COLS must be a
+    // multiple of 16.
+    let n16 = COLS / 16;
+
+    for i in 0..ROWS {
+        let row = mat_p.add(i * COLS);
+
+        let mut a0 = vdupq_n_f32(0.0);
+        let mut a1 = vdupq_n_f32(0.0);
+        let mut a2 = vdupq_n_f32(0.0);
+        let mut a3 = vdupq_n_f32(0.0);
+
+        let mut k = 0usize;
+        while k < n16 {
+            let off = k * 16;
+            a0 = vfmaq_f32(a0, vld1q_f32(row.add(off)), vld1q_f32(x_p.add(off)));
+            a1 = vfmaq_f32(
+                a1,
+                vld1q_f32(row.add(off + 4)),
+                vld1q_f32(x_p.add(off + 4)),
+            );
+            a2 = vfmaq_f32(
+                a2,
+                vld1q_f32(row.add(off + 8)),
+                vld1q_f32(x_p.add(off + 8)),
+            );
+            a3 = vfmaq_f32(
+                a3,
+                vld1q_f32(row.add(off + 12)),
+                vld1q_f32(x_p.add(off + 12)),
+            );
+            k += 1;
         }
 
         let acc = vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3));
