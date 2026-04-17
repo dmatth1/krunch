@@ -15,14 +15,17 @@ Covers both compress throughput and bits-per-byte ratio. Items with
 | #6 | INT8 attention/FFN blocks | ⏭ skipped | matvec_96x96_neon already ~3.2 µs/token total (~2%), not worth ratio risk |
 | — | NEON max_f32 (Pass 1 of cum_freqs) | ✅ Phase 12b | +11% compress, +13% decompress; new addition |
 | — | NEON sigmoid (safe form, vbslq select) | ✅ Phase 12c | +3-5% throughput; entropy bound exact |
+| — | Hand-tuned NEON 16-wide INT8 head matvec | ✅ Phase 12d | +11% ST, +4-5% MT |
+| — | Fused time_mix step1+step2 NEON kernels | ✅ Phase 12e | +0.5% ST, +3-4% MT (cuts L1 round-trips) |
+| — | Chunk-skip in softmax Pass 2 (4-wide / 16-wide) | ❌ reverted | sub-noise; NEON polynomial too cheap to gate on max-then-branch |
 
-**Cumulative throughput gain on 1MB enwik6, clean system, 3-run mean:**
+**Cumulative throughput gain on 1MB enwik6, clean system, 3-5 run mean:**
 
-| state | compress | decompress | scaling |
+| state | compress | decompress | single-thread |
 |---|---:|---:|---:|
-| CLAUDE.md baseline (pre-Phase-12) | 131 KB/s | 128 KB/s | — |
-| Phase 12 (rayon=10, default) | **151 KB/s** | **157 KB/s** | +15% / +22% |
-| Single-thread | 20.1 KB/s | (n/m) | 7.5× MT scaling |
+| CLAUDE.md baseline (pre-Phase-12) | 131 KB/s | 128 KB/s | ~8 KB/s |
+| **Phase 12 cumulative (12a-e)** | **161 KB/s** | **171 KB/s** | **22.4 KB/s** |
+| **Speedup over baseline** | **+23%** | **+34%** | **+180%** |
 
 Memory-bandwidth bound from 10 threads up — `RAYON_NUM_THREADS` 10/12/16/20
 all measure 151-152 KB/s, no benefit from oversubscription on a clean system.
