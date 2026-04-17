@@ -203,9 +203,10 @@ kernel void head_matvec_int8(
 "#;
 
 /// A reusable Metal pipeline for the head INT8 matvec, holding the
-/// model weights (qmat + per-column scales) once on the GPU. Per-token
-/// `forward` only uploads the small input vector and downloads the
-/// logits.
+/// model weights (qmat + per-column scales) AND the I/O buffers
+/// (`x_buf`, `out_buf`) once at construction. Per-token `forward`
+/// just memcpys `x` into the existing buffer, dispatches, and reads
+/// `out_buf` directly — no per-call Metal allocations.
 ///
 /// Equivalent CPU kernel: [`crate::tensor::matvec_col_major_int8`]
 /// (Phase 12d hand-tuned NEON).
@@ -214,13 +215,17 @@ pub struct HeadKernelMetal {
     pipeline: ComputePipelineState,
     qmat_buf: Buffer,
     scales_buf: Buffer,
+    x_buf: Buffer,
+    out_buf: Buffer,
     rows: usize,
     cols: usize,
+    rows_u32: u32,
+    cols_u32: u32,
 }
 
 impl HeadKernelMetal {
-    /// Build the kernel and upload model weights to the GPU.
-    /// `qmat` must be column-major i8 of length `rows * cols`.
+    /// Build the kernel, upload model weights, and pre-allocate I/O
+    /// buffers. `qmat` must be column-major i8 of length `rows * cols`;
     /// `scales` must be f32 of length `cols`.
     pub fn new(qmat: &[i8], scales: &[f32], rows: usize, cols: usize) -> Result<Self, MetalError> {
         assert_eq!(qmat.len(), rows * cols, "qmat shape");
@@ -238,54 +243,60 @@ impl HeadKernelMetal {
             std::mem::size_of_val(scales) as u64,
             MTLResourceOptions::StorageModeShared,
         );
+        // Pre-allocated I/O buffers — reused across every forward()
+        // call. Per-call cost becomes a memcpy and a dispatch.
+        let x_buf = device.new_buffer(
+            (cols * std::mem::size_of::<f32>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let out_buf = device.new_buffer(
+            (rows * std::mem::size_of::<f32>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
         Ok(Self {
             queue,
             pipeline,
             qmat_buf,
             scales_buf,
+            x_buf,
+            out_buf,
             rows,
             cols,
+            rows_u32: rows as u32,
+            cols_u32: cols as u32,
         })
     }
 
-    /// One forward pass: upload `x`, dispatch the kernel, copy result
-    /// into `out`. Blocks until the GPU finishes.
-    ///
-    /// `x.len()` must equal `cols`; `out.len()` must equal `rows`.
+    /// One forward pass: copy `x` into the persistent input buffer,
+    /// dispatch the kernel, copy the persistent output buffer into
+    /// `out`. Blocks until the GPU finishes.
     pub fn forward(&self, x: &[f32], out: &mut [f32]) {
         assert_eq!(x.len(), self.cols, "x shape");
         assert_eq!(out.len(), self.rows, "out shape");
 
-        let device = self.queue.device();
-        let x_buf = device.new_buffer_with_data(
-            x.as_ptr() as *const std::ffi::c_void,
-            std::mem::size_of_val(x) as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
-        let out_buf = device.new_buffer(
-            (self.rows * std::mem::size_of::<f32>()) as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
-
-        let rows_u32 = self.rows as u32;
-        let cols_u32 = self.cols as u32;
+        // Copy x into the pre-allocated GPU-visible buffer.
+        // SAFETY: x_buf has cols*sizeof(f32) bytes, x has cols floats.
+        unsafe {
+            let dst = self.x_buf.contents() as *mut f32;
+            std::ptr::copy_nonoverlapping(x.as_ptr(), dst, self.cols);
+        }
 
         let cmd_buf = self.queue.new_command_buffer();
         let encoder = cmd_buf.new_compute_command_encoder();
         encoder.set_compute_pipeline_state(&self.pipeline);
         encoder.set_buffer(0, Some(&self.qmat_buf), 0);
         encoder.set_buffer(1, Some(&self.scales_buf), 0);
-        encoder.set_buffer(2, Some(&x_buf), 0);
-        encoder.set_buffer(3, Some(&out_buf), 0);
+        encoder.set_buffer(2, Some(&self.x_buf), 0);
+        encoder.set_buffer(3, Some(&self.out_buf), 0);
         encoder.set_bytes(
             4,
             std::mem::size_of::<u32>() as u64,
-            &rows_u32 as *const u32 as *const std::ffi::c_void,
+            &self.rows_u32 as *const u32 as *const std::ffi::c_void,
         );
         encoder.set_bytes(
             5,
             std::mem::size_of::<u32>() as u64,
-            &cols_u32 as *const u32 as *const std::ffi::c_void,
+            &self.cols_u32 as *const u32 as *const std::ffi::c_void,
         );
 
         let tg_width = self
@@ -308,13 +319,12 @@ impl HeadKernelMetal {
         encoder.end_encoding();
         commit_and_wait(cmd_buf);
 
-        // Copy back. On Apple Silicon's unified memory this is just a
-        // `memcpy` from the GPU-visible page — no PCIe transfer.
-        let out_ptr = out_buf.contents() as *const f32;
-        // SAFETY: out_buf was created with `rows * sizeof(f32)` bytes
-        // and the dispatch waited for completion before we read.
-        let src: &[f32] = unsafe { std::slice::from_raw_parts(out_ptr, self.rows) };
-        out.copy_from_slice(src);
+        // Read the persistent output buffer.
+        // SAFETY: out_buf has rows*sizeof(f32), GPU has finished.
+        unsafe {
+            let src = self.out_buf.contents() as *const f32;
+            std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), self.rows);
+        }
     }
 }
 

@@ -167,14 +167,15 @@ Measured single-call latency (16384 × 96, MacBook M-series,
 
 | backend | per-call | speedup vs CPU |
 |---|---:|---:|
-| CPU NEON (Phase 12d) | **115 µs** | 1.00× |
-| Metal GPU (Phase 13c) | **343 µs** | **0.33× (3× SLOWER)** |
+| CPU NEON (Phase 12d) | **113 µs** | 1.00× |
+| Metal GPU (12c, per-call alloc) | 343 µs | 0.33× |
+| Metal GPU (12c, pre-allocated buffers) | **269 µs** | **0.42×** |
 
-This is exactly the predicted batch=1 behaviour. The Metal kernel
-itself does 1.5 M FMA ops in ~340 µs ≈ 4.4 GFLOPs — about 0.1% of
-the M-series GPU's 5+ TFLOPs of available compute. Almost all of
-that 343 µs is **kernel launch + buffer-binding overhead**, not
-arithmetic.
+This is the predicted batch=1 behaviour. The kernel itself does 1.5 M
+FMA ops in single-digit µs (~0.1% of the M-series GPU's 5+ TFLOPs).
+The remaining 250+ µs is kernel launch + encoder setup + the
+`wait_until_completed` sync — none of which can be avoided when each
+token's prediction blocks on the previous.
 
 The path forward isn't tuning this kernel — it's **batching**
 (Phase 13e). At batch=512 the same dispatch cost amortizes across
