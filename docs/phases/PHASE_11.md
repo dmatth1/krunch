@@ -1,14 +1,21 @@
-# Phase 11 — Universal text + structured-data compression
+# Phase 11 — Universal text + structured-data compression (CLOSED)
 
 **Goal:** train a model that compresses all text and structured
 data types (prose, code, JSON, logs, CSV, XML) competitively
 with classical compressors, while keeping the speed advantage
 that motivated the original L3TC port.
 
-**Status as of 2026-04-16:** corpus re-tokenized with balanced
-unigram 32K, **13.75B tokens / 51 GB** in 60 parts. Uploading
-to S3 (~45 min at 20 MiB/s). Then launch 2L × 96H × 32K
-training on g5.xlarge.
+**Status (2026-04-17):** **closed as failed.** A single 200K-
+param transformer cannot generalize across domains without
+losing both ratio AND speed. Approach pivoted to **Phase 14
+(Mixture of Specialists)** — see `docs/phases/PHASE_14.md`.
+
+**Final outcome of the 2L × 32K balanced unigram run** (the
+last attempt at a single generalist):
+- Killed at epoch 8 of 30 after eval results showed it was
+  tracking strictly worse than both L3TC-200K (on prose) and
+  Exp D 6L (on every other domain).
+- See "Closing notes" section at the bottom for the full data.
 
 ---
 
@@ -342,3 +349,101 @@ All tokenizable from raw sources if needed.
   - `retokenize_corpus.py` — parallel re-tokenization
   - `build_eval_suite.py` / `run_eval_suite.py` — eval
   - `launch-spot-train.sh` / `launch-ondemand.sh` — cloud
+
+---
+
+## Closing notes (2026-04-17): why the generalist approach failed
+
+### The 2L × 32K balanced unigram run — what we measured
+
+The final Phase 11 experiment was 2L × 96H × vocab 32K with the
+balanced unigram tokenizer, trained on the 51 GB diverse corpus.
+Killed at epoch 8 of 30 (~28% of planned training). Mid-run eval
+on the standard 9-domain suite:
+
+| domain | L3TC-200K (Wiki specialist, 16K vocab) | Exp D 6L 32K (generalist) | **2L 32K @ epoch 8** | speed (2L) |
+|---|---:|---:|---:|---:|
+| enwik6 (Wikipedia) | **0.170** | 0.335 | 0.400 | 56 KB/s |
+| fiction | 0.416 | 0.407 | 0.578 | 36 KB/s |
+| python_source | 0.473 | **0.354** | 0.865 | 24 KB/s |
+| c_source | 0.554 | 0.613 | 0.871 | 8 KB/s |
+| html | 1.001 | 1.001 | 1.001 | n/a |
+
+Eval bits/token across epochs (geometric decay):
+
+```
+8.38 → 8.04 → 7.87 → 7.77 → 7.69 → 7.64 → 7.60 → 7.57
+deltas: -0.34, -0.17, -0.10, -0.08, -0.05, -0.04, -0.03
+```
+
+Asymptote projected at ~7.0-7.3 bpt by epoch 30 — translates to
+roughly 0.32-0.36 ratio on enwik6 (worse than Exp D, far worse
+than L3TC-200K) and 0.55-0.65 on python_source (still worse than
+Exp D's 0.354).
+
+### Why it failed (root cause)
+
+Two compounding problems pulled in opposite directions:
+
+1. **Capacity ceiling on a 200K-param transformer.** Splitting
+   200K params across 5+ domains gives ~40K effective params per
+   domain — too thin to model anything well. The model couldn't
+   reach L3TC-200K's prose floor (~3.34 nats/token) because it
+   was also trying to model code, JSON, logs, CSV, etc.
+
+2. **32K vocab cost speed for marginal gains.** We chose 32K to
+   help structured text (Pile BPE 32K → balanced unigram 32K
+   gave +81% B/T on Python). But the head matvec scales with
+   vocab size, so per-token compute doubled. On Wikipedia where
+   B/T was already ~3.5, we got no compensating reduction in
+   per-byte work — net result: 56 KB/s vs L3TC-200K's 130 KB/s
+   on the same 1 MB enwik6.
+
+The combination meant the 2L generalist couldn't beat L3TC-200K
+on its specialty (prose) AND couldn't match Exp D on the
+specialties Exp D was designed for. Strictly worse than both
+predecessors on all domains. Continuing the run wouldn't have
+changed the conclusion — the geometric decay made it clear by
+epoch 8 that no amount of additional training would close the
+capacity gap.
+
+### What we kept from Phase 11 (carries to Phase 14)
+
+- **51 GB diverse, deduplicated corpus** — the source data is good;
+  just needs to be split per-domain for specialists instead of fed
+  to one model.
+- **Parallel re-tokenization pipeline** (`scripts/retokenize_corpus.py`)
+  — works for any tokenizer + corpus combo; will be used per
+  specialist.
+- **Cloud training infrastructure** — spot fleet launcher with
+  `.npy` cache pull from S3, cron-based S3 sync, auto-shutdown,
+  AMI bake gotchas documented. All transferable.
+- **Eval suite** (`scripts/run_eval_suite.py`) — works as-is for
+  per-specialist validation.
+- **Lessons** — the "Lessons from the 2L launch" section above
+  documents the at-job race, userdata sed-leak gotcha, cache-
+  build memory blow-up, etc. These all stand for any future
+  training run.
+
+### What we learned about model architecture (drives Phase 14)
+
+| dimension | takeaway |
+|---|---|
+| Single small model, single domain | works great (L3TC-200K original, 0.17 on Wiki) |
+| Single small model, broad domains | fails — capacity too thin (Phase 11 final run) |
+| Single big model, broad domains | works on ratio but loses speed (Exp D 6L, 49 KB/s) |
+| Many small models (one per domain) | **proposed Phase 14 — best of all worlds in theory** |
+| Wider tokenizer (32K vs 16K) | only useful when paired with enough capacity to leverage it |
+
+### Status of Phase 11 artifacts on S3
+
+| path | size | keep or delete? |
+|---|---|---|
+| `l3tc/corpora/train_2l_corpus_balanced_32k.txt` | 51 GB | **keep** (Phase 14 specialists will re-slice) |
+| `l3tc/corpora/train_2l_corpus_balanced_32k.npy` | 55 GB | **delete** — Phase 14 builds new caches per specialist |
+| `l3tc/corpora/val_train_2l_corpus_balanced_32k.{txt,npy}` | small | **delete** — same reason |
+| `l3tc/corpora/tokenizer_balanced_32k/*` | small | **keep** — useful as fallback specialist tokenizer |
+| `l3tc/exp_2l_balanced_32k/` (checkpoints, log) | ~100 MB | **delete** — failed run, no model artifact value |
+| All earlier Phase 11 checkpoints (`phase11_pass2/`, etc.) | small | already cleaned up earlier |
+
+Cleanup will happen at start of Phase 14 work.
