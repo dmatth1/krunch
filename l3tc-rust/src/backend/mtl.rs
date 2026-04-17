@@ -934,6 +934,155 @@ fn build_sub_exp_pipeline(device: &Device) -> Result<ComputePipelineState, Metal
         .map_err(MetalError::PipelineCreate)
 }
 
+// ===================================================================
+// Phase 13e prep: batched sigmoid (safe -|x| form matching CPU
+// Phase 12c). Used 1x per layer in both time_mix and channel_mix
+// for the receptance gate.
+// ===================================================================
+
+const SIGMOID_KERNEL_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+// Same polynomial exp as sub_exp_batched (clamped to [-50, 0] for
+// safety; sigmoid feeds it -|x| so the polynomial argument is
+// always ≤ 0).
+static inline float poly_exp(float x) {
+    x = fmax(x, -50.0f);
+    float y = x * 1.442695041f;
+    float k = floor(y);
+    float r = y - k;
+    float p = 0.000154035303933f;
+    p = fma(p, r, 0.001333355814643f);
+    p = fma(p, r, 0.009618129107628f);
+    p = fma(p, r, 0.055504108664821f);
+    p = fma(p, r, 0.240226506959101f);
+    p = fma(p, r, 0.693147180559945f);
+    p = fma(p, r, 1.0f);
+    int  ki = int(k);
+    int  exp_bits = (ki + 127) << 23;
+    float two_k = as_type<float>(exp_bits);
+    return p * two_k;
+}
+
+// Sigmoid via the safe -|x| form, matching CPU Phase 12c. For
+// x >= 0:  sig(x) = 1 / (1 + e^-x)            = 1 / (1 + e_negabs)
+// For x < 0:   sig(x) = e^x / (1 + e^x)       = e_negabs / (1 + e_negabs)
+// Branchless via select(): polynomial argument stays ≤ 0.
+kernel void sigmoid_batched(
+    device const float* x     [[buffer(0)]],
+    device float*       out   [[buffer(1)]],
+    constant uint&      h     [[buffer(2)]],
+    constant uint&      batch [[buffer(3)]],
+    uint2               gid   [[thread_position_in_grid]]
+) {
+    uint i  = gid.x;
+    uint bb = gid.y;
+    if (i >= h || bb >= batch) return;
+    uint k = bb * h + i;
+    float v = x[k];
+    float e = poly_exp(-fabs(v));
+    float denom = 1.0f + e;
+    float pos_form = 1.0f / denom;
+    float neg_form = e / denom;
+    out[k] = (v >= 0.0f) ? pos_form : neg_form;
+}
+"#;
+
+/// Reusable batched sigmoid kernel (safe `-|x|` form).
+///
+/// CPU equivalent: [`crate::tensor::sigmoid_inplace`] (Phase 12c).
+pub struct SigmoidKernelMetal {
+    queue: CommandQueue,
+    pipeline: ComputePipelineState,
+    h: usize,
+    h_u32: u32,
+}
+
+impl SigmoidKernelMetal {
+    /// Build the kernel. Stateless.
+    pub fn new(h: usize) -> Result<Self, MetalError> {
+        let device = Device::system_default().ok_or(MetalError::NoDevice)?;
+        let queue = device.new_command_queue();
+        let pipeline = build_sigmoid_pipeline(&device)?;
+        Ok(Self {
+            queue,
+            pipeline,
+            h,
+            h_u32: h as u32,
+        })
+    }
+
+    /// Compute `out[b, i] = sigmoid(x[b, i])` for every `(b, i)`.
+    pub fn forward_batched(&self, x: &[f32], out: &mut [f32], batch: usize) {
+        assert_eq!(x.len(), batch * self.h);
+        assert_eq!(out.len(), batch * self.h);
+
+        let device = self.queue.device();
+        let n_bytes = (batch * self.h * std::mem::size_of::<f32>()) as u64;
+        let x_buf = device.new_buffer_with_data(
+            x.as_ptr() as *const std::ffi::c_void,
+            n_bytes,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let out_buf = device.new_buffer(n_bytes, MTLResourceOptions::StorageModeShared);
+        let batch_u32 = batch as u32;
+
+        let cmd_buf = self.queue.new_command_buffer();
+        let encoder = cmd_buf.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&self.pipeline);
+        encoder.set_buffer(0, Some(&x_buf), 0);
+        encoder.set_buffer(1, Some(&out_buf), 0);
+        encoder.set_bytes(
+            2,
+            std::mem::size_of::<u32>() as u64,
+            &self.h_u32 as *const u32 as *const std::ffi::c_void,
+        );
+        encoder.set_bytes(
+            3,
+            std::mem::size_of::<u32>() as u64,
+            &batch_u32 as *const u32 as *const std::ffi::c_void,
+        );
+
+        let tg_width = self
+            .pipeline
+            .thread_execution_width()
+            .max(1)
+            .min(self.h as u64);
+        encoder.dispatch_threads(
+            MTLSize {
+                width: self.h as u64,
+                height: batch as u64,
+                depth: 1,
+            },
+            MTLSize {
+                width: tg_width,
+                height: 1,
+                depth: 1,
+            },
+        );
+        encoder.end_encoding();
+        commit_and_wait(cmd_buf);
+
+        unsafe {
+            let src = out_buf.contents() as *const f32;
+            std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), batch * self.h);
+        }
+    }
+}
+
+fn build_sigmoid_pipeline(device: &Device) -> Result<ComputePipelineState, MetalError> {
+    let library = device
+        .new_library_with_source(SIGMOID_KERNEL_MSL, &metal::CompileOptions::new())
+        .map_err(MetalError::LibraryCompile)?;
+    let function = library
+        .get_function("sigmoid_batched", None)
+        .map_err(|e| MetalError::PipelineCreate(format!("sigmoid_batched: {e:?}")))?;
+    device
+        .new_compute_pipeline_state_with_function(&function)
+        .map_err(MetalError::PipelineCreate)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1230,6 +1379,58 @@ mod tests {
         assert!(
             max_rel < 5e-5,
             "sub_exp CPU vs Metal max relative error = {max_rel} at {max_idx} \
+             (cpu = {}, gpu = {})",
+            cpu_out[max_idx],
+            gpu_out[max_idx],
+        );
+    }
+
+    /// Phase 13e prep: batched sigmoid on Metal must match the CPU
+    /// NEON safe-form (Phase 12c) within FMA-rounding tolerance.
+    #[test]
+    fn sigmoid_batched_metal_matches_cpu() {
+        use crate::tensor;
+
+        let h: usize = 96;
+        let batch: usize = 32;
+
+        // Cover positive AND negative inputs (the safe -|x| form
+        // matters most for x > 0).
+        let mut x = vec![0.0f32; batch * h];
+        for bi in 0..batch {
+            for i in 0..h {
+                x[bi * h + i] = ((i as f32 - 48.0) * 0.5) + (bi as f32 * 0.05);
+            }
+        }
+
+        // CPU reference: in-place sigmoid per lane.
+        let mut cpu_out = x.clone();
+        for bi in 0..batch {
+            tensor::sigmoid_inplace(&mut cpu_out[bi * h..(bi + 1) * h]);
+        }
+
+        let kernel = match SigmoidKernelMetal::new(h) {
+            Ok(k) => k,
+            Err(MetalError::NoDevice) => return,
+            Err(other) => panic!("SigmoidKernelMetal::new failed: {other}"),
+        };
+        let mut gpu_out = vec![0.0f32; batch * h];
+        kernel.forward_batched(&x, &mut gpu_out, batch);
+
+        let mut max_abs = 0.0f32;
+        let mut max_idx = 0usize;
+        for i in 0..(batch * h) {
+            let d = (cpu_out[i] - gpu_out[i]).abs();
+            if d > max_abs {
+                max_abs = d;
+                max_idx = i;
+            }
+        }
+        // Sigmoid output is in [0, 1]; absolute error budget is
+        // tighter than sub_exp (no large dynamic range).
+        assert!(
+            max_abs < 1e-5,
+            "sigmoid CPU vs Metal max abs diff = {max_abs} at {max_idx} \
              (cpu = {}, gpu = {})",
             cpu_out[max_idx],
             gpu_out[max_idx],
