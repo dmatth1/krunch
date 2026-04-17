@@ -17,7 +17,11 @@ Covers both compress throughput and bits-per-byte ratio. Items with
 | — | NEON sigmoid (safe form, vbslq select) | ✅ Phase 12c | +3-5% throughput; entropy bound exact |
 | — | Hand-tuned NEON 16-wide INT8 head matvec | ✅ Phase 12d | +11% ST, +4-5% MT |
 | — | Fused time_mix step1+step2 NEON kernels | ✅ Phase 12e | +0.5% ST, +3-4% MT (cuts L1 round-trips) |
+| — | NEON layer_norm + fat LTO | ✅ Phase 12f | -1 µs/step on forward; sub-noise but ratio-neutral |
 | — | Chunk-skip in softmax Pass 2 (4-wide / 16-wide) | ❌ reverted | sub-noise; NEON polynomial too cheap to gate on max-then-branch |
+| — | INT8 embedding row lookup | ⏭ skipped | 1 row/token × 96 f32 = 384 bytes at L2 latency = ~50ns total; INT8 saves ~30ns (~0.07% throughput) |
+| — | Top-K cum_freqs via quickselect | ⏭ skipped | finding K-th largest costs ~50-150 µs vs ~12 µs Pass-2 polynomial — net loss |
+| — | rANS replacing Nayuki AC | ⏭ skipped | measured ST decompress (23.6 KB/s) > ST compress (22.5 KB/s); AC decode is already essentially free after Phase 12a binary search |
 
 **Cumulative throughput gain on 1MB enwik6, clean system, 3-5 run mean:**
 
