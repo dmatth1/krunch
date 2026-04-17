@@ -361,6 +361,14 @@ impl<'a> BatchedSession<'a> {
         self.glue.encode_copy(cmd_buf, &self.normed_buf, &self.x_buf, bh);
 
         // 3. Per-layer block.
+        //
+        // Phase 13k: eliminate the two `residual = x` copies per layer.
+        // Since time_mix and channel_mix only read `normed` (produced
+        // by ln1/ln2) and per-lane state buffers — neither touches
+        // `x` — we can leave `x` alone and just add `rwkv` and
+        // `ffn_out` into it in-place after each block. That drops 4
+        // elementwise encoders per token (2 per layer) without any
+        // correctness change.
         for layer in 0..self.model.num_layers() {
             // short = short_weight @ x; relu(short)
             self.layers[layer]
@@ -368,27 +376,18 @@ impl<'a> BatchedSession<'a> {
                 .encode_into(cmd_buf, &self.x_buf, &self.short_buf, batch_u);
             self.glue.encode_relu_inplace(cmd_buf, &self.short_buf, bh);
 
-            // residual = x
-            self.glue.encode_copy(cmd_buf, &self.x_buf, &self.residual_buf, bh);
-
-            // ln1: x → normed
+            // ln1: x → normed (x preserved so we can add rwkv into it)
             self.layers[layer]
                 .ln1
                 .encode_into(cmd_buf, &self.x_buf, &self.normed_buf, batch_u);
 
             // time_mix: produces rwkv, updates state_x/a/b/p.
+            // Reads only `normed` + state — `x` is safe to keep.
             self.encode_time_mix(cmd_buf, layer);
 
-            // x = residual + rwkv
-            self.glue.encode_add(
-                cmd_buf,
-                &self.residual_buf,
-                &self.rwkv_buf,
-                &self.x_buf,
-                bh,
-            );
-            // residual = x
-            self.glue.encode_copy(cmd_buf, &self.x_buf, &self.residual_buf, bh);
+            // x += rwkv (residual connection)
+            self.glue
+                .encode_add_inplace(cmd_buf, &self.x_buf, &self.rwkv_buf, bh);
 
             // ln2: x → normed
             self.layers[layer]
@@ -396,17 +395,12 @@ impl<'a> BatchedSession<'a> {
                 .encode_into(cmd_buf, &self.x_buf, &self.normed_buf, batch_u);
 
             // channel_mix: produces ffn_out, updates state_ffn.
+            // Reads only `normed` + state_ffn — `x` is safe to keep.
             self.encode_channel_mix(cmd_buf, layer);
 
-            // x = residual + ffn_out
-            self.glue.encode_add(
-                cmd_buf,
-                &self.residual_buf,
-                &self.ffn_out_buf,
-                &self.x_buf,
-                bh,
-            );
-            // x += short
+            // x += ffn_out; x += short
+            self.glue
+                .encode_add_inplace(cmd_buf, &self.x_buf, &self.ffn_out_buf, bh);
             self.glue
                 .encode_add_inplace(cmd_buf, &self.x_buf, &self.short_buf, bh);
         }
@@ -520,21 +514,20 @@ impl<'a> BatchedSession<'a> {
             self.batch,
         );
 
-        // rwkv = r * a / b
+        // Phase 13k: write r*a/b into out_proj (rather than rwkv),
+        // then run the output projection reading from out_proj and
+        // writing to rwkv. Saves the extra copy that used to exist
+        // to shuffle att_output's output back into rwkv.
         self.glue.encode_mul_div(
             cmd_buf,
             &self.r_buf,
             &self.a_buf,
             &self.b_buf,
-            &self.rwkv_buf,
+            &self.out_proj_buf,
             bh,
         );
-
-        // Output projection into out_proj; copy back into rwkv.
         lk.att_output
-            .encode_into(cmd_buf, &self.rwkv_buf, &self.out_proj_buf, self.batch);
-        self.glue
-            .encode_copy(cmd_buf, &self.out_proj_buf, &self.rwkv_buf, bh);
+            .encode_into(cmd_buf, &self.out_proj_buf, &self.rwkv_buf, self.batch);
     }
 
     fn encode_channel_mix(&self, cmd_buf: &metal::CommandBufferRef, layer: usize) {
