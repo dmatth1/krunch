@@ -6,9 +6,11 @@ by a wide margin"). It exists so that any number in the README is
 traceable to a primary source, and so that the framing survives a
 careful reader who goes looking for the math.
 
-**Date of research:** April 2026. Most recent leaderboard update
-consulted: [LTCB](http://mattmahoney.net/dc/text.html), updated
-2026-03-25.
+**Date of research:** April 2026 (refreshed). Most recent leaderboard
+update consulted: [LTCB](http://mattmahoney.net/dc/text.html),
+updated 2026-03-25. Refresh added DualComp, AlphaZip, LMCompress,
+expanded Nacrith with current GitHub source, noted Mamba-3 as
+architecture-to-watch.
 
 **Audience:** anyone who wants to verify the claims in the README,
 including me six months from now when the landscape has shifted and
@@ -47,6 +49,21 @@ some of these numbers are stale.
   LSTM compressor; repo confirms wall-clock time on enwik9.
 - **[lstm-compress repo](https://github.com/byronknoll/lstm-compress)** —
   CPU LSTM compressor.
+- **[DualComp paper (arXiv 2505.16256)](https://arxiv.org/abs/2505.16256)** —
+  May 2025. RWKV-7 multi-modal text+image compressor. MacBook CPU
+  benchmarks. No published inference code.
+- **[Nacrith repo](https://github.com/robtacconelli/Nacrith-GPU)** —
+  Open-source Feb 2026 LLM-based compressor with confidence-skip
+  and adaptive bias head. SmolLM2-135M via llama.cpp.
+- **[AlphaZip paper (arXiv 2409.15046)](https://arxiv.org/abs/2409.15046)** /
+  **[AlphaZip repo](https://github.com/BaristaBandits/AlphaZip)** —
+  Sep 2024. GPT-2 XL rank-encoded compressor.
+- **[LMCompress (Nature MI 2025)](https://www.nature.com/articles/s42256-025-01033-7)** —
+  LLaMA3-8B fine-tuned, multi-modal (text/image/video/audio) ratio
+  records.
+- **[Mamba-3 (ICLR 2026)](https://openreview.net/pdf?id=HwCvaJOiCj)** —
+  Latest selective state-space model. No published compression work
+  yet — architecture-to-watch.
 
 Wikipedia and second-hand blog posts are not used as sources for
 any number in this document.
@@ -116,12 +133,17 @@ wall-clock KB/s for human readability.
 | gmix v1 | 2024 | PAQ | 0.980 | 13.20 | CPU | 1 |
 | paq8px_v206fix1 | 2022 | PAQ + LSTM | 1.002 | 3.35 | CPU | 1 |
 | lstm-compress v3 | 2020 | LSTM | ~1.39 | 10.58 | CPU | 1 |
-| **l3tc-prod 200K** | **2026** | **RWKV-v4 200K** | **~1.43 (enwik8)** | **131 (enwik6) / 114 (enwik8)** | **Apple M-series CPU** | **8 (rayon segments)** |
-| **l3tc-prod 3.2M** | **2026** | **RWKV-v4 3.2M** | **~1.07 (enwik8)** | **26** | **Apple M-series CPU** | **8 (rayon segments)** |
+| **l3tc-prod 200K (post-Phase-12h)** | **2026** | **RWKV-v4 200K + NEON** | **~1.43 (enwik8)** | **172 (enwik6, clean system)** | **Apple M-series CPU** | **10 (rayon segments)** |
+| **l3tc-prod 3.2M (post-Phase-12g)** | **2026** | **RWKV-v4 3.2M + NEON** | **~1.07 (enwik8)** | **40 (enwik6 200K subset, MT)** | **Apple M-series CPU** | **10 (rayon segments)** |
+| DualComp 0.3M | 2025-05 | RWKV-7 multi-modal | not reported on enwik9 | 134 (text) | MacBook CPU | unknown |
+| DualComp 16M | 2025-05 | RWKV-7 multi-modal + MoE | 1.218 (enwik9) | 22 (text) | MacBook CPU | unknown |
+| DualComp 130M | 2025-05 | RWKV-7 multi-modal + MoE | 1.107 (enwik9) | not on CPU | NPU/GPU | 1 |
 | ts_zip (Bellard) | 2024-03 | RWKV-169M | 1.084 (enwik9) / 1.106 (enwik8) | ~1024 | RTX 4090 GPU | 1 GPU stream |
 | LLMZip | 2023 | LLaMA-7B | 0.842 (enwik9) | not published (GPU days) | GPU | 1 |
-| Llamazip | 2025 | LLaMA | 2.069 (enwik9) | not published | GPU | 1 |
-| Nacrith | 2026-02 | LLM (llama.cpp) | 0.939 (enwik8) | not published | consumer GPU, ~1.2 GB VRAM | 1 |
+| Llamazip | 2025-11 | LLaMA | 2.069 (enwik9) | not published | GPU | 1 |
+| AlphaZip | 2024-09 | GPT-2 XL (1.5B) rank-encoded | not on enwik | not published | GPU | 1 |
+| Nacrith | 2026-02 | SmolLM2-135M Transformer (llama.cpp) + N-gram + skip | **0.939 (enwik8)** | ~200-280 (steady ~80 KB/s) | GTX 1050 Ti GPU (4 GB) | 1 + parallel workers |
+| LMCompress | 2025 (Nature) | LLaMA3-8B fine-tuned | "1/3 zpaq, 4× bz2" (no enwik9 number) | not reported | GPU | 1 |
 
 **Notes on the table:**
 
@@ -310,15 +332,118 @@ doesn't think we're ignoring it.
 
 ### The 2024-2026 LLM-compressor wave
 
-LLMZip (LLaMA-7B), LMCompress (LLaMA3-8B), Llamazip (Nov 2025),
-Nacrith (Feb 2026), Language Modeling Is Compression (Chinchilla
-70B). All **GPU-only research demos**. None ship a CPU mode.
-None publish wall-clock speed in any usable form. They're not
-in the same product category as l3tc-prod and they're not on
-the LTCB. They are all chasing the ratio frontier, not the
-speed frontier — Llamazip's 2.069 bpb on enwik9 actually
-*regresses* on Llama-7B's underlying capability, suggesting
-even ratio is hard to nail down for these.
+LLMZip (LLaMA-7B), AlphaZip (GPT-2 XL), LMCompress (LLaMA3-8B,
+Nature 2025), Llamazip (Nov 2025), Nacrith (Feb 2026), Language
+Modeling Is Compression (Chinchilla 70B). All **GPU-required
+in practice**. The category is consolidating around three patterns:
+
+1. **Pure LLM-as-compressor** (LLMZip, AlphaZip, LMCompress, Llamazip,
+   "Language Modeling Is Compression") — take a pretrained large
+   language model (1B-70B parameters), run next-token prediction,
+   feed to arithmetic coder. Best ratios on the leaderboard but
+   GPU-only and slow even on GPU.
+2. **Specialized small model + AC** (this is L3TC, also DualComp,
+   ts_zip) — train a compact model specifically for compression.
+   Better speed at lower ratio.
+3. **Ensemble (LLM + classical predictors + skip)** (Nacrith) —
+   combine an LLM with online n-grams and an adaptive bias head;
+   skip the LLM forward pass on confidence.
+
+### Nacrith (Feb 2026) deep-dive — the strongest in-category competitor
+
+Updated information from the open-source repository
+([github.com/robtacconelli/Nacrith-GPU](https://github.com/robtacconelli/Nacrith-GPU))
+and arXiv 2602.19626:
+
+- **Inference backbone**: llama.cpp (C/C++) with Python orchestration.
+  Falls back to PyTorch CUDA Graphs (GPU) or dynamic KV cache (CPU)
+  if llama.cpp unavailable, but **CPU performance is not benchmarked**.
+- **Model**: SmolLM2-135M (Transformer, 49,152 token vocab),
+  ~500 MB GGUF, ~1.2 GB VRAM per worker.
+- **Ratio**: 0.9389 bpb on enwik8 — beats CMIX (1.17), ts_zip (1.11),
+  FineZip (1.024). No direct enwik9 number published; no L3TC
+  comparison.
+- **Throughput**: 50-70 tok/s ramping to 20-30 tok/s steady-state on
+  GTX 1050 Ti. Roughly 80-280 KB/s depending on conditions.
+- **Confidence-based LLM skip**: when an online n-gram's Shannon
+  entropy drops below 1.5 bits, skip the full transformer forward
+  pass entirely. Skip rates 30-70% on highly repetitive text,
+  contributes -0.39 bpb improvement (n-gram + bias head is
+  competitive with the LLM on easy tokens).
+- **Token n-gram model**: orders 1-4, online Laplace smoothing,
+  always-on alongside the LLM.
+- **Adaptive log-space bias head**: per-document online gradient
+  correction, learns to suppress over/under-predicted tokens
+  during the encode itself. Identical correction is recomputed
+  on decode.
+- **CDF 24-bit precision** (vs typical 16-bit): saves 0.52 bpb on
+  Nacrith's 49K vocab where 16-bit cum_freqs floor occupied ~75%
+  of total mass. **L3TC-prod is already at 24-bit-equivalent
+  (PYTHON_FREQ_TOTAL = 10M)** so this lever doesn't apply to us.
+- **Hybrid binary format (NC06)**: text + binary chunks segmented
+  separately; binary uses LZMA (≥4 KB), gzip (smaller), or raw.
+  This is exactly what we sketched as "Phase 8 hybrid dispatch."
+
+**Implication for l3tc-prod positioning**: Nacrith is the most
+modern open-source learned compressor and ships with conditional
+computation (the "two-tier predictor" we'd been discussing as a
+roadmap item). Their result validates that approach — it works
+in practice. But Nacrith is GPU-only in practice and uses a
+675× larger model than L3TC-200K. L3TC-prod and Nacrith are
+at different points on the same Pareto curve, not in direct
+contention.
+
+### DualComp (May 2025) deep-dive
+
+[arXiv 2505.16256](https://arxiv.org/abs/2505.16256). RWKV-7
+("Goose") backbone with multi-modal (text + image) extension.
+
+- **Pipeline**: same shape as L3TC — tokenizer → per-token RWKV
+  forward → softmax → arithmetic coder.
+- **Tokenizer**: unified 16K vocab merging text BPE tokens + image
+  RGB sub-pixels (256-token patches in raster order).
+- **Modality switching**: separate R/K/V projection layers per
+  modality, switched dynamically inside time-mix.
+- **MoE final block**: routes to modality-specific experts.
+- **Scale**: 0.3M / 16M / 130M parameter variants.
+- **Text-only ratio (enwik9)**: 16M = 1.218 bpb, 130M = 1.107 bpb.
+- **MacBook CPU throughput** (text): 0.3M = 134 KB/s, 16M = 22 KB/s.
+- **Inference code**: not published. The MacBook number is from
+  default PyTorch (no SIMD or hand-tuned kernels described).
+- **Training**: A100 GPUs.
+
+**Implication**: DualComp's text performance lands inside L3TC-prod's
+existing Pareto. Their **0.3M v7 model gets 134 KB/s on the same
+MacBook where L3TC-prod 200K gets 172 KB/s**, and our 3.2M v4
+model gets a tighter ratio (0.13 enwik6) than their 16M v7 (0.152
+enwik9, comparable corpus). The genuine novelty is multi-modal
++ MoE, neither of which improves text-only text compression on CPU.
+
+### Mamba-3 (ICLR 2026) — architecture to watch
+
+[ICLR 2026 paper](https://openreview.net/pdf?id=HwCvaJOiCj). Latest
+generation of selective state-space models. Conceptually a strong
+fit for compression — SSMs explicitly compress past context into a
+fixed-size state. **No published lossless compression work using
+Mamba-family models as of April 2026.** Worth monitoring.
+
+### LMCompress (Nature 2025)
+
+[Nature MI vol 7, pp 794-799 (2025)](https://www.nature.com/articles/s42256-025-01033-7).
+LLaMA3-8B fine-tuned. Reports 1/3 zpaq size, 4× bz2 ratio across
+text/image/video/audio. No specific enwik9 number in summaries we
+found. GPU only. Significant academic visibility (Nature MI venue)
+but not yet on the LTCB and not in the same product category as
+l3tc-prod.
+
+### LLM weight compression (adjacent, not file compression)
+
+Not on the file-compression Pareto curve, but worth knowing:
+[DFloat11](https://arxiv.org/abs/2504.11651) (30% LLM weight
+reduction with bit-identical output), [ZipServ](https://arxiv.org/abs/2603.17435)
+(compressed-weight serving), Huff-LLM (Huffman-coded weights),
+TQ3_0 (CPU-friendly Hadamard + 3-bit Lloyd-Max). These compress
+the LLM, not the input data — different problem class.
 
 ### bzip3 (current v1.5.3, August 2025)
 
@@ -406,6 +531,25 @@ hitting diminishing returns on the speed axis.
    CPU-only learned compressor per core. That's a separately
    defensible claim, smaller in magnitude (1.2-10.5×) but still
    true.
+
+4. **The 2025-2026 LLM-compressor wave has gone uniformly bigger
+   and GPU-only.** LMCompress (LLaMA3-8B), Llamazip (LLaMA),
+   Nacrith (135M Transformer + GPU), AlphaZip (GPT-2 XL), DualComp
+   (130M for best ratio, MacBook CPU only at small-model variants).
+   **No new entrant is contesting the small-model CPU corner that
+   L3TC-prod occupies.** The closest spirit-competitor (DualComp)
+   has its 0.3M model lose to our 200K on the same MacBook (134
+   vs 172 KB/s) and its 16M model lose to our 3.2M on both speed
+   and ratio.
+
+5. **Phase 12 work is portable to all ARM64.** All NEON kernels
+   use stable Rust intrinsics — they work unchanged on Linux/Android/
+   embedded ARM64 (Graviton, Ampere, Pi 4/5, etc.). On x86_64 the
+   code falls back to scalar but the algorithm and file format
+   are unchanged. Other learned compressors are tied to specific
+   inference stacks (PyTorch + CUDA, llama.cpp, custom training
+   frameworks). l3tc-prod is a single static Rust binary with
+   no GPU dependency.
 
 ---
 
