@@ -91,8 +91,12 @@ enum Command {
         /// Metal-only: number of segments processed in GPU lockstep
         /// per BatchedSession chunk. Higher = more amortization of
         /// per-token dispatch overhead, until GPU occupancy saturates.
-        /// Ignored for `--backend=cpu`.
-        #[arg(long, default_value_t = 8)]
+        /// Ignored for `--backend=cpu`. Default 32 is the measured
+        /// amortization knee on a 50 KB enwik6 reference after Phase
+        /// 13j's chained dispatch; the knee moves with corpus size and
+        /// per-step GPU wall time, so sweep (--metal-batch=64/128) on
+        /// multi-MB inputs if you want to re-find it.
+        #[arg(long, default_value_t = 32)]
         metal_batch: usize,
     },
     /// Decompress a file produced by `compress`.

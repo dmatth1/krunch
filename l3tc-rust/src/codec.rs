@@ -409,9 +409,12 @@ pub fn decompress_with_metal(
             bodies.push((seg.ac_body.to_vec(), seg.n_tokens, BOS_ID));
         }
     }
-    // Phase 13h: 8-lane lockstep mirrors compress_with_metal so
-    // decoder per-token GPU overhead amortizes the same way.
-    let decoded_tokens = decompress_segments_batched(model, &bodies, 8)?;
+    // Phase 13h + 13i: 16-lane lockstep matches the default for
+    // compress_with_metal. The per-token GPU overhead amortizes
+    // across all active lanes; 16 is the measured knee on 50 KB
+    // enwik6 before idle-lane overhead starts costing more than
+    // amortization saves.
+    let decoded_tokens = decompress_segments_batched(model, &bodies, 16)?;
 
     // Reassemble text in segment order.
     let mut out = String::new();

@@ -23,13 +23,64 @@
 //! decompress on `Session` and vice versa.
 
 use crate::backend::mtl::{
-    CumFreqsKernelMetal, HeadKernelMetal, LayerNormKernelMetal, Matvec96Metal,
-    MetalError, SigmoidKernelMetal, SubExpKernelMetal, TimeMixKernelMetal,
+    CumFreqsKernelMetal, GlueKernelsMetal, HeadKernelMetal, LayerNormKernelMetal,
+    Matvec96Metal, MetalError, SigmoidKernelMetal, SubExpKernelMetal, TimeMixKernelMetal,
 };
 use crate::rwkv::{Block, Model};
+use metal::{Buffer, MTLResourceOptions};
 
-/// Per-layer GPU kernel set. Each kernel owns its weight buffers
-/// once at construction.
+/// Allocate a GPU-visible buffer of `n * sizeof(T)` bytes, zero-filled.
+fn new_shared_buf_bytes(device: &metal::Device, bytes: u64) -> Buffer {
+    device.new_buffer(bytes, MTLResourceOptions::StorageModeShared)
+}
+
+/// Upload a `&[f32]` into a fresh shared-storage Metal buffer.
+fn upload_f32(device: &metal::Device, data: &[f32]) -> Buffer {
+    device.new_buffer_with_data(
+        data.as_ptr() as *const std::ffi::c_void,
+        std::mem::size_of_val(data) as u64,
+        MTLResourceOptions::StorageModeShared,
+    )
+}
+
+/// Fill a buffer's contents with a repeated f32 value.
+fn fill_f32(buf: &Buffer, value: f32, n: usize) {
+    unsafe {
+        let ptr = buf.contents() as *mut f32;
+        for i in 0..n {
+            *ptr.add(i) = value;
+        }
+    }
+}
+
+/// Copy a Metal buffer's contents into a &mut [f32] slice.
+fn read_f32(buf: &Buffer, dst: &mut [f32]) {
+    unsafe {
+        let src = buf.contents() as *const f32;
+        std::ptr::copy_nonoverlapping(src, dst.as_mut_ptr(), dst.len());
+    }
+}
+
+/// Copy a Metal buffer's contents into a &mut [u32] slice.
+fn read_u32(buf: &Buffer, dst: &mut [u32]) {
+    unsafe {
+        let src = buf.contents() as *const u32;
+        std::ptr::copy_nonoverlapping(src, dst.as_mut_ptr(), dst.len());
+    }
+}
+
+/// Write a &[u32] into a Metal buffer's contents.
+fn write_u32(buf: &Buffer, src: &[u32]) {
+    unsafe {
+        let dst = buf.contents() as *mut u32;
+        std::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len());
+    }
+}
+
+/// Per-layer GPU kernel set + the layer's GPU-resident blend weights
+/// (time_mix_k/v/r for attention, time_mix_k/r for channel_mix).
+/// Phase 13j: the blends used to happen CPU-side — now they're
+/// elementwise GPU kernels that read these weight buffers.
 struct LayerKernels {
     ln1: LayerNormKernelMetal,
     ln2: LayerNormKernelMetal,
@@ -42,10 +93,16 @@ struct LayerKernels {
     ffn_v: Matvec96Metal,
     ffn_r: Matvec96Metal,
     time_mix: TimeMixKernelMetal,
+    // Persistent GPU copies of the per-channel blend weights.
+    att_mix_k_buf: Buffer,
+    att_mix_v_buf: Buffer,
+    att_mix_r_buf: Buffer,
+    ffn_mix_k_buf: Buffer,
+    ffn_mix_r_buf: Buffer,
 }
 
 impl LayerKernels {
-    fn new(block: &Block, h: usize) -> Result<Self, MetalError> {
+    fn new(block: &Block, h: usize, device: &metal::Device) -> Result<Self, MetalError> {
         Ok(Self {
             ln1: LayerNormKernelMetal::new(&block.ln1.weight, &block.ln1.bias, h, 1e-5)?,
             ln2: LayerNormKernelMetal::new(&block.ln2.weight, &block.ln2.bias, h, 1e-5)?,
@@ -62,12 +119,30 @@ impl LayerKernels {
                 &block.att.neg_exp_time_decay,
                 h,
             )?,
+            att_mix_k_buf: upload_f32(device, &block.att.time_mix_k),
+            att_mix_v_buf: upload_f32(device, &block.att.time_mix_v),
+            att_mix_r_buf: upload_f32(device, &block.att.time_mix_r),
+            ffn_mix_k_buf: upload_f32(device, &block.ffn.time_mix_k),
+            ffn_mix_r_buf: upload_f32(device, &block.ffn.time_mix_r),
         })
     }
 }
 
 /// Batched inference session backed by Metal kernels.
-#[allow(dead_code)] // some kernels reserved for follow-up perf passes
+///
+/// Phase 13j: all per-lane state and per-step scratch live on the GPU
+/// as persistent Metal buffers. One `forward_batched(prev_tokens)`
+/// call encodes the entire forward pass + cum_freqs pipeline into a
+/// single `MTLCommandBuffer` with a single `commit_and_wait` at the
+/// end. The only CPU↔GPU traffic per token is:
+/// - upload prev_tokens (batch × 4 bytes)
+/// - readback logits (batch × vocab × 4 bytes) and freqs (same size)
+///
+/// All the previous CPU glue ops (embedding lookup, time_mix /
+/// channel_mix input blends, residual adds, relu/square, copies,
+/// `rwkv = r * a / b`) now run as GPU kernels inside the chained
+/// cmd_buf (see `GlueKernelsMetal`).
+#[allow(dead_code)] // some kernels retained for microbenchmarks and tests
 pub struct BatchedSession<'a> {
     model: &'a Model,
     batch: usize,
@@ -81,40 +156,52 @@ pub struct BatchedSession<'a> {
     cum_freqs: CumFreqsKernelMetal,
     sub_exp: SubExpKernelMetal,
     sigmoid: SigmoidKernelMetal,
+    glue: GlueKernelsMetal,
 
-    // Per-layer kernels.
+    // Per-layer kernels (includes per-layer blend weight buffers).
     layers: Vec<LayerKernels>,
 
-    // Per-lane state. All `batch * h` flat (lane-major: state[b*h..(b+1)*h]).
-    // One Vec per layer.
-    state_a: Vec<Vec<f32>>,
-    state_b: Vec<Vec<f32>>,
-    state_p: Vec<Vec<f32>>,
-    state_x: Vec<Vec<f32>>,
-    state_ffn: Vec<Vec<f32>>,
+    // Persistent GPU state. All `batch * h` f32 (lane-major).
+    // One buffer per layer.
+    state_a: Vec<Buffer>,
+    state_b: Vec<Buffer>,
+    state_p: Vec<Buffer>,
+    state_x: Vec<Buffer>,
+    state_ffn: Vec<Buffer>,
 
-    // Scratch buffers (all `batch * h` or `batch * vocab`).
-    x: Vec<f32>,
-    residual: Vec<f32>,
-    short: Vec<f32>,
-    normed: Vec<f32>,
-    xk: Vec<f32>,
-    xv: Vec<f32>,
-    xr: Vec<f32>,
-    k: Vec<f32>,
-    v: Vec<f32>,
-    r: Vec<f32>,
-    ww: Vec<f32>,
-    p: Vec<f32>,
-    a: Vec<f32>,
-    b: Vec<f32>,
-    rwkv: Vec<f32>,
-    out_proj: Vec<f32>,
-    ffn_out: Vec<f32>,
-    /// Final output buffer: `batch * vocab` logits.
+    // Shared per-token scratch on the GPU.
+    emb_buf: Buffer,           // vocab * h (uploaded once at construction)
+    prev_tokens_buf: Buffer,   // batch u32
+    x_buf: Buffer,             // batch * h
+    residual_buf: Buffer,      // batch * h
+    short_buf: Buffer,         // batch * h
+    normed_buf: Buffer,        // batch * h
+    xk_buf: Buffer,
+    xv_buf: Buffer,
+    xr_buf: Buffer,
+    k_buf: Buffer,
+    v_buf: Buffer,
+    r_buf: Buffer,
+    ww_buf: Buffer,
+    p_buf: Buffer,
+    a_buf: Buffer,
+    b_buf: Buffer,
+    rwkv_buf: Buffer,
+    out_proj_buf: Buffer,
+    ffn_out_buf: Buffer,
+    logits_buf: Buffer,        // batch * vocab f32
+    // cum_freqs scratch (reused across calls).
+    cum_max_buf: Buffer,       // batch f32
+    cum_exps_buf: Buffer,      // batch * vocab f32
+    cum_sum_buf: Buffer,       // batch f32
+    cum_scale_buf: Buffer,     // batch f32
+    freqs_buf: Buffer,         // batch * vocab u32
+
+    /// Host-side copy of the final `batch * vocab` logits. Populated
+    /// after `forward_batched` returns.
     pub logits: Vec<f32>,
-    /// Reusable freqs buffer: `batch * vocab` u32. Populated by
-    /// `cum_freqs_batched` after `forward_batched`.
+    /// Host-side copy of the `batch * vocab` u32 freqs table.
+    /// Populated after `forward_batched` returns.
     pub freqs: Vec<u32>,
 }
 
@@ -134,22 +221,45 @@ impl<'a> BatchedSession<'a> {
         let cum_freqs = CumFreqsKernelMetal::new(vocab)?;
         let sub_exp = SubExpKernelMetal::new(h)?;
         let sigmoid = SigmoidKernelMetal::new(h)?;
+        let glue = GlueKernelsMetal::new()?;
+        let device = glue.device();
 
         let mut layers = Vec::with_capacity(num_layers);
         for block in &model.blocks {
-            layers.push(LayerKernels::new(block, h)?);
+            layers.push(LayerKernels::new(block, h, &device)?);
         }
 
         let bh = batch * h;
+        let bh_bytes = (bh * std::mem::size_of::<f32>()) as u64;
+        let bv = batch * vocab;
+        let bv_bytes = (bv * std::mem::size_of::<f32>()) as u64;
+        let bv_u32_bytes = (bv * std::mem::size_of::<u32>()) as u64;
+        let batch_u32_bytes = (batch * std::mem::size_of::<u32>()) as u64;
+        let batch_f32_bytes = (batch * std::mem::size_of::<f32>()) as u64;
 
-        // Per-lane state, fresh.
-        let state_a: Vec<Vec<f32>> = (0..num_layers).map(|_| vec![0.0; bh]).collect();
-        let state_b: Vec<Vec<f32>> = (0..num_layers).map(|_| vec![0.0; bh]).collect();
-        let state_p: Vec<Vec<f32>> = (0..num_layers).map(|_| vec![-1e30; bh]).collect();
-        let state_x: Vec<Vec<f32>> = (0..num_layers).map(|_| vec![0.0; bh]).collect();
-        let state_ffn: Vec<Vec<f32>> = (0..num_layers).map(|_| vec![0.0; bh]).collect();
+        // Persistent state buffers, one per layer.
+        let state_a: Vec<Buffer> = (0..num_layers)
+            .map(|_| new_shared_buf_bytes(&device, bh_bytes))
+            .collect();
+        let state_b: Vec<Buffer> = (0..num_layers)
+            .map(|_| new_shared_buf_bytes(&device, bh_bytes))
+            .collect();
+        let state_p: Vec<Buffer> = (0..num_layers)
+            .map(|_| new_shared_buf_bytes(&device, bh_bytes))
+            .collect();
+        let state_x: Vec<Buffer> = (0..num_layers)
+            .map(|_| new_shared_buf_bytes(&device, bh_bytes))
+            .collect();
+        let state_ffn: Vec<Buffer> = (0..num_layers)
+            .map(|_| new_shared_buf_bytes(&device, bh_bytes))
+            .collect();
 
-        Ok(Self {
+        // Persistent embedding table upload.
+        let emb_buf = upload_f32(&device, &model.emb);
+
+        let prev_tokens_buf = new_shared_buf_bytes(&device, batch_u32_bytes);
+
+        let session = Self {
             model,
             batch,
             h,
@@ -160,32 +270,45 @@ impl<'a> BatchedSession<'a> {
             cum_freqs,
             sub_exp,
             sigmoid,
+            glue,
             layers,
             state_a,
             state_b,
             state_p,
             state_x,
             state_ffn,
-            x: vec![0.0; bh],
-            residual: vec![0.0; bh],
-            short: vec![0.0; bh],
-            normed: vec![0.0; bh],
-            xk: vec![0.0; bh],
-            xv: vec![0.0; bh],
-            xr: vec![0.0; bh],
-            k: vec![0.0; bh],
-            v: vec![0.0; bh],
-            r: vec![0.0; bh],
-            ww: vec![0.0; bh],
-            p: vec![0.0; bh],
-            a: vec![0.0; bh],
-            b: vec![0.0; bh],
-            rwkv: vec![0.0; bh],
-            out_proj: vec![0.0; bh],
-            ffn_out: vec![0.0; bh],
-            logits: vec![0.0; batch * vocab],
-            freqs: vec![0; batch * vocab],
-        })
+            emb_buf,
+            prev_tokens_buf,
+            x_buf: new_shared_buf_bytes(&device, bh_bytes),
+            residual_buf: new_shared_buf_bytes(&device, bh_bytes),
+            short_buf: new_shared_buf_bytes(&device, bh_bytes),
+            normed_buf: new_shared_buf_bytes(&device, bh_bytes),
+            xk_buf: new_shared_buf_bytes(&device, bh_bytes),
+            xv_buf: new_shared_buf_bytes(&device, bh_bytes),
+            xr_buf: new_shared_buf_bytes(&device, bh_bytes),
+            k_buf: new_shared_buf_bytes(&device, bh_bytes),
+            v_buf: new_shared_buf_bytes(&device, bh_bytes),
+            r_buf: new_shared_buf_bytes(&device, bh_bytes),
+            ww_buf: new_shared_buf_bytes(&device, bh_bytes),
+            p_buf: new_shared_buf_bytes(&device, bh_bytes),
+            a_buf: new_shared_buf_bytes(&device, bh_bytes),
+            b_buf: new_shared_buf_bytes(&device, bh_bytes),
+            rwkv_buf: new_shared_buf_bytes(&device, bh_bytes),
+            out_proj_buf: new_shared_buf_bytes(&device, bh_bytes),
+            ffn_out_buf: new_shared_buf_bytes(&device, bh_bytes),
+            logits_buf: new_shared_buf_bytes(&device, bv_bytes),
+            cum_max_buf: new_shared_buf_bytes(&device, batch_f32_bytes),
+            cum_exps_buf: new_shared_buf_bytes(&device, bv_bytes),
+            cum_sum_buf: new_shared_buf_bytes(&device, batch_f32_bytes),
+            cum_scale_buf: new_shared_buf_bytes(&device, batch_f32_bytes),
+            freqs_buf: new_shared_buf_bytes(&device, bv_u32_bytes),
+            logits: vec![0.0; bv],
+            freqs: vec![0u32; bv],
+        };
+        // Initialize persistent state buffers.
+        let mut s = session;
+        s.reset();
+        Ok(s)
     }
 
     /// Reset all per-lane state to fresh values. Call at every
@@ -193,207 +316,270 @@ impl<'a> BatchedSession<'a> {
     pub fn reset(&mut self) {
         let bh = self.batch * self.h;
         for layer in 0..self.model.num_layers() {
-            self.state_a[layer].fill(0.0);
-            self.state_b[layer].fill(0.0);
-            self.state_p[layer].fill(-1e30);
-            self.state_x[layer].fill(0.0);
-            self.state_ffn[layer].fill(0.0);
+            fill_f32(&self.state_a[layer], 0.0, bh);
+            fill_f32(&self.state_b[layer], 0.0, bh);
+            fill_f32(&self.state_p[layer], -1e30, bh);
+            fill_f32(&self.state_x[layer], 0.0, bh);
+            fill_f32(&self.state_ffn[layer], 0.0, bh);
         }
-        let _ = bh;
     }
 
-    /// One step: feed one previous token per lane, get back the
-    /// next-token logits for every lane (`batch * vocab`).
+    /// One step: feed one previous token per lane, encode the entire
+    /// forward pass + cum_freqs pipeline into a single command buffer,
+    /// commit + wait once, and populate `self.logits` and `self.freqs`.
     ///
-    /// `prev_tokens.len() == batch`. The returned logits live in
-    /// `self.logits`.
+    /// Phase 13j: all ~32 per-token GPU dispatches (embed → ln0 → N
+    /// layer passes → ln_out → head → cum_freqs) run inside one
+    /// `commit_and_wait`. All state and scratch are persistent Metal
+    /// buffers; only `prev_tokens` goes CPU→GPU and only `logits` +
+    /// `freqs` come GPU→CPU per call.
     pub fn forward_batched(&mut self, prev_tokens: &[u32]) {
         assert_eq!(prev_tokens.len(), self.batch);
-        let h = self.h;
+        const PYTHON_FREQ_TOTAL: u32 = 10_000_000;
+        let bh = (self.batch * self.h) as u32;
+        let batch_u = self.batch;
+        let h_u = self.h as u32;
+        let batch_u32 = self.batch as u32;
 
-        // 1. Embedding lookup, batched: x[b, :] = emb[prev_tokens[b], :]
-        for (b, &tok) in prev_tokens.iter().enumerate() {
-            let row_start = (tok as usize) * h;
-            let row = &self.model.emb[row_start..row_start + h];
-            self.x[b * h..(b + 1) * h].copy_from_slice(row);
-        }
+        // Upload prev_tokens to the persistent buffer (batch × 4 bytes).
+        write_u32(&self.prev_tokens_buf, prev_tokens);
 
-        // 2. ln0 — batched layer norm over all lanes
-        self.ln0
-            .forward_batched(&self.x, &mut self.normed, self.batch);
-        self.x.copy_from_slice(&self.normed);
+        let cmd_buf = self.glue.queue().new_command_buffer();
 
-        // 3. Block loop
+        // 1. Embedding lookup: x[lane, :] = emb[prev_tokens[lane], :]
+        self.glue.encode_embed(
+            cmd_buf,
+            &self.emb_buf,
+            &self.prev_tokens_buf,
+            &self.x_buf,
+            h_u,
+            batch_u32,
+        );
+
+        // 2. ln0 with input aliased to x (out → normed), then copy back.
+        self.ln0.encode_into(cmd_buf, &self.x_buf, &self.normed_buf, batch_u);
+        self.glue.encode_copy(cmd_buf, &self.normed_buf, &self.x_buf, bh);
+
+        // 3. Per-layer block.
         for layer in 0..self.model.num_layers() {
-            // short = relu(short_weight @ x), batched
+            // short = short_weight @ x; relu(short)
             self.layers[layer]
                 .short
-                .forward_batched(&self.x, &mut self.short, self.batch);
-            relu_inplace(&mut self.short);
+                .encode_into(cmd_buf, &self.x_buf, &self.short_buf, batch_u);
+            self.glue.encode_relu_inplace(cmd_buf, &self.short_buf, bh);
 
             // residual = x
-            self.residual.copy_from_slice(&self.x);
+            self.glue.encode_copy(cmd_buf, &self.x_buf, &self.residual_buf, bh);
 
-            // ln1
+            // ln1: x → normed
             self.layers[layer]
                 .ln1
-                .forward_batched(&self.x, &mut self.normed, self.batch);
+                .encode_into(cmd_buf, &self.x_buf, &self.normed_buf, batch_u);
 
-            // time_mix → writes to self.rwkv
-            self.time_mix(layer);
+            // time_mix: produces rwkv, updates state_x/a/b/p.
+            self.encode_time_mix(cmd_buf, layer);
 
             // x = residual + rwkv
-            self.x.copy_from_slice(&self.residual);
-            add_inplace(&mut self.x, &self.rwkv);
-
+            self.glue.encode_add(
+                cmd_buf,
+                &self.residual_buf,
+                &self.rwkv_buf,
+                &self.x_buf,
+                bh,
+            );
             // residual = x
-            self.residual.copy_from_slice(&self.x);
+            self.glue.encode_copy(cmd_buf, &self.x_buf, &self.residual_buf, bh);
 
-            // ln2
+            // ln2: x → normed
             self.layers[layer]
                 .ln2
-                .forward_batched(&self.x, &mut self.normed, self.batch);
+                .encode_into(cmd_buf, &self.x_buf, &self.normed_buf, batch_u);
 
-            // channel_mix → writes to self.ffn_out
-            self.channel_mix(layer);
+            // channel_mix: produces ffn_out, updates state_ffn.
+            self.encode_channel_mix(cmd_buf, layer);
 
             // x = residual + ffn_out
-            self.x.copy_from_slice(&self.residual);
-            add_inplace(&mut self.x, &self.ffn_out);
-
-            // x = x + short
-            add_inplace(&mut self.x, &self.short);
+            self.glue.encode_add(
+                cmd_buf,
+                &self.residual_buf,
+                &self.ffn_out_buf,
+                &self.x_buf,
+                bh,
+            );
+            // x += short
+            self.glue
+                .encode_add_inplace(cmd_buf, &self.x_buf, &self.short_buf, bh);
         }
 
-        // 4. Final layer norm
+        // 4. Final layer norm.
         self.ln_out
-            .forward_batched(&self.x, &mut self.normed, self.batch);
+            .encode_into(cmd_buf, &self.x_buf, &self.normed_buf, batch_u);
 
-        // 5. Head matvec: produces `batch * vocab` logits
+        // 5. Head matvec: produces `batch * vocab` logits.
         self.head
-            .forward_batched(&self.normed, &mut self.logits, self.batch);
-    }
+            .encode_into(cmd_buf, &self.normed_buf, &self.logits_buf, batch_u);
 
-    /// After `forward_batched`, compute per-lane freqs from logits.
-    /// Stored in `self.freqs`. The cum-prefix walk and AC encode
-    /// stay CPU-side per lane.
-    pub fn cum_freqs_batched(&mut self) {
-        const PYTHON_FREQ_TOTAL: u32 = 10_000_000;
-        self.cum_freqs.forward_batched(
-            &self.logits,
-            &mut self.freqs,
-            self.batch,
+        // 6. cum_freqs: logits → freqs (u32).
+        self.cum_freqs.encode_into(
+            cmd_buf,
+            &self.logits_buf,
+            &self.cum_max_buf,
+            &self.cum_exps_buf,
+            &self.cum_sum_buf,
+            &self.cum_scale_buf,
+            &self.freqs_buf,
+            batch_u,
             PYTHON_FREQ_TOTAL,
         );
+
+        // 7. Single sync for the whole token.
+        cmd_buf.commit();
+        cmd_buf.wait_until_completed();
+
+        // 8. Read freqs (compress/decompress hot path only needs this —
+        //    ~1 MB copy at batch=16, vocab=16K). Logits readback is
+        //    deferred until a caller actually asks for them via
+        //    `sync_logits_host()`, so the hot path skips a second
+        //    `batch * vocab * 4` byte CPU copy per token.
+        read_u32(&self.freqs_buf, &mut self.freqs);
     }
 
-    fn time_mix(&mut self, layer: usize) {
-        let h = self.h;
-        let block = &self.model.blocks[layer];
-        let att = &block.att;
+    /// Copy the most recent GPU-side logits into the host-side
+    /// `self.logits` vec. Tests and microbenches call this before
+    /// reading `self.logits`; the compress/decompress path skips it.
+    pub fn sync_logits_host(&mut self) {
+        read_f32(&self.logits_buf, &mut self.logits);
+    }
 
-        // 3 input blends. `time_mix_k/v/r` are shared across batch.
-        for b in 0..self.batch {
-            let s = b * h;
-            let e = s + h;
-            for i in 0..h {
-                let m = att.time_mix_k[i];
-                self.xk[s + i] = self.normed[s + i] * m + self.state_x[layer][s + i] * (1.0 - m);
-                let m = att.time_mix_v[i];
-                self.xv[s + i] = self.normed[s + i] * m + self.state_x[layer][s + i] * (1.0 - m);
-                let m = att.time_mix_r[i];
-                self.xr[s + i] = self.normed[s + i] * m + self.state_x[layer][s + i] * (1.0 - m);
-            }
-            let _ = e;
-        }
+    /// Legacy API: after `forward_batched`, freqs are already populated,
+    /// so this is now a no-op kept for API compat with pre-13j callers.
+    pub fn cum_freqs_batched(&mut self) {
+        // Freqs were computed + read back inside `forward_batched`.
+    }
 
-        // Update state_x for next step
-        self.state_x[layer].copy_from_slice(&self.normed);
-
-        // 3 matvecs
+    fn encode_time_mix(&self, cmd_buf: &metal::CommandBufferRef, layer: usize) {
+        let bh = (self.batch * self.h) as u32;
+        let h_u = self.h as u32;
+        let batch_u32 = self.batch as u32;
         let lk = &self.layers[layer];
-        lk.att_k.forward_batched(&self.xk, &mut self.k, self.batch);
-        lk.att_v.forward_batched(&self.xv, &mut self.v, self.batch);
-        lk.att_r.forward_batched(&self.xr, &mut self.r, self.batch);
 
-        // sigmoid(r) in place — use a temp because our kernel API takes
-        // separate input/output slices.
-        let r_tmp = self.r.clone();
-        self.sigmoid.forward_batched(&r_tmp, &mut self.r, self.batch);
+        // Input blends xk/xv/xr = normed * mix + state_x * (1 - mix).
+        // Also updates state_x ← normed in the same kernel.
+        self.glue.encode_blend3(
+            cmd_buf,
+            &self.normed_buf,
+            &self.state_x[layer],
+            &self.state_x[layer],
+            &lk.att_mix_k_buf,
+            &lk.att_mix_v_buf,
+            &lk.att_mix_r_buf,
+            &self.xk_buf,
+            &self.xv_buf,
+            &self.xr_buf,
+            h_u,
+            batch_u32,
+        );
 
-        // step1 (fused)
-        lk.time_mix.step1_batched(
+        // 3 matvecs (independent, safe to chain).
+        lk.att_k
+            .encode_into(cmd_buf, &self.xk_buf, &self.k_buf, self.batch);
+        lk.att_v
+            .encode_into(cmd_buf, &self.xv_buf, &self.v_buf, self.batch);
+        lk.att_r
+            .encode_into(cmd_buf, &self.xr_buf, &self.r_buf, self.batch);
+
+        // sigmoid(r) in-place: the MSL elementwise kernel writes
+        // out[i] from in[i] so aliasing r=in=out is safe.
+        self.sigmoid
+            .encode_into(cmd_buf, &self.r_buf, &self.r_buf, self.batch);
+
+        // time_mix step1 reads state_p/a/b + k + v, writes ww/p/a/b.
+        lk.time_mix.encode_step1_into(
+            cmd_buf,
             &self.state_p[layer],
-            &self.k,
+            &self.k_buf,
             &self.state_a[layer],
             &self.state_b[layer],
-            &self.v,
-            &mut self.ww,
-            &mut self.p,
-            &mut self.a,
-            &mut self.b,
+            &self.v_buf,
+            &self.ww_buf,
+            &self.p_buf,
+            &self.a_buf,
+            &self.b_buf,
             self.batch,
         );
 
-        // step2 (fused, in-place)
-        lk.time_mix.step2_batched(
-            &self.k,
-            &self.v,
-            &mut self.state_p[layer],
-            &mut self.state_a[layer],
-            &mut self.state_b[layer],
-            &mut self.ww,
+        // step2 updates state_p/a/b in-place.
+        lk.time_mix.encode_step2_into(
+            cmd_buf,
+            &self.k_buf,
+            &self.v_buf,
+            &self.state_p[layer],
+            &self.state_a[layer],
+            &self.state_b[layer],
+            &self.ww_buf,
             self.batch,
         );
 
         // rwkv = r * a / b
-        for k in 0..(self.batch * h) {
-            self.rwkv[k] = self.r[k] * self.a[k] / self.b[k];
-        }
+        self.glue.encode_mul_div(
+            cmd_buf,
+            &self.r_buf,
+            &self.a_buf,
+            &self.b_buf,
+            &self.rwkv_buf,
+            bh,
+        );
 
-        // Output projection: out_proj = w_output @ rwkv; rwkv = out_proj
+        // Output projection into out_proj; copy back into rwkv.
         lk.att_output
-            .forward_batched(&self.rwkv, &mut self.out_proj, self.batch);
-        self.rwkv.copy_from_slice(&self.out_proj);
+            .encode_into(cmd_buf, &self.rwkv_buf, &self.out_proj_buf, self.batch);
+        self.glue
+            .encode_copy(cmd_buf, &self.out_proj_buf, &self.rwkv_buf, bh);
     }
 
-    fn channel_mix(&mut self, layer: usize) {
-        let h = self.h;
-        let block = &self.model.blocks[layer];
-        let ffn = &block.ffn;
-
-        // 2 input blends
-        for b in 0..self.batch {
-            let s = b * h;
-            for i in 0..h {
-                let m = ffn.time_mix_k[i];
-                self.xk[s + i] = self.normed[s + i] * m + self.state_ffn[layer][s + i] * (1.0 - m);
-                let m = ffn.time_mix_r[i];
-                self.xr[s + i] = self.normed[s + i] * m + self.state_ffn[layer][s + i] * (1.0 - m);
-            }
-        }
-
-        // Update state_ffn
-        self.state_ffn[layer].copy_from_slice(&self.normed);
-
-        // r = sigmoid(receptance @ xr)
+    fn encode_channel_mix(&self, cmd_buf: &metal::CommandBufferRef, layer: usize) {
+        let bh = (self.batch * self.h) as u32;
+        let h_u = self.h as u32;
+        let batch_u32 = self.batch as u32;
         let lk = &self.layers[layer];
-        lk.ffn_r.forward_batched(&self.xr, &mut self.r, self.batch);
-        let r_tmp = self.r.clone();
-        self.sigmoid.forward_batched(&r_tmp, &mut self.r, self.batch);
 
-        // k = (relu(key @ xk))^2
-        lk.ffn_k.forward_batched(&self.xk, &mut self.k, self.batch);
-        relu_inplace(&mut self.k);
-        square_inplace(&mut self.k);
+        // Blend xk/xr + update state_ffn.
+        self.glue.encode_blend2(
+            cmd_buf,
+            &self.normed_buf,
+            &self.state_ffn[layer],
+            &self.state_ffn[layer],
+            &lk.ffn_mix_k_buf,
+            &lk.ffn_mix_r_buf,
+            &self.xk_buf,
+            &self.xr_buf,
+            h_u,
+            batch_u32,
+        );
 
-        // kv = value @ k → self.v
-        lk.ffn_v.forward_batched(&self.k, &mut self.v, self.batch);
+        // r = sigmoid(ffn_r @ xr)
+        lk.ffn_r
+            .encode_into(cmd_buf, &self.xr_buf, &self.r_buf, self.batch);
+        self.sigmoid
+            .encode_into(cmd_buf, &self.r_buf, &self.r_buf, self.batch);
+
+        // k = relu(ffn_k @ xk); k = k^2 (fused relu+square kernel)
+        lk.ffn_k
+            .encode_into(cmd_buf, &self.xk_buf, &self.k_buf, self.batch);
+        self.glue.encode_relu_square_inplace(cmd_buf, &self.k_buf, bh);
+
+        // v = ffn_v @ k
+        lk.ffn_v
+            .encode_into(cmd_buf, &self.k_buf, &self.v_buf, self.batch);
 
         // ffn_out = r * v
-        for k in 0..(self.batch * h) {
-            self.ffn_out[k] = self.r[k] * self.v[k];
-        }
+        self.glue.encode_mul(
+            cmd_buf,
+            &self.r_buf,
+            &self.v_buf,
+            &self.ffn_out_buf,
+            bh,
+        );
     }
 }
 
@@ -679,30 +865,6 @@ pub fn decompress_one_segment_batched(
     Ok(tokens)
 }
 
-// CPU helpers for the small element-wise ops not yet on GPU.
-// For Phase 13e validation these are kept on CPU since per-call
-// they're cheap (96-element loops).
-
-fn relu_inplace(v: &mut [f32]) {
-    for x in v.iter_mut() {
-        if *x < 0.0 {
-            *x = 0.0;
-        }
-    }
-}
-
-fn square_inplace(v: &mut [f32]) {
-    for x in v.iter_mut() {
-        *x *= *x;
-    }
-}
-
-fn add_inplace(a: &mut [f32], b: &[f32]) {
-    for (x, y) in a.iter_mut().zip(b.iter()) {
-        *x += *y;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -766,6 +928,7 @@ mod tests {
         for t in 0..n_steps {
             let prev: Vec<u32> = (0..batch).map(|b| sequences[b][t]).collect();
             bs.forward_batched(&prev);
+            bs.sync_logits_host();
 
             // Compare logits per lane.
             for b in 0..batch {
@@ -820,6 +983,7 @@ mod tests {
         // Single forward step with synthetic token IDs.
         let prev: Vec<u32> = (0..batch).map(|b| (b as u32) * 100).collect();
         bs.forward_batched(&prev);
+        bs.sync_logits_host();
         bs.cum_freqs_batched();
 
         // CPU reference for each lane.

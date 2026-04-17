@@ -8,19 +8,25 @@ GPU dependency; GPU is opt-in via cargo features.
 CLI compress/decompress via Metal works on real corpora with
 bit-identical round-trip. Major correctness finding (bit) below.
 
-**Phase 13g (chained dispatch) in progress:** the cum_freqs path
-now chains all 4 GPU stages into a single `commit_and_wait`. The
-broader forward-pass refactor (pull state into persistent Metal
-buffers, chain ~30 per-token kernels into one command buffer)
-is the structural change still required to hit the 1-3 MB/s
-projected throughput.
+**Phases 13g/13h/13i/13j shipped:** collapsing per-token GPU sync
+overhead plus N-segment lockstep batching. Measured headline on
+50 KB enwik6, L3TC-200K, M-series:
 
-**Phase 13h (true N-segment lockstep) shipped:** Metal compress and
-decompress now run 8 segments concurrently through one BatchedSession
-with per-lane AC encoders/decoders. Per-token GPU dispatch overhead
-amortizes across all active lanes. Measured on 50 KB enwik6:
-**~7.5× wall-clock speedup (0.15 → 1.12 KB/s)** with ratio held at
-0.1791 and bit-identical round trip.
+| phase | compress | change |
+|---|---:|---:|
+| pre-13h (lane-0 serial)        | 0.15 KB/s | baseline |
+| 13h (8-lane lockstep)          | 1.12 KB/s | +7.5× |
+| 13i (16-lane knee, sweep)      | 1.73 KB/s | +1.5× |
+| **13j (GPU-resident + chained)** | **~5.0 KB/s** | **+2.9×** |
+
+Cumulative **~33× over the original Phase 13e bring-up**, ratio
+held at 0.1791 across all sub-phases, byte-identical round trip.
+Still ~200× short of the 1 MB/s projection — the remaining gap is
+per-step GPU wall time (each token still triggers ~40 encoder
+dispatches inside the single command buffer; the dispatch-threads
+setup overhead now dominates). Next levers are kernel fusion
+(combine the elementwise glue kernels into one big per-token
+kernel) and larger batch scaling on multi-MB inputs.
 
 **Major caveat from Phase 13e:** files compressed via Metal must be
 decompressed via Metal. Cross-backend interop (the original

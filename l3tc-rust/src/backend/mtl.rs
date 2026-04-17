@@ -322,15 +322,34 @@ impl HeadKernelMetal {
             (batch * self.rows * std::mem::size_of::<f32>()) as u64,
             MTLResourceOptions::StorageModeShared,
         );
-        let batch_u32 = batch as u32;
 
         let cmd_buf = self.queue.new_command_buffer();
+        self.encode_into(cmd_buf, &xb_buf, &outb_buf, batch);
+        commit_and_wait(cmd_buf);
+
+        // SAFETY: outb_buf has batch*rows*sizeof(f32), GPU has finished.
+        unsafe {
+            let src = outb_buf.contents() as *const f32;
+            std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), batch * self.rows);
+        }
+    }
+
+    /// Phase 13j: encode the batched head matvec into a caller-
+    /// provided command buffer (no commit/wait).
+    pub fn encode_into(
+        &self,
+        cmd_buf: &CommandBufferRef,
+        x: &Buffer,
+        out: &Buffer,
+        batch: usize,
+    ) {
+        let batch_u32 = batch as u32;
         let encoder = cmd_buf.new_compute_command_encoder();
         encoder.set_compute_pipeline_state(&self.pipeline_batched);
         encoder.set_buffer(0, Some(&self.qmat_buf), 0);
         encoder.set_buffer(1, Some(&self.scales_buf), 0);
-        encoder.set_buffer(2, Some(&xb_buf), 0);
-        encoder.set_buffer(3, Some(&outb_buf), 0);
+        encoder.set_buffer(2, Some(x), 0);
+        encoder.set_buffer(3, Some(out), 0);
         encoder.set_bytes(
             4,
             std::mem::size_of::<u32>() as u64,
@@ -346,33 +365,16 @@ impl HeadKernelMetal {
             std::mem::size_of::<u32>() as u64,
             &batch_u32 as *const u32 as *const std::ffi::c_void,
         );
-
-        // 2D grid: (rows, batch). Threadgroup along rows axis.
         let tg_width = self
             .pipeline_batched
             .thread_execution_width()
             .max(1)
             .min(self.rows as u64);
         encoder.dispatch_threads(
-            MTLSize {
-                width: self.rows as u64,
-                height: batch as u64,
-                depth: 1,
-            },
-            MTLSize {
-                width: tg_width,
-                height: 1,
-                depth: 1,
-            },
+            MTLSize { width: self.rows as u64, height: batch as u64, depth: 1 },
+            MTLSize { width: tg_width, height: 1, depth: 1 },
         );
         encoder.end_encoding();
-        commit_and_wait(cmd_buf);
-
-        // SAFETY: outb_buf has batch*rows*sizeof(f32), GPU has finished.
-        unsafe {
-            let src = outb_buf.contents() as *const f32;
-            std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), batch * self.rows);
-        }
     }
 
     /// One forward pass: copy `x` into the persistent input buffer,
@@ -566,15 +568,32 @@ impl LayerNormKernelMetal {
             (batch * self.h * std::mem::size_of::<f32>()) as u64,
             MTLResourceOptions::StorageModeShared,
         );
-        let batch_u32 = batch as u32;
 
         let cmd_buf = self.queue.new_command_buffer();
+        self.encode_into(cmd_buf, &xb_buf, &outb_buf, batch);
+        commit_and_wait(cmd_buf);
+
+        unsafe {
+            let src = outb_buf.contents() as *const f32;
+            std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), batch * self.h);
+        }
+    }
+
+    /// Phase 13j: encode into a caller-provided command buffer.
+    pub fn encode_into(
+        &self,
+        cmd_buf: &CommandBufferRef,
+        x: &Buffer,
+        out: &Buffer,
+        batch: usize,
+    ) {
+        let batch_u32 = batch as u32;
         let encoder = cmd_buf.new_compute_command_encoder();
         encoder.set_compute_pipeline_state(&self.pipeline);
-        encoder.set_buffer(0, Some(&xb_buf), 0);
+        encoder.set_buffer(0, Some(x), 0);
         encoder.set_buffer(1, Some(&self.weight_buf), 0);
         encoder.set_buffer(2, Some(&self.bias_buf), 0);
-        encoder.set_buffer(3, Some(&outb_buf), 0);
+        encoder.set_buffer(3, Some(out), 0);
         encoder.set_bytes(
             4,
             std::mem::size_of::<u32>() as u64,
@@ -590,27 +609,12 @@ impl LayerNormKernelMetal {
             std::mem::size_of::<f32>() as u64,
             &self.eps as *const f32 as *const std::ffi::c_void,
         );
-
         let tg_width = self.pipeline.thread_execution_width().max(1).min(batch as u64);
         encoder.dispatch_threads(
-            MTLSize {
-                width: batch as u64,
-                height: 1,
-                depth: 1,
-            },
-            MTLSize {
-                width: tg_width,
-                height: 1,
-                depth: 1,
-            },
+            MTLSize { width: batch as u64, height: 1, depth: 1 },
+            MTLSize { width: tg_width, height: 1, depth: 1 },
         );
         encoder.end_encoding();
-        commit_and_wait(cmd_buf);
-
-        unsafe {
-            let src = outb_buf.contents() as *const f32;
-            std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), batch * self.h);
-        }
     }
 }
 
@@ -714,14 +718,33 @@ impl Matvec96Metal {
             (batch * self.h * std::mem::size_of::<f32>()) as u64,
             MTLResourceOptions::StorageModeShared,
         );
-        let batch_u32 = batch as u32;
 
         let cmd_buf = self.queue.new_command_buffer();
+        self.encode_into(cmd_buf, &xb_buf, &outb_buf, batch);
+        commit_and_wait(cmd_buf);
+
+        unsafe {
+            let src = outb_buf.contents() as *const f32;
+            std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), batch * self.h);
+        }
+    }
+
+    /// Phase 13j: encode the matvec into a caller-provided command
+    /// buffer without committing. Used by `BatchedSession` to chain
+    /// many kernel dispatches into one commit.
+    pub fn encode_into(
+        &self,
+        cmd_buf: &CommandBufferRef,
+        x: &Buffer,
+        out: &Buffer,
+        batch: usize,
+    ) {
+        let batch_u32 = batch as u32;
         let encoder = cmd_buf.new_compute_command_encoder();
         encoder.set_compute_pipeline_state(&self.pipeline);
         encoder.set_buffer(0, Some(&self.mat_buf), 0);
-        encoder.set_buffer(1, Some(&xb_buf), 0);
-        encoder.set_buffer(2, Some(&outb_buf), 0);
+        encoder.set_buffer(1, Some(x), 0);
+        encoder.set_buffer(2, Some(out), 0);
         encoder.set_bytes(
             3,
             std::mem::size_of::<u32>() as u64,
@@ -732,31 +755,16 @@ impl Matvec96Metal {
             std::mem::size_of::<u32>() as u64,
             &batch_u32 as *const u32 as *const std::ffi::c_void,
         );
-
         let tg_width = self
             .pipeline
             .thread_execution_width()
             .max(1)
             .min(self.h as u64);
         encoder.dispatch_threads(
-            MTLSize {
-                width: self.h as u64,
-                height: batch as u64,
-                depth: 1,
-            },
-            MTLSize {
-                width: tg_width,
-                height: 1,
-                depth: 1,
-            },
+            MTLSize { width: self.h as u64, height: batch as u64, depth: 1 },
+            MTLSize { width: tg_width, height: 1, depth: 1 },
         );
         encoder.end_encoding();
-        commit_and_wait(cmd_buf);
-
-        unsafe {
-            let src = outb_buf.contents() as *const f32;
-            std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), batch * self.h);
-        }
     }
 }
 
@@ -876,14 +884,32 @@ impl SubExpKernelMetal {
             MTLResourceOptions::StorageModeShared,
         );
         let out_buf = device.new_buffer(n_bytes, MTLResourceOptions::StorageModeShared);
-        let batch_u32 = batch as u32;
 
         let cmd_buf = self.queue.new_command_buffer();
+        self.encode_into(cmd_buf, &a_buf, &b_buf, &out_buf, batch);
+        commit_and_wait(cmd_buf);
+
+        unsafe {
+            let src = out_buf.contents() as *const f32;
+            std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), batch * self.h);
+        }
+    }
+
+    /// Phase 13j: encode into a caller-provided command buffer.
+    pub fn encode_into(
+        &self,
+        cmd_buf: &CommandBufferRef,
+        a: &Buffer,
+        b_v: &Buffer,
+        out: &Buffer,
+        batch: usize,
+    ) {
+        let batch_u32 = batch as u32;
         let encoder = cmd_buf.new_compute_command_encoder();
         encoder.set_compute_pipeline_state(&self.pipeline);
-        encoder.set_buffer(0, Some(&a_buf), 0);
-        encoder.set_buffer(1, Some(&b_buf), 0);
-        encoder.set_buffer(2, Some(&out_buf), 0);
+        encoder.set_buffer(0, Some(a), 0);
+        encoder.set_buffer(1, Some(b_v), 0);
+        encoder.set_buffer(2, Some(out), 0);
         encoder.set_bytes(
             3,
             std::mem::size_of::<u32>() as u64,
@@ -894,31 +920,16 @@ impl SubExpKernelMetal {
             std::mem::size_of::<u32>() as u64,
             &batch_u32 as *const u32 as *const std::ffi::c_void,
         );
-
         let tg_width = self
             .pipeline
             .thread_execution_width()
             .max(1)
             .min(self.h as u64);
         encoder.dispatch_threads(
-            MTLSize {
-                width: self.h as u64,
-                height: batch as u64,
-                depth: 1,
-            },
-            MTLSize {
-                width: tg_width,
-                height: 1,
-                depth: 1,
-            },
+            MTLSize { width: self.h as u64, height: batch as u64, depth: 1 },
+            MTLSize { width: tg_width, height: 1, depth: 1 },
         );
         encoder.end_encoding();
-        commit_and_wait(cmd_buf);
-
-        unsafe {
-            let src = out_buf.contents() as *const f32;
-            std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), batch * self.h);
-        }
     }
 }
 
@@ -1026,13 +1037,30 @@ impl SigmoidKernelMetal {
             MTLResourceOptions::StorageModeShared,
         );
         let out_buf = device.new_buffer(n_bytes, MTLResourceOptions::StorageModeShared);
-        let batch_u32 = batch as u32;
 
         let cmd_buf = self.queue.new_command_buffer();
+        self.encode_into(cmd_buf, &x_buf, &out_buf, batch);
+        commit_and_wait(cmd_buf);
+
+        unsafe {
+            let src = out_buf.contents() as *const f32;
+            std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), batch * self.h);
+        }
+    }
+
+    /// Phase 13j: encode into a caller-provided command buffer.
+    pub fn encode_into(
+        &self,
+        cmd_buf: &CommandBufferRef,
+        x: &Buffer,
+        out: &Buffer,
+        batch: usize,
+    ) {
+        let batch_u32 = batch as u32;
         let encoder = cmd_buf.new_compute_command_encoder();
         encoder.set_compute_pipeline_state(&self.pipeline);
-        encoder.set_buffer(0, Some(&x_buf), 0);
-        encoder.set_buffer(1, Some(&out_buf), 0);
+        encoder.set_buffer(0, Some(x), 0);
+        encoder.set_buffer(1, Some(out), 0);
         encoder.set_bytes(
             2,
             std::mem::size_of::<u32>() as u64,
@@ -1043,31 +1071,16 @@ impl SigmoidKernelMetal {
             std::mem::size_of::<u32>() as u64,
             &batch_u32 as *const u32 as *const std::ffi::c_void,
         );
-
         let tg_width = self
             .pipeline
             .thread_execution_width()
             .max(1)
             .min(self.h as u64);
         encoder.dispatch_threads(
-            MTLSize {
-                width: self.h as u64,
-                height: batch as u64,
-                depth: 1,
-            },
-            MTLSize {
-                width: tg_width,
-                height: 1,
-                depth: 1,
-            },
+            MTLSize { width: self.h as u64, height: batch as u64, depth: 1 },
+            MTLSize { width: tg_width, height: 1, depth: 1 },
         );
         encoder.end_encoding();
-        commit_and_wait(cmd_buf);
-
-        unsafe {
-            let src = out_buf.contents() as *const f32;
-            std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), batch * self.h);
-        }
     }
 }
 
@@ -1298,21 +1311,50 @@ impl TimeMixKernelMetal {
         let p_buf = device.new_buffer(n_bytes, MTLResourceOptions::StorageModeShared);
         let a_buf = device.new_buffer(n_bytes, MTLResourceOptions::StorageModeShared);
         let b_buf = device.new_buffer(n_bytes, MTLResourceOptions::StorageModeShared);
-        let batch_u32 = batch as u32;
 
         let cmd_buf = self.queue.new_command_buffer();
+        self.encode_step1_into(
+            cmd_buf, &sp_buf, &k_buf, &sa_buf, &sb_buf, &v_buf, &ww_buf, &p_buf, &a_buf,
+            &b_buf, batch,
+        );
+        commit_and_wait(cmd_buf);
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(ww_buf.contents() as *const f32, ww_out.as_mut_ptr(), n);
+            std::ptr::copy_nonoverlapping(p_buf.contents() as *const f32, p_out.as_mut_ptr(), n);
+            std::ptr::copy_nonoverlapping(a_buf.contents() as *const f32, a_out.as_mut_ptr(), n);
+            std::ptr::copy_nonoverlapping(b_buf.contents() as *const f32, b_out.as_mut_ptr(), n);
+        }
+    }
+
+    /// Phase 13j: encode step1 into a caller-provided command buffer.
+    pub fn encode_step1_into(
+        &self,
+        cmd_buf: &CommandBufferRef,
+        state_p: &Buffer,
+        k: &Buffer,
+        state_a: &Buffer,
+        state_b: &Buffer,
+        v: &Buffer,
+        ww_out: &Buffer,
+        p_out: &Buffer,
+        a_out: &Buffer,
+        b_out: &Buffer,
+        batch: usize,
+    ) {
+        let batch_u32 = batch as u32;
         let encoder = cmd_buf.new_compute_command_encoder();
         encoder.set_compute_pipeline_state(&self.pipeline_step1);
-        encoder.set_buffer(0, Some(&sp_buf), 0);
+        encoder.set_buffer(0, Some(state_p), 0);
         encoder.set_buffer(1, Some(&self.time_first_buf), 0);
-        encoder.set_buffer(2, Some(&k_buf), 0);
-        encoder.set_buffer(3, Some(&sa_buf), 0);
-        encoder.set_buffer(4, Some(&sb_buf), 0);
-        encoder.set_buffer(5, Some(&v_buf), 0);
-        encoder.set_buffer(6, Some(&ww_buf), 0);
-        encoder.set_buffer(7, Some(&p_buf), 0);
-        encoder.set_buffer(8, Some(&a_buf), 0);
-        encoder.set_buffer(9, Some(&b_buf), 0);
+        encoder.set_buffer(2, Some(k), 0);
+        encoder.set_buffer(3, Some(state_a), 0);
+        encoder.set_buffer(4, Some(state_b), 0);
+        encoder.set_buffer(5, Some(v), 0);
+        encoder.set_buffer(6, Some(ww_out), 0);
+        encoder.set_buffer(7, Some(p_out), 0);
+        encoder.set_buffer(8, Some(a_out), 0);
+        encoder.set_buffer(9, Some(b_out), 0);
         encoder.set_bytes(
             10,
             std::mem::size_of::<u32>() as u64,
@@ -1323,33 +1365,16 @@ impl TimeMixKernelMetal {
             std::mem::size_of::<u32>() as u64,
             &batch_u32 as *const u32 as *const std::ffi::c_void,
         );
-
         let tg_width = self
             .pipeline_step1
             .thread_execution_width()
             .max(1)
             .min(self.h as u64);
         encoder.dispatch_threads(
-            MTLSize {
-                width: self.h as u64,
-                height: batch as u64,
-                depth: 1,
-            },
-            MTLSize {
-                width: tg_width,
-                height: 1,
-                depth: 1,
-            },
+            MTLSize { width: self.h as u64, height: batch as u64, depth: 1 },
+            MTLSize { width: tg_width, height: 1, depth: 1 },
         );
         encoder.end_encoding();
-        commit_and_wait(cmd_buf);
-
-        unsafe {
-            std::ptr::copy_nonoverlapping(ww_buf.contents() as *const f32, ww_out.as_mut_ptr(), n);
-            std::ptr::copy_nonoverlapping(p_buf.contents() as *const f32, p_out.as_mut_ptr(), n);
-            std::ptr::copy_nonoverlapping(a_buf.contents() as *const f32, a_out.as_mut_ptr(), n);
-            std::ptr::copy_nonoverlapping(b_buf.contents() as *const f32, b_out.as_mut_ptr(), n);
-        }
     }
 
     /// Run step2 (post-state-update, in-place over state vectors).
@@ -1386,18 +1411,43 @@ impl TimeMixKernelMetal {
         let sa_buf = upload(state_a);
         let sb_buf = upload(state_b);
         let ww_buf = device.new_buffer(n_bytes, MTLResourceOptions::StorageModeShared);
-        let batch_u32 = batch as u32;
 
         let cmd_buf = self.queue.new_command_buffer();
+        self.encode_step2_into(
+            cmd_buf, &k_buf, &v_buf, &sp_buf, &sa_buf, &sb_buf, &ww_buf, batch,
+        );
+        commit_and_wait(cmd_buf);
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(sp_buf.contents() as *const f32, state_p.as_mut_ptr(), n);
+            std::ptr::copy_nonoverlapping(sa_buf.contents() as *const f32, state_a.as_mut_ptr(), n);
+            std::ptr::copy_nonoverlapping(sb_buf.contents() as *const f32, state_b.as_mut_ptr(), n);
+            std::ptr::copy_nonoverlapping(ww_buf.contents() as *const f32, ww_out.as_mut_ptr(), n);
+        }
+    }
+
+    /// Phase 13j: encode step2 into a caller-provided command buffer.
+    pub fn encode_step2_into(
+        &self,
+        cmd_buf: &CommandBufferRef,
+        k: &Buffer,
+        v: &Buffer,
+        state_p: &Buffer,
+        state_a: &Buffer,
+        state_b: &Buffer,
+        ww_out: &Buffer,
+        batch: usize,
+    ) {
+        let batch_u32 = batch as u32;
         let encoder = cmd_buf.new_compute_command_encoder();
         encoder.set_compute_pipeline_state(&self.pipeline_step2);
         encoder.set_buffer(0, Some(&self.neg_exp_decay_buf), 0);
-        encoder.set_buffer(1, Some(&k_buf), 0);
-        encoder.set_buffer(2, Some(&v_buf), 0);
-        encoder.set_buffer(3, Some(&sp_buf), 0);
-        encoder.set_buffer(4, Some(&sa_buf), 0);
-        encoder.set_buffer(5, Some(&sb_buf), 0);
-        encoder.set_buffer(6, Some(&ww_buf), 0);
+        encoder.set_buffer(1, Some(k), 0);
+        encoder.set_buffer(2, Some(v), 0);
+        encoder.set_buffer(3, Some(state_p), 0);
+        encoder.set_buffer(4, Some(state_a), 0);
+        encoder.set_buffer(5, Some(state_b), 0);
+        encoder.set_buffer(6, Some(ww_out), 0);
         encoder.set_bytes(
             7,
             std::mem::size_of::<u32>() as u64,
@@ -1408,33 +1458,16 @@ impl TimeMixKernelMetal {
             std::mem::size_of::<u32>() as u64,
             &batch_u32 as *const u32 as *const std::ffi::c_void,
         );
-
         let tg_width = self
             .pipeline_step2
             .thread_execution_width()
             .max(1)
             .min(self.h as u64);
         encoder.dispatch_threads(
-            MTLSize {
-                width: self.h as u64,
-                height: batch as u64,
-                depth: 1,
-            },
-            MTLSize {
-                width: tg_width,
-                height: 1,
-                depth: 1,
-            },
+            MTLSize { width: self.h as u64, height: batch as u64, depth: 1 },
+            MTLSize { width: tg_width, height: 1, depth: 1 },
         );
         encoder.end_encoding();
-        commit_and_wait(cmd_buf);
-
-        unsafe {
-            std::ptr::copy_nonoverlapping(sp_buf.contents() as *const f32, state_p.as_mut_ptr(), n);
-            std::ptr::copy_nonoverlapping(sa_buf.contents() as *const f32, state_a.as_mut_ptr(), n);
-            std::ptr::copy_nonoverlapping(sb_buf.contents() as *const f32, state_b.as_mut_ptr(), n);
-            std::ptr::copy_nonoverlapping(ww_buf.contents() as *const f32, ww_out.as_mut_ptr(), n);
-        }
     }
 }
 
@@ -1638,20 +1671,55 @@ impl CumFreqsKernelMetal {
         let sum_buf = device.new_buffer(small_bytes, MTLResourceOptions::StorageModeShared);
         let scale_buf = device.new_buffer(small_bytes, MTLResourceOptions::StorageModeShared);
         let freqs_buf = device.new_buffer(u32_bytes, MTLResourceOptions::StorageModeShared);
+
+        let cmd_buf = self.queue.new_command_buffer();
+        self.encode_into(
+            cmd_buf,
+            &logits_buf,
+            &max_buf,
+            &exps_buf,
+            &sum_buf,
+            &scale_buf,
+            &freqs_buf,
+            batch,
+            python_freq_total,
+        );
+        commit_and_wait(cmd_buf);
+
+        // Read back freqs.
+        unsafe {
+            let src = freqs_buf.contents() as *const u32;
+            std::ptr::copy_nonoverlapping(src, freqs_out.as_mut_ptr(), n);
+        }
+    }
+
+    /// Phase 13j: encode the whole cum_freqs path into a caller-
+    /// provided command buffer. `logits_buf` is read; `max_buf`,
+    /// `exps_buf`, `sum_buf`, `scale_buf` are internal scratch the
+    /// caller must provide (they can be persistent on the session);
+    /// `freqs_buf` holds the final u32 output.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_into(
+        &self,
+        cmd_buf: &CommandBufferRef,
+        logits_buf: &Buffer,
+        max_buf: &Buffer,
+        exps_buf: &Buffer,
+        sum_buf: &Buffer,
+        scale_buf: &Buffer,
+        freqs_buf: &Buffer,
+        batch: usize,
+        python_freq_total: u32,
+    ) {
         let batch_u32 = batch as u32;
         let scale_total = python_freq_total as f32;
-
-        // Single command buffer chains all four stages. Each encoder
-        // ends before the next starts so Metal sequences the work,
-        // but there's no GPU↔CPU sync between them.
-        let cmd_buf = self.queue.new_command_buffer();
 
         // Stage 1: max per lane.
         {
             let encoder = cmd_buf.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(&self.pipeline_max);
-            encoder.set_buffer(0, Some(&logits_buf), 0);
-            encoder.set_buffer(1, Some(&max_buf), 0);
+            encoder.set_buffer(0, Some(logits_buf), 0);
+            encoder.set_buffer(1, Some(max_buf), 0);
             encoder.set_bytes(
                 2,
                 std::mem::size_of::<u32>() as u64,
@@ -1678,10 +1746,10 @@ impl CumFreqsKernelMetal {
         {
             let encoder = cmd_buf.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(&self.pipeline_softmax);
-            encoder.set_buffer(0, Some(&logits_buf), 0);
-            encoder.set_buffer(1, Some(&max_buf), 0);
-            encoder.set_buffer(2, Some(&exps_buf), 0);
-            encoder.set_buffer(3, Some(&sum_buf), 0);
+            encoder.set_buffer(0, Some(logits_buf), 0);
+            encoder.set_buffer(1, Some(max_buf), 0);
+            encoder.set_buffer(2, Some(exps_buf), 0);
+            encoder.set_buffer(3, Some(sum_buf), 0);
             encoder.set_bytes(
                 4,
                 std::mem::size_of::<u32>() as u64,
@@ -1704,13 +1772,12 @@ impl CumFreqsKernelMetal {
             encoder.end_encoding();
         }
 
-        // Stage 2b: scale = total / sum, on-GPU so we don't have to
-        // wait for sum_buf to land on the CPU before kicking stage 3.
+        // Stage 2b: scale = total / sum on-GPU.
         {
             let encoder = cmd_buf.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(&self.pipeline_scale);
-            encoder.set_buffer(0, Some(&sum_buf), 0);
-            encoder.set_buffer(1, Some(&scale_buf), 0);
+            encoder.set_buffer(0, Some(sum_buf), 0);
+            encoder.set_buffer(1, Some(scale_buf), 0);
             encoder.set_bytes(
                 2,
                 std::mem::size_of::<f32>() as u64,
@@ -1737,9 +1804,9 @@ impl CumFreqsKernelMetal {
         {
             let encoder = cmd_buf.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(&self.pipeline_quantize);
-            encoder.set_buffer(0, Some(&exps_buf), 0);
-            encoder.set_buffer(1, Some(&scale_buf), 0);
-            encoder.set_buffer(2, Some(&freqs_buf), 0);
+            encoder.set_buffer(0, Some(exps_buf), 0);
+            encoder.set_buffer(1, Some(scale_buf), 0);
+            encoder.set_buffer(2, Some(freqs_buf), 0);
             encoder.set_bytes(
                 3,
                 std::mem::size_of::<u32>() as u64,
@@ -1764,15 +1831,6 @@ impl CumFreqsKernelMetal {
                 MTLSize { width: tg_width, height: 1, depth: 1 },
             );
             encoder.end_encoding();
-        }
-
-        // Single sync for the whole chain.
-        commit_and_wait(cmd_buf);
-
-        // Read back freqs.
-        unsafe {
-            let src = freqs_buf.contents() as *const u32;
-            std::ptr::copy_nonoverlapping(src, freqs_out.as_mut_ptr(), n);
         }
     }
 }
@@ -1805,6 +1863,445 @@ fn build_cum_freqs_pipelines(
         mk("scale_from_sum_batched")?,
         mk("quantize_exps_to_freqs_batched")?,
     ))
+}
+
+// ===================================================================
+// Phase 13j: elementwise glue + embedding gather kernels.
+//
+// These were previously done CPU-side between GPU kernels in
+// `BatchedSession::forward_batched`, which forced a `commit_and_wait`
+// after every GPU dispatch so the CPU could read the intermediate
+// result. Moving them to GPU kernels means the whole forward pass
+// stays on-device, letting ~30 per-token commits collapse into 1.
+// ===================================================================
+const GLUE_KERNELS_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+// embed_gather: x[bb*h + i] = emb[prev_tokens[bb] * h + i]
+kernel void embed_gather(
+    device const float* emb    [[buffer(0)]],   // vocab * h
+    device const uint*  tokens [[buffer(1)]],   // batch
+    device float*       x      [[buffer(2)]],   // batch * h
+    constant uint&      h      [[buffer(3)]],
+    constant uint&      batch  [[buffer(4)]],
+    uint2               gid    [[thread_position_in_grid]]
+) {
+    uint i  = gid.x;
+    uint bb = gid.y;
+    if (i >= h || bb >= batch) return;
+    uint tok = tokens[bb];
+    x[bb * h + i] = emb[tok * h + i];
+}
+
+// blend3: three parallel input blends for time_mix.
+//   xk[b, i] = normed[b, i] * mix_k[i] + state_x[b, i] * (1 - mix_k[i])
+//   xv, xr analogously with mix_v, mix_r.
+// Also sets state_x <- normed so the next step sees the updated state.
+kernel void blend3_and_update_state(
+    device const float* normed    [[buffer(0)]],  // batch * h
+    device const float* state_x   [[buffer(1)]],  // batch * h (read)
+    device float*       state_out [[buffer(2)]],  // batch * h (write, = normed copy)
+    device const float* mix_k     [[buffer(3)]],  // h
+    device const float* mix_v     [[buffer(4)]],  // h
+    device const float* mix_r     [[buffer(5)]],  // h
+    device float*       xk        [[buffer(6)]],  // batch * h
+    device float*       xv        [[buffer(7)]],  // batch * h
+    device float*       xr        [[buffer(8)]],  // batch * h
+    constant uint&      h         [[buffer(9)]],
+    constant uint&      batch     [[buffer(10)]],
+    uint2               gid       [[thread_position_in_grid]]
+) {
+    uint i  = gid.x;
+    uint bb = gid.y;
+    if (i >= h || bb >= batch) return;
+    uint k = bb * h + i;
+    float n = normed[k];
+    float s = state_x[k];
+    float mk = mix_k[i];
+    float mv = mix_v[i];
+    float mr = mix_r[i];
+    xk[k] = n * mk + s * (1.0f - mk);
+    xv[k] = n * mv + s * (1.0f - mv);
+    xr[k] = n * mr + s * (1.0f - mr);
+    state_out[k] = n;
+}
+
+// blend2: two parallel input blends for channel_mix.
+kernel void blend2_and_update_state(
+    device const float* normed    [[buffer(0)]],
+    device const float* state_ffn [[buffer(1)]],
+    device float*       state_out [[buffer(2)]],
+    device const float* mix_k     [[buffer(3)]],
+    device const float* mix_r     [[buffer(4)]],
+    device float*       xk        [[buffer(5)]],
+    device float*       xr        [[buffer(6)]],
+    constant uint&      h         [[buffer(7)]],
+    constant uint&      batch     [[buffer(8)]],
+    uint2               gid       [[thread_position_in_grid]]
+) {
+    uint i  = gid.x;
+    uint bb = gid.y;
+    if (i >= h || bb >= batch) return;
+    uint k = bb * h + i;
+    float n = normed[k];
+    float s = state_ffn[k];
+    float mk = mix_k[i];
+    float mr = mix_r[i];
+    xk[k] = n * mk + s * (1.0f - mk);
+    xr[k] = n * mr + s * (1.0f - mr);
+    state_out[k] = n;
+}
+
+// out = a + b, elementwise.
+kernel void elem_add(
+    device const float* a   [[buffer(0)]],
+    device const float* b   [[buffer(1)]],
+    device float*       out [[buffer(2)]],
+    constant uint&      n   [[buffer(3)]],
+    uint                i   [[thread_position_in_grid]]
+) {
+    if (i >= n) return;
+    out[i] = a[i] + b[i];
+}
+
+// a += b, elementwise.
+kernel void elem_add_inplace(
+    device float*       a [[buffer(0)]],
+    device const float* b [[buffer(1)]],
+    constant uint&      n [[buffer(2)]],
+    uint                i [[thread_position_in_grid]]
+) {
+    if (i >= n) return;
+    a[i] += b[i];
+}
+
+// dst = src, elementwise copy.
+kernel void elem_copy(
+    device const float* src [[buffer(0)]],
+    device float*       dst [[buffer(1)]],
+    constant uint&      n   [[buffer(2)]],
+    uint                i   [[thread_position_in_grid]]
+) {
+    if (i >= n) return;
+    dst[i] = src[i];
+}
+
+// out = a * b, elementwise.
+kernel void elem_mul(
+    device const float* a   [[buffer(0)]],
+    device const float* b   [[buffer(1)]],
+    device float*       out [[buffer(2)]],
+    constant uint&      n   [[buffer(3)]],
+    uint                i   [[thread_position_in_grid]]
+) {
+    if (i >= n) return;
+    out[i] = a[i] * b[i];
+}
+
+// out = a * b / d, elementwise. Used by time_mix `rwkv = r * a / b`.
+kernel void elem_mul_div(
+    device const float* a   [[buffer(0)]],
+    device const float* b   [[buffer(1)]],
+    device const float* d   [[buffer(2)]],
+    device float*       out [[buffer(3)]],
+    constant uint&      n   [[buffer(4)]],
+    uint                i   [[thread_position_in_grid]]
+) {
+    if (i >= n) return;
+    out[i] = a[i] * b[i] / d[i];
+}
+
+// a = max(0, a), in-place.
+kernel void relu_inplace_kernel(
+    device float*  a [[buffer(0)]],
+    constant uint& n [[buffer(1)]],
+    uint           i [[thread_position_in_grid]]
+) {
+    if (i >= n) return;
+    a[i] = max(0.0f, a[i]);
+}
+
+// a = max(0, a)^2, in-place. Used by channel_mix on k.
+kernel void relu_square_inplace_kernel(
+    device float*  a [[buffer(0)]],
+    constant uint& n [[buffer(1)]],
+    uint           i [[thread_position_in_grid]]
+) {
+    if (i >= n) return;
+    float v = max(0.0f, a[i]);
+    a[i] = v * v;
+}
+"#;
+
+/// Bundle of elementwise + gather kernels used to keep the forward
+/// pass on-device between the big matvec/reduction kernels. All
+/// take pre-existing GPU buffers and encode into a caller-provided
+/// command buffer (no commit/wait inside).
+///
+/// One instance per BatchedSession — stateless apart from its own
+/// pipelines.
+pub struct GlueKernelsMetal {
+    queue: CommandQueue,
+    pipe_embed: ComputePipelineState,
+    pipe_blend3: ComputePipelineState,
+    pipe_blend2: ComputePipelineState,
+    pipe_add: ComputePipelineState,
+    pipe_add_inplace: ComputePipelineState,
+    pipe_copy: ComputePipelineState,
+    pipe_mul: ComputePipelineState,
+    pipe_mul_div: ComputePipelineState,
+    pipe_relu: ComputePipelineState,
+    pipe_relu_sq: ComputePipelineState,
+}
+
+impl GlueKernelsMetal {
+    pub fn new() -> Result<Self, MetalError> {
+        let device = Device::system_default().ok_or(MetalError::NoDevice)?;
+        let queue = device.new_command_queue();
+        let library = device
+            .new_library_with_source(GLUE_KERNELS_MSL, &metal::CompileOptions::new())
+            .map_err(MetalError::LibraryCompile)?;
+        let mk = |name: &str| -> Result<ComputePipelineState, MetalError> {
+            let f = library
+                .get_function(name, None)
+                .map_err(|e| MetalError::PipelineCreate(format!("{name}: {e:?}")))?;
+            device
+                .new_compute_pipeline_state_with_function(&f)
+                .map_err(MetalError::PipelineCreate)
+        };
+        Ok(Self {
+            queue,
+            pipe_embed: mk("embed_gather")?,
+            pipe_blend3: mk("blend3_and_update_state")?,
+            pipe_blend2: mk("blend2_and_update_state")?,
+            pipe_add: mk("elem_add")?,
+            pipe_add_inplace: mk("elem_add_inplace")?,
+            pipe_copy: mk("elem_copy")?,
+            pipe_mul: mk("elem_mul")?,
+            pipe_mul_div: mk("elem_mul_div")?,
+            pipe_relu: mk("relu_inplace_kernel")?,
+            pipe_relu_sq: mk("relu_square_inplace_kernel")?,
+        })
+    }
+
+    pub fn queue(&self) -> &CommandQueue {
+        &self.queue
+    }
+
+    pub fn device(&self) -> metal::Device {
+        self.queue.device().to_owned()
+    }
+
+    fn encode_2d(
+        cmd_buf: &CommandBufferRef,
+        pipe: &ComputePipelineState,
+        buffers: &[(&Buffer, u64)],
+        dims: (u32, u32),
+        width: u32,
+        height: u32,
+    ) {
+        let encoder = cmd_buf.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(pipe);
+        for (i, (buf, off)) in buffers.iter().enumerate() {
+            encoder.set_buffer(i as u64, Some(*buf), *off);
+        }
+        // scalar u32s: width/height
+        let next = buffers.len() as u64;
+        encoder.set_bytes(
+            next,
+            std::mem::size_of::<u32>() as u64,
+            &dims.0 as *const u32 as *const std::ffi::c_void,
+        );
+        encoder.set_bytes(
+            next + 1,
+            std::mem::size_of::<u32>() as u64,
+            &dims.1 as *const u32 as *const std::ffi::c_void,
+        );
+        let tg = pipe.thread_execution_width().max(1).min(width as u64);
+        encoder.dispatch_threads(
+            MTLSize { width: width as u64, height: height as u64, depth: 1 },
+            MTLSize { width: tg, height: 1, depth: 1 },
+        );
+        encoder.end_encoding();
+    }
+
+    fn encode_1d(
+        cmd_buf: &CommandBufferRef,
+        pipe: &ComputePipelineState,
+        buffers: &[&Buffer],
+        n: u32,
+    ) {
+        let encoder = cmd_buf.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(pipe);
+        for (i, buf) in buffers.iter().enumerate() {
+            encoder.set_buffer(i as u64, Some(*buf), 0);
+        }
+        let next = buffers.len() as u64;
+        encoder.set_bytes(
+            next,
+            std::mem::size_of::<u32>() as u64,
+            &n as *const u32 as *const std::ffi::c_void,
+        );
+        let tg = pipe.thread_execution_width().max(1).min(n as u64);
+        encoder.dispatch_threads(
+            MTLSize { width: n as u64, height: 1, depth: 1 },
+            MTLSize { width: tg, height: 1, depth: 1 },
+        );
+        encoder.end_encoding();
+    }
+
+    pub fn encode_embed(
+        &self,
+        cmd_buf: &CommandBufferRef,
+        emb: &Buffer,
+        tokens: &Buffer,
+        x: &Buffer,
+        h: u32,
+        batch: u32,
+    ) {
+        Self::encode_2d(
+            cmd_buf,
+            &self.pipe_embed,
+            &[(emb, 0), (tokens, 0), (x, 0)],
+            (h, batch),
+            h,
+            batch,
+        );
+    }
+
+    pub fn encode_blend3(
+        &self,
+        cmd_buf: &CommandBufferRef,
+        normed: &Buffer,
+        state_in: &Buffer,
+        state_out: &Buffer,
+        mix_k: &Buffer,
+        mix_v: &Buffer,
+        mix_r: &Buffer,
+        xk: &Buffer,
+        xv: &Buffer,
+        xr: &Buffer,
+        h: u32,
+        batch: u32,
+    ) {
+        Self::encode_2d(
+            cmd_buf,
+            &self.pipe_blend3,
+            &[
+                (normed, 0),
+                (state_in, 0),
+                (state_out, 0),
+                (mix_k, 0),
+                (mix_v, 0),
+                (mix_r, 0),
+                (xk, 0),
+                (xv, 0),
+                (xr, 0),
+            ],
+            (h, batch),
+            h,
+            batch,
+        );
+    }
+
+    pub fn encode_blend2(
+        &self,
+        cmd_buf: &CommandBufferRef,
+        normed: &Buffer,
+        state_in: &Buffer,
+        state_out: &Buffer,
+        mix_k: &Buffer,
+        mix_r: &Buffer,
+        xk: &Buffer,
+        xr: &Buffer,
+        h: u32,
+        batch: u32,
+    ) {
+        Self::encode_2d(
+            cmd_buf,
+            &self.pipe_blend2,
+            &[
+                (normed, 0),
+                (state_in, 0),
+                (state_out, 0),
+                (mix_k, 0),
+                (mix_r, 0),
+                (xk, 0),
+                (xr, 0),
+            ],
+            (h, batch),
+            h,
+            batch,
+        );
+    }
+
+    pub fn encode_add(
+        &self,
+        cmd_buf: &CommandBufferRef,
+        a: &Buffer,
+        b: &Buffer,
+        out: &Buffer,
+        n: u32,
+    ) {
+        Self::encode_1d(cmd_buf, &self.pipe_add, &[a, b, out], n);
+    }
+
+    pub fn encode_add_inplace(
+        &self,
+        cmd_buf: &CommandBufferRef,
+        a: &Buffer,
+        b: &Buffer,
+        n: u32,
+    ) {
+        Self::encode_1d(cmd_buf, &self.pipe_add_inplace, &[a, b], n);
+    }
+
+    pub fn encode_copy(
+        &self,
+        cmd_buf: &CommandBufferRef,
+        src: &Buffer,
+        dst: &Buffer,
+        n: u32,
+    ) {
+        Self::encode_1d(cmd_buf, &self.pipe_copy, &[src, dst], n);
+    }
+
+    pub fn encode_mul(
+        &self,
+        cmd_buf: &CommandBufferRef,
+        a: &Buffer,
+        b: &Buffer,
+        out: &Buffer,
+        n: u32,
+    ) {
+        Self::encode_1d(cmd_buf, &self.pipe_mul, &[a, b, out], n);
+    }
+
+    pub fn encode_mul_div(
+        &self,
+        cmd_buf: &CommandBufferRef,
+        a: &Buffer,
+        b: &Buffer,
+        d: &Buffer,
+        out: &Buffer,
+        n: u32,
+    ) {
+        Self::encode_1d(cmd_buf, &self.pipe_mul_div, &[a, b, d, out], n);
+    }
+
+    pub fn encode_relu_inplace(&self, cmd_buf: &CommandBufferRef, a: &Buffer, n: u32) {
+        Self::encode_1d(cmd_buf, &self.pipe_relu, &[a], n);
+    }
+
+    pub fn encode_relu_square_inplace(
+        &self,
+        cmd_buf: &CommandBufferRef,
+        a: &Buffer,
+        n: u32,
+    ) {
+        Self::encode_1d(cmd_buf, &self.pipe_relu_sq, &[a], n);
+    }
 }
 
 #[cfg(test)]

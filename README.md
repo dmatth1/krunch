@@ -23,29 +23,41 @@ structured data types — see `docs/phases/PHASE_11.md`.
 ### Speed by configuration (Phase 12 measured, Phase 13 in progress)
 
 All measurements on a clean Apple M-series MacBook (8 performance
-+ 2 efficiency cores), 1 MB enwik6 input, 5-run mean.
++ 2 efficiency cores). CPU rows use 1 MB enwik6 (5-run mean); the
+GPU row uses 50 KB enwik6 (still in wall-clock calibration while
+Phase 13 continues). **The ratios are only comparable at matched
+input size** — see note after the table.
 
-| backend | model | compress | decompress | ratio | bpb |
-|---|---|---:|---:|---:|---:|
-| CPU 1 thread | 200K | **22.7 KB/s** | **23.6 KB/s** | 0.1699 | ~1.43 |
-| CPU 10 threads (rayon) | 200K | **172 KB/s** | **180 KB/s** | 0.1699 | ~1.43 |
-| CPU 10 threads (rayon) | 3.2M | **40 KB/s** | **41 KB/s** | 0.1337 | ~1.07 |
-| GPU Metal (Apple Silicon, 200K, 8-lane lockstep) | 200K | ~1.12 KB/s | ~1.12 KB/s | 0.1791 | ~1.43 |
+| backend | model | input | compress | decompress | ratio | bpb |
+|---|---|---|---:|---:|---:|---:|
+| CPU 1 thread | 200K | 1 MB | **22.7 KB/s** | **23.6 KB/s** | 0.1699 | ~1.43 |
+| CPU 10 threads (rayon) | 200K | 1 MB | **172 KB/s** | **180 KB/s** | 0.1699 | ~1.43 |
+| CPU 10 threads (rayon) | 3.2M | 1 MB | **40 KB/s** | **41 KB/s** | 0.1337 | ~1.07 |
+| GPU Metal (200K, 32-lane + chained dispatch) | 200K | 50 KB | ~5.0 KB/s | ~5.6 KB/s | 0.1791 | ~1.43 |
+
+Ratio note: on the matched 50 KB slice, CPU also produces 0.1792
+(identical within FP noise — Metal and CPU forward passes diverge
+by a few ULPs which at cum_freqs `round()` boundaries shift a
+handful of freq entries, but within a single backend the AC is
+deterministic and the round trip is byte-identical). The 0.1699
+number on 1 MB is better because model state warms up across more
+segments.
 
 CPU multi-thread scaling: ~7.5× over single-thread (memory-bandwidth
 bound from 10 threads up).
 
 **Phase 13 GPU backend status:** functional, bit-correct, and (post
-Phase 13h) running 8 segments in true GPU lockstep. End-to-end
-50 KB enwik6 wall-clock on M-series: **~1.12 KB/s** Metal compress
-and decompress, ratio 0.1791, byte-identical round trip via auto-
-routed file header. That's a ~7.5× win over the original Phase 13e
-single-lane bring-up, with the full ~30× projected aggregate still
-gated on chaining the per-token kernel dispatches into one command
-buffer (Phase 13g step 2 — partially landed for cum_freqs, deferred
-for the rest of the forward pass). See
-[`docs/phases/PHASE_13.md`](docs/phases/PHASE_13.md) for the
-architecture and the bit-equivalence finding.
+Phase 13j) running the entire forward pass + cum_freqs in a single
+GPU command buffer per token across 32 segments in lockstep. End-
+to-end 50 KB enwik6 wall-clock on M-series: **~5.0 KB/s** Metal
+compress, **~5.6 KB/s** decompress, ratio 0.1791, byte-identical
+round trip via auto-routed file header. That's ~33× over the
+original Phase 13e bring-up. Remaining gap to the 1 MB/s projection
+is per-token dispatch-encoder overhead inside the chained command
+buffer — next levers are fusing the elementwise glue kernels into
+one "forward-step" kernel and scaling to larger batch on multi-MB
+inputs. See [`docs/phases/PHASE_13.md`](docs/phases/PHASE_13.md)
+for the architecture and the bit-equivalence finding.
 
 **Backend choice:** pass `--backend=cpu` (default) or `--backend=metal`.
 Files compressed with `metal` MUST be decompressed with `metal`
