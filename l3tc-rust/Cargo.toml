@@ -68,10 +68,13 @@ cli = ["dep:clap", "dep:anyhow"]
 
 [profile.release]
 opt-level = 3
-# Fat (whole-program) LTO across all crates. Slower compile but
-# squeezes the last few % out of the inner-loop kernels, especially
-# the rayon dispatch and matrixmultiply boundary calls.
-lto = "fat"
+# Thin LTO. Fat LTO was tried (Phase 12f) and gave equivalent
+# throughput on this workload (memory-bandwidth bound at the head
+# matvec). PGO was also attempted; rustc 1.94.1 + aarch64-apple-darwin
+# has a regression where the LLVM value-profile instrumentation
+# crashes the instrumented binary intermittently. Defer until a
+# future rustc fixes it.
+lto = "thin"
 codegen-units = 1
 strip = "symbols"
 panic = "abort"

@@ -22,6 +22,7 @@ Covers both compress throughput and bits-per-byte ratio. Items with
 | — | INT8 embedding row lookup | ⏭ skipped | 1 row/token × 96 f32 = 384 bytes at L2 latency = ~50ns total; INT8 saves ~30ns (~0.07% throughput) |
 | — | Top-K cum_freqs via quickselect | ⏭ skipped | finding K-th largest costs ~50-150 µs vs ~12 µs Pass-2 polynomial — net loss |
 | — | rANS replacing Nayuki AC | ⏭ skipped | measured ST decompress (23.6 KB/s) > ST compress (22.5 KB/s); AC decode is already essentially free after Phase 12a binary search |
+| — | PGO (profile-guided optimization) | ⏭ broken | rustc 1.94.1 + aarch64-apple-darwin: LLVM value-profile instrumentation segfaults intermittently (same binary, EXIT 0 once then 139 next). One successful run showed +5-6% multi-core. Defer to future rustc that fixes the regression. |
 
 **Cumulative throughput gain on 1MB enwik6, clean system, 3-5 run mean:**
 
