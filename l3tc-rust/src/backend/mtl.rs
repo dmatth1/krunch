@@ -1455,6 +1455,307 @@ fn build_time_mix_pipelines(
     Ok((mk("time_mix_step1_batched")?, mk("time_mix_step2_batched")?))
 }
 
+// ===================================================================
+// Phase 13e prep: cum_freqs path kernels (max_f32, shifted-exp-sum,
+// quantize_exps_to_freqs). Together these replace ~80% of the
+// per-token cum_freqs cost on CPU. The cum-prefix and the AC encode
+// stay CPU-side (per-lane serial work that's fast enough).
+// ===================================================================
+
+const CUM_FREQS_KERNEL_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+static inline float poly_exp(float x) {
+    x = fmax(x, -50.0f);
+    float y = x * 1.442695041f;
+    float k = floor(y);
+    float r = y - k;
+    float p = 0.000154035303933f;
+    p = fma(p, r, 0.001333355814643f);
+    p = fma(p, r, 0.009618129107628f);
+    p = fma(p, r, 0.055504108664821f);
+    p = fma(p, r, 0.240226506959101f);
+    p = fma(p, r, 0.693147180559945f);
+    p = fma(p, r, 1.0f);
+    int  ki = int(k);
+    int  exp_bits = (ki + 127) << 23;
+    float two_k = as_type<float>(exp_bits);
+    return p * two_k;
+}
+
+// Pass 1: per batch lane, find the max over `vocab` logits.
+// One thread per batch lane; loops over the lane's logits.
+kernel void max_f32_batched(
+    device const float* logits  [[buffer(0)]],   // batch * vocab
+    device float*       max_out [[buffer(1)]],   // batch
+    constant uint&      vocab   [[buffer(2)]],
+    constant uint&      batch   [[buffer(3)]],
+    uint                bb      [[thread_position_in_grid]]
+) {
+    if (bb >= batch) return;
+    device const float* lp = logits + (bb * vocab);
+    float m = lp[0];
+    for (uint i = 1; i < vocab; ++i) {
+        m = fmax(m, lp[i]);
+    }
+    max_out[bb] = m;
+}
+
+// Pass 2: per batch lane, compute exps and their sum.
+// exps[bb, i] = exp(logits[bb, i] - max[bb]); sum[bb] = Σ exps[bb, i].
+// One thread per batch lane.
+kernel void softmax_shifted_exp_sum_batched(
+    device const float* logits  [[buffer(0)]],   // batch * vocab
+    device const float* max_in  [[buffer(1)]],   // batch
+    device float*       exps    [[buffer(2)]],   // batch * vocab
+    device float*       sum_out [[buffer(3)]],   // batch
+    constant uint&      vocab   [[buffer(4)]],
+    constant uint&      batch   [[buffer(5)]],
+    uint                bb      [[thread_position_in_grid]]
+) {
+    if (bb >= batch) return;
+    device const float* lp = logits + (bb * vocab);
+    device float*       ep = exps   + (bb * vocab);
+    float m = max_in[bb];
+    float s = 0.0f;
+    for (uint i = 0; i < vocab; ++i) {
+        float e = poly_exp(lp[i] - m);
+        ep[i] = e;
+        s += e;
+    }
+    sum_out[bb] = s;
+}
+
+// Pass 3a: per (batch, i), quantize exps to u32 freqs.
+//   freqs[bb, i] = max(1, round(exps[bb, i] * scale[bb]))
+// where scale[bb] = inv_sum[bb] * PYTHON_FREQ_TOTAL (precomputed
+// CPU-side from sum_out).
+kernel void quantize_exps_to_freqs_batched(
+    device const float* exps   [[buffer(0)]],   // batch * vocab
+    device const float* scale  [[buffer(1)]],   // batch
+    device uint*        freqs  [[buffer(2)]],   // batch * vocab
+    constant uint&      vocab  [[buffer(3)]],
+    constant uint&      batch  [[buffer(4)]],
+    uint2               gid    [[thread_position_in_grid]]
+) {
+    uint i  = gid.x;
+    uint bb = gid.y;
+    if (i >= vocab || bb >= batch) return;
+    uint k = bb * vocab + i;
+    float scaled = round(exps[k] * scale[bb]);
+    uint q = (scaled < 1.0f) ? 1u : uint(scaled);
+    freqs[k] = q;
+}
+"#;
+
+/// Reusable batched cum_freqs path kernel set. Together produces
+/// per-lane `freqs[vocab]` arrays from per-lane `logits[vocab]`.
+/// The cum-prefix walk and the AC encode stay CPU-side.
+///
+/// CPU equivalent: [`crate::tensor::max_f32`],
+/// [`crate::tensor::softmax_shifted_exp_sum`],
+/// [`crate::tensor::quantize_exps_to_freqs`].
+pub struct CumFreqsKernelMetal {
+    queue: CommandQueue,
+    pipeline_max: ComputePipelineState,
+    pipeline_softmax: ComputePipelineState,
+    pipeline_quantize: ComputePipelineState,
+    vocab: usize,
+    vocab_u32: u32,
+}
+
+impl CumFreqsKernelMetal {
+    /// Build all three pipelines for the cum_freqs path. Stateless;
+    /// `vocab` fixes the per-lane element count.
+    pub fn new(vocab: usize) -> Result<Self, MetalError> {
+        let device = Device::system_default().ok_or(MetalError::NoDevice)?;
+        let queue = device.new_command_queue();
+        let (pipeline_max, pipeline_softmax, pipeline_quantize) =
+            build_cum_freqs_pipelines(&device)?;
+        Ok(Self {
+            queue,
+            pipeline_max,
+            pipeline_softmax,
+            pipeline_quantize,
+            vocab,
+            vocab_u32: vocab as u32,
+        })
+    }
+
+    /// End-to-end batched cum_freqs path: logits → freqs.
+    /// `logits` is `batch * vocab`; `freqs_out` is `batch * vocab`
+    /// `u32`. Internally allocates per-call buffers for max + sum +
+    /// exps + scale; these never cross back to CPU until the end.
+    pub fn forward_batched(
+        &self,
+        logits: &[f32],
+        freqs_out: &mut [u32],
+        batch: usize,
+        python_freq_total: u32,
+    ) {
+        let n = batch * self.vocab;
+        assert_eq!(logits.len(), n);
+        assert_eq!(freqs_out.len(), n);
+
+        let device = self.queue.device();
+        let f32_bytes = (n * std::mem::size_of::<f32>()) as u64;
+        let u32_bytes = (n * std::mem::size_of::<u32>()) as u64;
+        let small_bytes = (batch * std::mem::size_of::<f32>()) as u64;
+
+        let logits_buf = device.new_buffer_with_data(
+            logits.as_ptr() as *const std::ffi::c_void,
+            std::mem::size_of_val(logits) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let max_buf = device.new_buffer(small_bytes, MTLResourceOptions::StorageModeShared);
+        let exps_buf = device.new_buffer(f32_bytes, MTLResourceOptions::StorageModeShared);
+        let sum_buf = device.new_buffer(small_bytes, MTLResourceOptions::StorageModeShared);
+        let scale_buf = device.new_buffer(small_bytes, MTLResourceOptions::StorageModeShared);
+        let freqs_buf = device.new_buffer(u32_bytes, MTLResourceOptions::StorageModeShared);
+        let batch_u32 = batch as u32;
+
+        // Stage 1: max per lane.
+        {
+            let cmd_buf = self.queue.new_command_buffer();
+            let encoder = cmd_buf.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&self.pipeline_max);
+            encoder.set_buffer(0, Some(&logits_buf), 0);
+            encoder.set_buffer(1, Some(&max_buf), 0);
+            encoder.set_bytes(
+                2,
+                std::mem::size_of::<u32>() as u64,
+                &self.vocab_u32 as *const u32 as *const std::ffi::c_void,
+            );
+            encoder.set_bytes(
+                3,
+                std::mem::size_of::<u32>() as u64,
+                &batch_u32 as *const u32 as *const std::ffi::c_void,
+            );
+            let tg_width = self
+                .pipeline_max
+                .thread_execution_width()
+                .max(1)
+                .min(batch as u64);
+            encoder.dispatch_threads(
+                MTLSize { width: batch as u64, height: 1, depth: 1 },
+                MTLSize { width: tg_width, height: 1, depth: 1 },
+            );
+            encoder.end_encoding();
+            commit_and_wait(cmd_buf);
+        }
+
+        // Stage 2: shifted exp + sum per lane.
+        {
+            let cmd_buf = self.queue.new_command_buffer();
+            let encoder = cmd_buf.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&self.pipeline_softmax);
+            encoder.set_buffer(0, Some(&logits_buf), 0);
+            encoder.set_buffer(1, Some(&max_buf), 0);
+            encoder.set_buffer(2, Some(&exps_buf), 0);
+            encoder.set_buffer(3, Some(&sum_buf), 0);
+            encoder.set_bytes(
+                4,
+                std::mem::size_of::<u32>() as u64,
+                &self.vocab_u32 as *const u32 as *const std::ffi::c_void,
+            );
+            encoder.set_bytes(
+                5,
+                std::mem::size_of::<u32>() as u64,
+                &batch_u32 as *const u32 as *const std::ffi::c_void,
+            );
+            let tg_width = self
+                .pipeline_softmax
+                .thread_execution_width()
+                .max(1)
+                .min(batch as u64);
+            encoder.dispatch_threads(
+                MTLSize { width: batch as u64, height: 1, depth: 1 },
+                MTLSize { width: tg_width, height: 1, depth: 1 },
+            );
+            encoder.end_encoding();
+            commit_and_wait(cmd_buf);
+        }
+
+        // Compute scales CPU-side: scale[bb] = (1 / sum[bb]) * PYTHON_FREQ_TOTAL
+        // (faster than a separate kernel for `batch` scalars).
+        let scale_total = python_freq_total as f32;
+        unsafe {
+            let sum_ptr = sum_buf.contents() as *const f32;
+            let scale_ptr = scale_buf.contents() as *mut f32;
+            for bb in 0..batch {
+                let s = *sum_ptr.add(bb);
+                *scale_ptr.add(bb) = scale_total / s;
+            }
+        }
+
+        // Stage 3: quantize exps to u32 freqs per (batch, vocab).
+        {
+            let cmd_buf = self.queue.new_command_buffer();
+            let encoder = cmd_buf.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&self.pipeline_quantize);
+            encoder.set_buffer(0, Some(&exps_buf), 0);
+            encoder.set_buffer(1, Some(&scale_buf), 0);
+            encoder.set_buffer(2, Some(&freqs_buf), 0);
+            encoder.set_bytes(
+                3,
+                std::mem::size_of::<u32>() as u64,
+                &self.vocab_u32 as *const u32 as *const std::ffi::c_void,
+            );
+            encoder.set_bytes(
+                4,
+                std::mem::size_of::<u32>() as u64,
+                &batch_u32 as *const u32 as *const std::ffi::c_void,
+            );
+            let tg_width = self
+                .pipeline_quantize
+                .thread_execution_width()
+                .max(1)
+                .min(self.vocab as u64);
+            encoder.dispatch_threads(
+                MTLSize {
+                    width: self.vocab as u64,
+                    height: batch as u64,
+                    depth: 1,
+                },
+                MTLSize { width: tg_width, height: 1, depth: 1 },
+            );
+            encoder.end_encoding();
+            commit_and_wait(cmd_buf);
+        }
+
+        // Read back freqs.
+        unsafe {
+            let src = freqs_buf.contents() as *const u32;
+            std::ptr::copy_nonoverlapping(src, freqs_out.as_mut_ptr(), n);
+        }
+    }
+}
+
+fn build_cum_freqs_pipelines(
+    device: &Device,
+) -> Result<
+    (ComputePipelineState, ComputePipelineState, ComputePipelineState),
+    MetalError,
+> {
+    let library = device
+        .new_library_with_source(CUM_FREQS_KERNEL_MSL, &metal::CompileOptions::new())
+        .map_err(MetalError::LibraryCompile)?;
+    let mk = |name: &str| -> Result<ComputePipelineState, MetalError> {
+        let f = library
+            .get_function(name, None)
+            .map_err(|e| MetalError::PipelineCreate(format!("{name}: {e:?}")))?;
+        device
+            .new_compute_pipeline_state_with_function(&f)
+            .map_err(MetalError::PipelineCreate)
+    };
+    Ok((
+        mk("max_f32_batched")?,
+        mk("softmax_shifted_exp_sum_batched")?,
+        mk("quantize_exps_to_freqs_batched")?,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1963,5 +2264,102 @@ mod tests {
         assert!(max_abs(&cpu_state_a, &gpu_state_a) < tol, "state_a diff");
         assert!(max_abs(&cpu_state_b, &gpu_state_b) < tol, "state_b diff");
         assert!(max_abs(&cpu_ww, &gpu_ww) < tol, "ww diff");
+    }
+
+    /// Phase 13e prep: full batched cum_freqs path on Metal must
+    /// produce per-lane freqs that match (or are within ±1) the CPU
+    /// reference. The freqs are u32 — exact equality is desirable
+    /// but ±1 is acceptable since FMA-rounding can shift a borderline
+    /// `round()` by 1.
+    #[test]
+    fn cum_freqs_batched_metal_matches_cpu() {
+        use crate::tensor;
+
+        let vocab: usize = 16384;
+        let batch: usize = 8;
+        const PYTHON_FREQ_TOTAL: u32 = 10_000_000;
+
+        // Realistic logit distribution: most of the mass on a few
+        // tokens, long tail.
+        let mut logits = vec![0.0f32; batch * vocab];
+        for bi in 0..batch {
+            for i in 0..vocab {
+                let t = (i as f32) / (vocab as f32);
+                let base = if i % 97 == 0 {
+                    10.0 - 0.5 * t
+                } else if i % 31 == 0 {
+                    -5.0 + 2.0 * t
+                } else if i % 7 == 0 {
+                    -20.0 - 10.0 * t
+                } else {
+                    -40.0 - 20.0 * t
+                };
+                logits[bi * vocab + i] = base + (bi as f32) * 0.01;
+            }
+        }
+
+        // CPU reference: use the public test wrapper which mirrors
+        // the production path exactly.
+        let mut cpu_freqs = vec![0u32; batch * vocab];
+        let mut cpu_exps = vec![0.0f32; vocab];
+        for bi in 0..batch {
+            let lp = &logits[bi * vocab..(bi + 1) * vocab];
+            // Replicate the CPU pipeline manually: max → exp_sum →
+            // quantize. (We can't call logits_to_cum_freqs_scratch
+            // directly because it includes the prefix walk, which
+            // we're not testing here.)
+            let m = tensor::max_f32(lp);
+            let s = tensor::softmax_shifted_exp_sum(lp, m, &mut cpu_exps);
+            let scale = (1.0 / s) * (PYTHON_FREQ_TOTAL as f32);
+            tensor::quantize_exps_to_freqs(
+                &cpu_exps,
+                scale,
+                &mut cpu_freqs[bi * vocab..(bi + 1) * vocab],
+            );
+        }
+
+        // Metal path.
+        let kernel = match CumFreqsKernelMetal::new(vocab) {
+            Ok(k) => k,
+            Err(MetalError::NoDevice) => return,
+            Err(other) => panic!("CumFreqsKernelMetal::new failed: {other}"),
+        };
+        let mut gpu_freqs = vec![0u32; batch * vocab];
+        kernel.forward_batched(&logits, &mut gpu_freqs, batch, PYTHON_FREQ_TOTAL);
+
+        // Allow ±1 freq drift per element from FMA-rounding shifts
+        // around the round() boundary. Track the cumulative drift
+        // per lane (which is what matters for the AC encoder).
+        let mut max_diff = 0i64;
+        let mut max_idx = 0usize;
+        let mut total_drift_max = 0i64;
+        for bi in 0..batch {
+            let mut drift = 0i64;
+            for i in 0..vocab {
+                let k = bi * vocab + i;
+                let d = (cpu_freqs[k] as i64) - (gpu_freqs[k] as i64);
+                drift += d.abs();
+                if d.abs() > max_diff {
+                    max_diff = d.abs();
+                    max_idx = k;
+                }
+            }
+            if drift > total_drift_max {
+                total_drift_max = drift;
+            }
+        }
+        // Per-element drift bounded; total per-lane drift bounded.
+        // ±1 per borderline element, expect <vocab/100 drift overall.
+        assert!(
+            max_diff <= 1,
+            "freq diff {max_diff} > 1 at idx {max_idx} \
+             (cpu = {}, gpu = {})",
+            cpu_freqs[max_idx],
+            gpu_freqs[max_idx],
+        );
+        assert!(
+            total_drift_max < (vocab as i64) / 50,
+            "per-lane total drift {total_drift_max} too large"
+        );
     }
 }
