@@ -422,7 +422,7 @@ pub fn compress_one_segment_batched(
     session.reset();
     if tokens.len() < 2 {
         let mut buf = Vec::new();
-        let mut enc = ArithmeticEncoder::new(&mut buf);
+        let enc = ArithmeticEncoder::new(&mut buf);
         enc.finish()?;
         return Ok(buf);
     }
@@ -447,6 +447,56 @@ pub fn compress_one_segment_batched(
         enc.finish()?;
     }
     Ok(buf)
+}
+
+/// Compress multiple tokenized segments via Metal. Returns an AC
+/// body per input segment, in input order.
+///
+/// **Current implementation:** processes segments serially through
+/// `compress_one_segment_batched` (which uses lane 0 of a
+/// BatchedSession with `batch_size` lanes). The lockstep N-segment
+/// batching with per-lane AC encoders is left to a follow-up — the
+/// borrow-check ergonomics for holding N concurrent encoders over
+/// N independent `Vec<u8>` outputs need a small refactor of
+/// `ArithmeticEncoder`.
+///
+/// For now this gives the GPU forward-pass speedup at the cost of
+/// running the rest of the lanes idle — single-segment latency is
+/// correct, but throughput is bounded by per-segment GPU dispatch
+/// overhead (~25 ms for 1000 tokens at batch=1).
+pub fn compress_segments_batched(
+    model: &Model,
+    segments: &[Vec<u32>],
+    batch_size: usize,
+) -> Result<Vec<Vec<u8>>, crate::Error> {
+    if segments.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut bs = BatchedSession::new(model, batch_size)
+        .map_err(|e| crate::Error::BadCheckpoint(format!("Metal init: {e}")))?;
+    let mut out: Vec<Vec<u8>> = Vec::with_capacity(segments.len());
+    for tokens in segments {
+        out.push(compress_one_segment_batched(&mut bs, tokens)?);
+    }
+    Ok(out)
+}
+
+/// Inverse of [`compress_segments_batched`].
+pub fn decompress_segments_batched(
+    model: &Model,
+    bodies: &[(Vec<u8>, u32, u32)],
+    batch_size: usize,
+) -> Result<Vec<Vec<u32>>, crate::Error> {
+    if bodies.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut bs = BatchedSession::new(model, batch_size)
+        .map_err(|e| crate::Error::BadCheckpoint(format!("Metal init: {e}")))?;
+    let mut out: Vec<Vec<u32>> = Vec::with_capacity(bodies.len());
+    for (body, n_tokens, bos) in bodies {
+        out.push(decompress_one_segment_batched(&mut bs, body, *n_tokens, *bos)?);
+    }
+    Ok(out)
 }
 
 /// Decompress one segment via `BatchedSession`. Inverse of
@@ -679,6 +729,77 @@ mod tests {
             max_total < 10_000,
             "per-lane cum_freqs total drift = {max_total} \
              (max single-element diff = {max_diff}) — too large"
+        );
+    }
+
+    /// Top-level codec round-trip: compress text via Metal,
+    /// decompress via Metal, expect bit-identical output. Validates
+    /// the full file format + tokenizer + AC + GPU forward path.
+    #[test]
+    fn codec_metal_round_trip_50kb() {
+        let model_path = "checkpoints/l3tc_200k.bin";
+        if !std::path::Path::new(model_path).exists() {
+            return;
+        }
+        let mut ckpt = match Checkpoint::load(model_path) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let model = match Model::from_checkpoint(&mut ckpt) {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        // Probe Metal availability before doing real work.
+        if BatchedSession::new(&model, 1).is_err() {
+            return;
+        }
+
+        let tok_path =
+            "../vendor/L3TC/dictionary/vocab_enwik8_bpe_16384_0.999/spm_enwik8_bpe_16384_0.999.model";
+        if !std::path::Path::new(tok_path).exists() {
+            eprintln!("test skipped: tokenizer not found at {tok_path}");
+            return;
+        }
+        let tokenizer = match crate::Tokenizer::load(tok_path) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("test skipped: tokenizer load failed: {e}");
+                return;
+            }
+        };
+
+        let input_path = "/tmp/e6_50k.txt";
+        let text = match std::fs::read_to_string(input_path) {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+
+        let compressed = crate::codec::compress_with_metal(
+            &text,
+            &tokenizer,
+            &model,
+            crate::codec::DEFAULT_SEGMENT_BYTES,
+            1,
+        )
+        .expect("compress_with_metal");
+
+        let recovered = crate::codec::decompress_with_metal(&compressed, &tokenizer, &model)
+            .expect("decompress_with_metal");
+
+        assert_eq!(
+            recovered.len(),
+            text.len(),
+            "decompressed length mismatch: {} vs {}",
+            recovered.len(),
+            text.len()
+        );
+        assert_eq!(recovered, text, "decompressed text differs from original");
+        eprintln!(
+            "Metal round-trip OK: {} → {} → {} bytes (ratio {:.4})",
+            text.len(),
+            compressed.len(),
+            recovered.len(),
+            compressed.len() as f64 / text.len() as f64
         );
     }
 

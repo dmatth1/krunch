@@ -161,6 +161,21 @@ const N_SEGMENTS_IMPLICIT: u32 = u32::MAX;
 /// whether the compressor was actually useful for their input.
 const FLAG_RAW_STORE: u8 = 0x01;
 
+/// File-level flag bit: "encoded by the GPU (Metal) backend".
+///
+/// Phase 13e finding: the Metal forward pass diverges from CPU NEON
+/// by a few ULPs per layer. At borderline `round()` boundaries in
+/// cum_freqs that shifts a handful of freq-table entries, which
+/// desyncs the AC if encoder and decoder use different backends.
+///
+/// When this bit is set on the file header, the decoder MUST use
+/// the same Metal backend or the decompressed output will be
+/// garbage. CPU-only builds will refuse to decode such files with
+/// a clear error message.
+///
+/// CPU-encoded files (this bit unset) decode on either backend.
+pub(crate) const FLAG_GPU_ENCODED: u8 = 0x02;
+
 /// Per-segment flag bit: "raw fallback bytes follow the unks".
 ///
 /// When the encoder detects that `sp.decode(tokens) != original`
@@ -249,6 +264,161 @@ pub fn compress(
     // v3: append CRC32 of the entire payload written so far.
     let crc = crc32fast::hash(&out);
     out.write_u32::<LittleEndian>(crc)?;
+    Ok(out)
+}
+
+/// Compress text to bytes using the Metal GPU backend (Phase 13e).
+///
+/// Same file format as [`compress`], with the `FLAG_GPU_ENCODED`
+/// bit set in the header. Decompression must use the same Metal
+/// backend (see the docstring on `FLAG_GPU_ENCODED` for why).
+///
+/// `batch_size` controls how many segments are processed in lockstep
+/// per BatchedSession. The current `compress_segments_batched`
+/// implementation runs segments serially through lane 0 — proper
+/// lockstep N-segment encoding will land in a follow-up. For now
+/// `batch_size` should be 1 (it controls allocation, not actual
+/// concurrency).
+#[cfg(feature = "metal")]
+pub fn compress_with_metal(
+    text: &str,
+    tokenizer: &Tokenizer,
+    model: &Model,
+    segment_bytes: usize,
+    batch_size: usize,
+) -> Result<Vec<u8>> {
+    use crate::backend::batched::compress_segments_batched;
+
+    let segments = tokenizer.encode_file(text, segment_bytes)?;
+    let total_bytes = text.len() as u64;
+
+    // Build per-segment AC bodies via the GPU path. Raw-fallback
+    // segments bypass the model entirely (same behaviour as CPU).
+    let raw_fallback_indices: Vec<bool> =
+        segments.iter().map(|s| s.needs_raw_fallback).collect();
+    let token_inputs: Vec<Vec<u32>> = segments
+        .iter()
+        .map(|s| if s.needs_raw_fallback { Vec::new() } else { s.tokens.clone() })
+        .collect();
+
+    let mut bodies = compress_segments_batched(model, &token_inputs, batch_size.max(1))?;
+    // Replace raw-fallback bodies with empty (codec uses the raw
+    // bytes instead of the AC body for those segments).
+    for (i, is_raw) in raw_fallback_indices.iter().enumerate() {
+        if *is_raw {
+            bodies[i] = Vec::new();
+        }
+    }
+
+    let mut out = Vec::with_capacity(text.len() / 8);
+    write_header(&mut out, total_bytes, segments.len() as u32, FLAG_GPU_ENCODED)?;
+    for (seg, body) in segments.iter().zip(bodies.iter()) {
+        write_segment(&mut out, seg, body)?;
+    }
+    write_trailer(&mut out)?;
+    let crc = crc32fast::hash(&out);
+    out.write_u32::<LittleEndian>(crc)?;
+    Ok(out)
+}
+
+/// Decompress a blob produced by [`compress_with_metal`] back to
+/// text. Errors if the file's `FLAG_GPU_ENCODED` flag is set but
+/// this build doesn't have the `metal` feature, OR if the flag is
+/// unset (use [`decompress`] for CPU-encoded files instead).
+///
+/// Mirrors the structure of [`decompress`] but swaps per-segment
+/// AC decoding to the BatchedSession path so the freq tables match
+/// what `compress_with_metal` produced.
+#[cfg(feature = "metal")]
+pub fn decompress_with_metal(
+    bytes: &[u8],
+    tokenizer: &Tokenizer,
+    model: &Model,
+) -> Result<String> {
+    use crate::backend::batched::decompress_segments_batched;
+
+    // CRC + version check mirrors decompress_bytes().
+    if bytes.len() < 5 {
+        return Err(Error::BadCheckpoint("file too short".into()));
+    }
+    if &bytes[..4] != MAGIC {
+        return Err(Error::BadCheckpoint(format!(
+            "bad magic: {:?}",
+            &bytes[..4]
+        )));
+    }
+    let version = bytes[4];
+    let body: &[u8] = match version {
+        VERSION | VERSION_V3_COMPAT => {
+            let (payload, crc_bytes) = bytes.split_at(bytes.len() - 4);
+            let stored = LittleEndian::read_u32(crc_bytes);
+            let computed = crc32fast::hash(payload);
+            if stored != computed {
+                return Err(Error::BadCheckpoint(format!(
+                    "CRC32 mismatch: stored {stored:08x}, computed {computed:08x}"
+                )));
+            }
+            payload
+        }
+        VERSION_V2_COMPAT => bytes,
+        v => {
+            return Err(Error::BadCheckpoint(format!(
+                "unsupported version: {v}"
+            )));
+        }
+    };
+
+    let mut cursor = std::io::Cursor::new(body);
+    let (_total_bytes, n_segments, flags) = read_header(&mut cursor)?;
+    if flags & FLAG_GPU_ENCODED == 0 {
+        return Err(Error::BadCheckpoint(
+            "decompress_with_metal called on a CPU-encoded file; \
+             use decompress() instead"
+                .into(),
+        ));
+    }
+    if flags & FLAG_RAW_STORE != 0 {
+        // Raw store doesn't depend on the model, just unwrap.
+        let raw_end = body.len() - TRAILER.len();
+        let raw = &body[HEADER_SIZE..raw_end];
+        return String::from_utf8(raw.to_vec())
+            .map_err(|e| Error::BadCheckpoint(format!("raw-store body is not utf-8: {e}")));
+    }
+
+    // Parse segments (varint format = v4).
+    let mut raw_segments: Vec<SegmentRead> = Vec::with_capacity(n_segments as usize);
+    for _ in 0..n_segments {
+        raw_segments.push(read_segment_meta(&mut cursor)?);
+    }
+    read_trailer(&mut cursor)?;
+
+    // Run all tokenized segments through the Metal decoder. Raw-
+    // fallback segments are handled separately on CPU since they
+    // don't go through the model.
+    let mut tokenized_indices: Vec<usize> = Vec::new();
+    let mut bodies: Vec<(Vec<u8>, u32, u32)> = Vec::new();
+    for (i, seg) in raw_segments.iter().enumerate() {
+        if seg.raw_fallback.is_none() {
+            tokenized_indices.push(i);
+            bodies.push((seg.ac_body.to_vec(), seg.n_tokens, BOS_ID));
+        }
+    }
+    let decoded_tokens = decompress_segments_batched(model, &bodies, 1)?;
+
+    // Reassemble text in segment order.
+    let mut out = String::new();
+    let mut decoded_iter = decoded_tokens.into_iter();
+    for seg in &raw_segments {
+        if let Some(raw) = &seg.raw_fallback {
+            out.push_str(&String::from_utf8(raw.clone())?);
+        } else {
+            let tokens = decoded_iter
+                .next()
+                .ok_or_else(|| Error::BadCheckpoint("decoded segment count mismatch".into()))?;
+            let segment_text = tokenizer.decode_segment(&tokens, &seg.unks)?;
+            out.push_str(&segment_text);
+        }
+    }
     Ok(out)
 }
 
