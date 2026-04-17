@@ -240,6 +240,16 @@ enum Command {
     },
     /// Print version information.
     Version,
+
+    /// Phase 13b: run a self-contained Metal smoke test (compile a
+    /// trivial element-wise add kernel, dispatch it, verify output).
+    /// Available only when built with `--features=metal`.
+    #[cfg(feature = "metal")]
+    MetalSmoke {
+        /// Number of f32 elements to operate on.
+        #[arg(long, default_value_t = 1024)]
+        n: usize,
+    },
 }
 
 fn main() -> ExitCode {
@@ -248,7 +258,28 @@ fn main() -> ExitCode {
         Command::Version => {
             println!("l3tc {}", env!("CARGO_PKG_VERSION"));
             println!("phase 1 — research inference runtime");
+            #[cfg(feature = "metal")]
+            println!("backends: cpu, metal");
+            #[cfg(not(feature = "metal"))]
+            println!("backends: cpu");
             Ok(())
+        }
+        #[cfg(feature = "metal")]
+        Command::MetalSmoke { n } => {
+            use l3tc::backend::mtl;
+            let t0 = Instant::now();
+            match mtl::smoke_test(n) {
+                Ok(processed) => {
+                    let elapsed = t0.elapsed();
+                    println!(
+                        "Metal smoke test: OK — processed {} f32 elements in {:?} \
+                         (compile + dispatch + verify roundtrip)",
+                        processed, elapsed
+                    );
+                    Ok(())
+                }
+                Err(e) => Err(anyhow::anyhow!("Metal smoke test failed: {}", e)),
+            }
         }
         Command::Compress {
             input,

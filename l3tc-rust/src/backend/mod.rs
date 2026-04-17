@@ -4,6 +4,9 @@
 //! CUDA later) that runs the same RWKV forward pass with the
 //! same file format and bit-equivalent cum_freqs as the CPU path.
 //!
+//! See [`docs/phases/PHASE_13.md`](../../../docs/phases/PHASE_13.md)
+//! for the full plan and guardrails.
+//!
 //! # Design
 //!
 //! The hot path is `Session::forward(token) -> &[f32]`. Every backend
@@ -35,6 +38,9 @@
 //! // → Backend::Metal if compiled with --features=metal AND device
 //! //   present AND input ≥ GPU_THRESHOLD; otherwise Backend::Cpu.
 //! ```
+
+#[cfg(feature = "metal")]
+pub mod mtl;
 
 /// The set of inference backends this build was compiled to support.
 ///
@@ -114,7 +120,7 @@ impl Default for Backend {
 /// reachable (headless server, simulator, etc.).
 #[cfg(feature = "metal")]
 fn metal_available() -> bool {
-    metal::Device::system_default().is_some()
+    ::metal::Device::system_default().is_some()
 }
 
 #[cfg(test)]
