@@ -1083,6 +1083,378 @@ fn build_sigmoid_pipeline(device: &Device) -> Result<ComputePipelineState, Metal
         .map_err(MetalError::PipelineCreate)
 }
 
+// ===================================================================
+// Phase 13e prep: fused time_mix step1+step2 kernels (the most
+// complex per-token kernels). step1 runs pre-state-update, step2
+// runs post-state-update. Together they replace 11 separate
+// element-wise passes from the pre-fused CPU baseline (Phase 12e).
+// ===================================================================
+
+const TIME_MIX_STEPS_KERNEL_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+static inline float poly_exp(float x) {
+    x = fmax(x, -50.0f);
+    float y = x * 1.442695041f;
+    float k = floor(y);
+    float r = y - k;
+    float p = 0.000154035303933f;
+    p = fma(p, r, 0.001333355814643f);
+    p = fma(p, r, 0.009618129107628f);
+    p = fma(p, r, 0.055504108664821f);
+    p = fma(p, r, 0.240226506959101f);
+    p = fma(p, r, 0.693147180559945f);
+    p = fma(p, r, 1.0f);
+    int  ki = int(k);
+    int  exp_bits = (ki + 127) << 23;
+    float two_k = as_type<float>(exp_bits);
+    return p * two_k;
+}
+
+// time_mix step1 (pre-state-update). For each (batch, i):
+//   ww[i] = time_first[i] + k[i]
+//   p[i]  = max(state_p[i], ww[i])
+//   e1    = exp(state_p[i] - p[i])
+//   e2    = exp(ww[i] - p[i])
+//   a[i]  = e1 * state_a[i] + e2 * v[i]
+//   b[i]  = e1 * state_b[i] + e2
+// time_first is broadcast across batch (per-block parameter).
+kernel void time_mix_step1_batched(
+    device const float* state_p    [[buffer(0)]],   // batch * h
+    device const float* time_first [[buffer(1)]],   // h
+    device const float* k          [[buffer(2)]],   // batch * h
+    device const float* state_a    [[buffer(3)]],   // batch * h
+    device const float* state_b    [[buffer(4)]],   // batch * h
+    device const float* v          [[buffer(5)]],   // batch * h
+    device float*       ww_out     [[buffer(6)]],   // batch * h
+    device float*       p_out      [[buffer(7)]],   // batch * h
+    device float*       a_out      [[buffer(8)]],   // batch * h
+    device float*       b_out      [[buffer(9)]],   // batch * h
+    constant uint&      h          [[buffer(10)]],
+    constant uint&      batch      [[buffer(11)]],
+    uint2               gid        [[thread_position_in_grid]]
+) {
+    uint i  = gid.x;
+    uint bb = gid.y;
+    if (i >= h || bb >= batch) return;
+    uint kk = bb * h + i;
+
+    float sp = state_p[kk];
+    float kv = k[kk];
+    float vv = v[kk];
+    float sa = state_a[kk];
+    float sb = state_b[kk];
+
+    float ww = time_first[i] + kv;
+    float p  = max(sp, ww);
+    // Both exponents ≤ 0 since p = max(sp, ww).
+    float e1 = poly_exp(sp - p);
+    float e2 = poly_exp(ww - p);
+
+    ww_out[kk] = ww;
+    p_out[kk]  = p;
+    a_out[kk]  = fma(e2, vv, e1 * sa);
+    b_out[kk]  = fma(e1, sb, e2);
+}
+
+// time_mix step2 (post-state-update, in-place over state). For each:
+//   ww[i]      = state_p[i] + neg_exp_decay[i]
+//   p_new[i]   = max(ww[i], k[i])
+//   e1         = exp(ww[i] - p_new[i])
+//   e2         = exp(k[i] - p_new[i])
+//   state_a[i] = e1 * state_a[i] + e2 * v[i]
+//   state_b[i] = e1 * state_b[i] + e2
+//   state_p[i] = p_new[i]
+//   ww_out[i]  = ww[i]
+// neg_exp_decay is broadcast across batch.
+kernel void time_mix_step2_batched(
+    device const float* neg_exp_decay [[buffer(0)]],  // h
+    device const float* k             [[buffer(1)]],  // batch * h
+    device const float* v             [[buffer(2)]],  // batch * h
+    device float*       state_p       [[buffer(3)]],  // batch * h (in/out)
+    device float*       state_a       [[buffer(4)]],  // batch * h (in/out)
+    device float*       state_b       [[buffer(5)]],  // batch * h (in/out)
+    device float*       ww_out        [[buffer(6)]],  // batch * h
+    constant uint&      h             [[buffer(7)]],
+    constant uint&      batch         [[buffer(8)]],
+    uint2               gid           [[thread_position_in_grid]]
+) {
+    uint i  = gid.x;
+    uint bb = gid.y;
+    if (i >= h || bb >= batch) return;
+    uint kk = bb * h + i;
+
+    float sp = state_p[kk];
+    float kv = k[kk];
+    float vv = v[kk];
+    float sa = state_a[kk];
+    float sb = state_b[kk];
+    float nd = neg_exp_decay[i];
+
+    float ww    = sp + nd;
+    float p_new = max(ww, kv);
+    float e1    = poly_exp(ww - p_new);
+    float e2    = poly_exp(kv - p_new);
+
+    state_a[kk] = fma(e2, vv, e1 * sa);
+    state_b[kk] = fma(e1, sb, e2);
+    state_p[kk] = p_new;
+    ww_out[kk]  = ww;
+}
+"#;
+
+/// Reusable batched time_mix step1 + step2 kernel pair. The two
+/// pipelines share one MSL library; both are pre-built at
+/// construction. Per-block parameters (`time_first`, `neg_exp_decay`)
+/// stay GPU-resident; per-token state is passed in by the caller.
+///
+/// CPU equivalent: [`crate::tensor::time_mix_step1`] and
+/// [`crate::tensor::time_mix_step2`] (Phase 12e fused NEON).
+pub struct TimeMixKernelMetal {
+    queue: CommandQueue,
+    pipeline_step1: ComputePipelineState,
+    pipeline_step2: ComputePipelineState,
+    time_first_buf: Buffer,
+    neg_exp_decay_buf: Buffer,
+    h: usize,
+    h_u32: u32,
+}
+
+impl TimeMixKernelMetal {
+    /// Build the kernel pair and upload the per-block parameter
+    /// vectors. `time_first` and `neg_exp_decay` must both be `h`
+    /// floats — they're shared across all batch lanes.
+    pub fn new(time_first: &[f32], neg_exp_decay: &[f32], h: usize) -> Result<Self, MetalError> {
+        assert_eq!(time_first.len(), h);
+        assert_eq!(neg_exp_decay.len(), h);
+        let device = Device::system_default().ok_or(MetalError::NoDevice)?;
+        let queue = device.new_command_queue();
+        let (pipeline_step1, pipeline_step2) = build_time_mix_pipelines(&device)?;
+        let time_first_buf = device.new_buffer_with_data(
+            time_first.as_ptr() as *const std::ffi::c_void,
+            std::mem::size_of_val(time_first) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let neg_exp_decay_buf = device.new_buffer_with_data(
+            neg_exp_decay.as_ptr() as *const std::ffi::c_void,
+            std::mem::size_of_val(neg_exp_decay) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        Ok(Self {
+            queue,
+            pipeline_step1,
+            pipeline_step2,
+            time_first_buf,
+            neg_exp_decay_buf,
+            h,
+            h_u32: h as u32,
+        })
+    }
+
+    /// Run step1 (pre-state-update). Inputs are all `batch * h`
+    /// flat slices; outputs are written into the four `*_out`
+    /// parameters.
+    #[allow(clippy::too_many_arguments)]
+    pub fn step1_batched(
+        &self,
+        state_p: &[f32],
+        k: &[f32],
+        state_a: &[f32],
+        state_b: &[f32],
+        v: &[f32],
+        ww_out: &mut [f32],
+        p_out: &mut [f32],
+        a_out: &mut [f32],
+        b_out: &mut [f32],
+        batch: usize,
+    ) {
+        let n = batch * self.h;
+        assert_eq!(state_p.len(), n);
+        assert_eq!(k.len(), n);
+        assert_eq!(state_a.len(), n);
+        assert_eq!(state_b.len(), n);
+        assert_eq!(v.len(), n);
+        assert_eq!(ww_out.len(), n);
+        assert_eq!(p_out.len(), n);
+        assert_eq!(a_out.len(), n);
+        assert_eq!(b_out.len(), n);
+
+        let device = self.queue.device();
+        let n_bytes = (n * std::mem::size_of::<f32>()) as u64;
+        let upload = |data: &[f32]| {
+            device.new_buffer_with_data(
+                data.as_ptr() as *const std::ffi::c_void,
+                std::mem::size_of_val(data) as u64,
+                MTLResourceOptions::StorageModeShared,
+            )
+        };
+        let sp_buf = upload(state_p);
+        let k_buf = upload(k);
+        let sa_buf = upload(state_a);
+        let sb_buf = upload(state_b);
+        let v_buf = upload(v);
+        let ww_buf = device.new_buffer(n_bytes, MTLResourceOptions::StorageModeShared);
+        let p_buf = device.new_buffer(n_bytes, MTLResourceOptions::StorageModeShared);
+        let a_buf = device.new_buffer(n_bytes, MTLResourceOptions::StorageModeShared);
+        let b_buf = device.new_buffer(n_bytes, MTLResourceOptions::StorageModeShared);
+        let batch_u32 = batch as u32;
+
+        let cmd_buf = self.queue.new_command_buffer();
+        let encoder = cmd_buf.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&self.pipeline_step1);
+        encoder.set_buffer(0, Some(&sp_buf), 0);
+        encoder.set_buffer(1, Some(&self.time_first_buf), 0);
+        encoder.set_buffer(2, Some(&k_buf), 0);
+        encoder.set_buffer(3, Some(&sa_buf), 0);
+        encoder.set_buffer(4, Some(&sb_buf), 0);
+        encoder.set_buffer(5, Some(&v_buf), 0);
+        encoder.set_buffer(6, Some(&ww_buf), 0);
+        encoder.set_buffer(7, Some(&p_buf), 0);
+        encoder.set_buffer(8, Some(&a_buf), 0);
+        encoder.set_buffer(9, Some(&b_buf), 0);
+        encoder.set_bytes(
+            10,
+            std::mem::size_of::<u32>() as u64,
+            &self.h_u32 as *const u32 as *const std::ffi::c_void,
+        );
+        encoder.set_bytes(
+            11,
+            std::mem::size_of::<u32>() as u64,
+            &batch_u32 as *const u32 as *const std::ffi::c_void,
+        );
+
+        let tg_width = self
+            .pipeline_step1
+            .thread_execution_width()
+            .max(1)
+            .min(self.h as u64);
+        encoder.dispatch_threads(
+            MTLSize {
+                width: self.h as u64,
+                height: batch as u64,
+                depth: 1,
+            },
+            MTLSize {
+                width: tg_width,
+                height: 1,
+                depth: 1,
+            },
+        );
+        encoder.end_encoding();
+        commit_and_wait(cmd_buf);
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(ww_buf.contents() as *const f32, ww_out.as_mut_ptr(), n);
+            std::ptr::copy_nonoverlapping(p_buf.contents() as *const f32, p_out.as_mut_ptr(), n);
+            std::ptr::copy_nonoverlapping(a_buf.contents() as *const f32, a_out.as_mut_ptr(), n);
+            std::ptr::copy_nonoverlapping(b_buf.contents() as *const f32, b_out.as_mut_ptr(), n);
+        }
+    }
+
+    /// Run step2 (post-state-update, in-place over state vectors).
+    pub fn step2_batched(
+        &self,
+        k: &[f32],
+        v: &[f32],
+        state_p: &mut [f32],
+        state_a: &mut [f32],
+        state_b: &mut [f32],
+        ww_out: &mut [f32],
+        batch: usize,
+    ) {
+        let n = batch * self.h;
+        assert_eq!(k.len(), n);
+        assert_eq!(v.len(), n);
+        assert_eq!(state_p.len(), n);
+        assert_eq!(state_a.len(), n);
+        assert_eq!(state_b.len(), n);
+        assert_eq!(ww_out.len(), n);
+
+        let device = self.queue.device();
+        let n_bytes = (n * std::mem::size_of::<f32>()) as u64;
+        let upload = |data: &[f32]| {
+            device.new_buffer_with_data(
+                data.as_ptr() as *const std::ffi::c_void,
+                std::mem::size_of_val(data) as u64,
+                MTLResourceOptions::StorageModeShared,
+            )
+        };
+        let k_buf = upload(k);
+        let v_buf = upload(v);
+        let sp_buf = upload(state_p);
+        let sa_buf = upload(state_a);
+        let sb_buf = upload(state_b);
+        let ww_buf = device.new_buffer(n_bytes, MTLResourceOptions::StorageModeShared);
+        let batch_u32 = batch as u32;
+
+        let cmd_buf = self.queue.new_command_buffer();
+        let encoder = cmd_buf.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&self.pipeline_step2);
+        encoder.set_buffer(0, Some(&self.neg_exp_decay_buf), 0);
+        encoder.set_buffer(1, Some(&k_buf), 0);
+        encoder.set_buffer(2, Some(&v_buf), 0);
+        encoder.set_buffer(3, Some(&sp_buf), 0);
+        encoder.set_buffer(4, Some(&sa_buf), 0);
+        encoder.set_buffer(5, Some(&sb_buf), 0);
+        encoder.set_buffer(6, Some(&ww_buf), 0);
+        encoder.set_bytes(
+            7,
+            std::mem::size_of::<u32>() as u64,
+            &self.h_u32 as *const u32 as *const std::ffi::c_void,
+        );
+        encoder.set_bytes(
+            8,
+            std::mem::size_of::<u32>() as u64,
+            &batch_u32 as *const u32 as *const std::ffi::c_void,
+        );
+
+        let tg_width = self
+            .pipeline_step2
+            .thread_execution_width()
+            .max(1)
+            .min(self.h as u64);
+        encoder.dispatch_threads(
+            MTLSize {
+                width: self.h as u64,
+                height: batch as u64,
+                depth: 1,
+            },
+            MTLSize {
+                width: tg_width,
+                height: 1,
+                depth: 1,
+            },
+        );
+        encoder.end_encoding();
+        commit_and_wait(cmd_buf);
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(sp_buf.contents() as *const f32, state_p.as_mut_ptr(), n);
+            std::ptr::copy_nonoverlapping(sa_buf.contents() as *const f32, state_a.as_mut_ptr(), n);
+            std::ptr::copy_nonoverlapping(sb_buf.contents() as *const f32, state_b.as_mut_ptr(), n);
+            std::ptr::copy_nonoverlapping(ww_buf.contents() as *const f32, ww_out.as_mut_ptr(), n);
+        }
+    }
+}
+
+fn build_time_mix_pipelines(
+    device: &Device,
+) -> Result<(ComputePipelineState, ComputePipelineState), MetalError> {
+    let library = device
+        .new_library_with_source(TIME_MIX_STEPS_KERNEL_MSL, &metal::CompileOptions::new())
+        .map_err(MetalError::LibraryCompile)?;
+    let mk = |name: &str| -> Result<ComputePipelineState, MetalError> {
+        let f = library
+            .get_function(name, None)
+            .map_err(|e| MetalError::PipelineCreate(format!("{name}: {e:?}")))?;
+        device
+            .new_compute_pipeline_state_with_function(&f)
+            .map_err(MetalError::PipelineCreate)
+    };
+    Ok((mk("time_mix_step1_batched")?, mk("time_mix_step2_batched")?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1435,5 +1807,161 @@ mod tests {
             cpu_out[max_idx],
             gpu_out[max_idx],
         );
+    }
+
+    /// Phase 13e prep: batched time_mix step1 on Metal must match
+    /// the CPU NEON fused step1 for every (batch, i) cell.
+    #[test]
+    fn time_mix_step1_batched_metal_matches_cpu() {
+        use crate::tensor;
+
+        let h: usize = 96;
+        let batch: usize = 16;
+
+        // Realistic time_mix-range inputs.
+        let time_first: Vec<f32> = (0..h).map(|i| 0.5 - (i as f32) * 0.005).collect();
+        let mk = |seed: f32| -> Vec<f32> {
+            (0..(batch * h))
+                .map(|k| ((k as f32) * 0.01 + seed).sin())
+                .collect()
+        };
+        let state_p = mk(0.1);
+        let k_in = mk(0.2);
+        let state_a = mk(0.3);
+        let state_b = mk(0.4);
+        let v = mk(0.5);
+
+        // CPU reference per-lane.
+        let mut cpu_ww = vec![0.0f32; batch * h];
+        let mut cpu_p = vec![0.0f32; batch * h];
+        let mut cpu_a = vec![0.0f32; batch * h];
+        let mut cpu_b = vec![0.0f32; batch * h];
+        for bi in 0..batch {
+            let s = bi * h;
+            let e = s + h;
+            tensor::time_mix_step1(
+                &state_p[s..e],
+                &time_first,
+                &k_in[s..e],
+                &state_a[s..e],
+                &state_b[s..e],
+                &v[s..e],
+                &mut cpu_ww[s..e],
+                &mut cpu_p[s..e],
+                &mut cpu_a[s..e],
+                &mut cpu_b[s..e],
+            );
+        }
+
+        // Metal path.
+        let neg_decay = vec![0.0f32; h]; // unused by step1
+        let kernel = match TimeMixKernelMetal::new(&time_first, &neg_decay, h) {
+            Ok(k) => k,
+            Err(MetalError::NoDevice) => return,
+            Err(other) => panic!("TimeMixKernelMetal::new failed: {other}"),
+        };
+        let mut gpu_ww = vec![0.0f32; batch * h];
+        let mut gpu_p = vec![0.0f32; batch * h];
+        let mut gpu_a = vec![0.0f32; batch * h];
+        let mut gpu_b = vec![0.0f32; batch * h];
+        kernel.step1_batched(
+            &state_p,
+            &k_in,
+            &state_a,
+            &state_b,
+            &v,
+            &mut gpu_ww,
+            &mut gpu_p,
+            &mut gpu_a,
+            &mut gpu_b,
+            batch,
+        );
+
+        let max_abs = |a: &[f32], b: &[f32]| -> f32 {
+            a.iter()
+                .zip(b.iter())
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max)
+        };
+        let tol = 5e-4;
+        assert!(max_abs(&cpu_ww, &gpu_ww) < tol, "ww diff");
+        assert!(max_abs(&cpu_p, &gpu_p) < tol, "p diff");
+        assert!(max_abs(&cpu_a, &gpu_a) < tol, "a diff: {}", max_abs(&cpu_a, &gpu_a));
+        assert!(max_abs(&cpu_b, &gpu_b) < tol, "b diff: {}", max_abs(&cpu_b, &gpu_b));
+    }
+
+    /// Phase 13e prep: batched time_mix step2 on Metal must match
+    /// the CPU NEON fused step2 — including the in-place state
+    /// updates.
+    #[test]
+    fn time_mix_step2_batched_metal_matches_cpu() {
+        use crate::tensor;
+
+        let h: usize = 96;
+        let batch: usize = 16;
+
+        let neg_decay: Vec<f32> = (0..h).map(|i| -((i as f32) * 0.01).exp()).collect();
+        let mk = |seed: f32| -> Vec<f32> {
+            (0..(batch * h))
+                .map(|k| ((k as f32) * 0.01 + seed).cos())
+                .collect()
+        };
+        let k_in = mk(0.6);
+        let v = mk(0.7);
+        let state_p_init = mk(0.8);
+        let state_a_init = mk(0.9);
+        let state_b_init = mk(1.0);
+
+        // CPU reference: clone state and apply per-lane.
+        let mut cpu_state_p = state_p_init.clone();
+        let mut cpu_state_a = state_a_init.clone();
+        let mut cpu_state_b = state_b_init.clone();
+        let mut cpu_ww = vec![0.0f32; batch * h];
+        for bi in 0..batch {
+            let s = bi * h;
+            let e = s + h;
+            tensor::time_mix_step2(
+                &neg_decay,
+                &k_in[s..e],
+                &v[s..e],
+                &mut cpu_state_p[s..e],
+                &mut cpu_state_a[s..e],
+                &mut cpu_state_b[s..e],
+                &mut cpu_ww[s..e],
+            );
+        }
+
+        // Metal path: clone state again, apply the batched kernel.
+        let time_first = vec![0.0f32; h]; // unused by step2
+        let kernel = match TimeMixKernelMetal::new(&time_first, &neg_decay, h) {
+            Ok(k) => k,
+            Err(MetalError::NoDevice) => return,
+            Err(other) => panic!("TimeMixKernelMetal::new failed: {other}"),
+        };
+        let mut gpu_state_p = state_p_init.clone();
+        let mut gpu_state_a = state_a_init.clone();
+        let mut gpu_state_b = state_b_init.clone();
+        let mut gpu_ww = vec![0.0f32; batch * h];
+        kernel.step2_batched(
+            &k_in,
+            &v,
+            &mut gpu_state_p,
+            &mut gpu_state_a,
+            &mut gpu_state_b,
+            &mut gpu_ww,
+            batch,
+        );
+
+        let max_abs = |a: &[f32], b: &[f32]| -> f32 {
+            a.iter()
+                .zip(b.iter())
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max)
+        };
+        let tol = 5e-4;
+        assert!(max_abs(&cpu_state_p, &gpu_state_p) < tol, "state_p diff");
+        assert!(max_abs(&cpu_state_a, &gpu_state_a) < tol, "state_a diff");
+        assert!(max_abs(&cpu_state_b, &gpu_state_b) < tol, "state_b diff");
+        assert!(max_abs(&cpu_ww, &gpu_ww) < tol, "ww diff");
     }
 }
