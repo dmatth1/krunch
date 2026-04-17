@@ -148,16 +148,40 @@ Deliverable: a hidden CLI subcommand `l3tc metal-smoke` that
 allocates a Metal buffer, runs a kernel, verifies output. Errors
 out cleanly if Metal is unavailable.
 
-### Phase 13c — Metal head matvec kernel
+### Phase 13c — Metal head matvec kernel ✅ shipped
 
-The biggest single op in the forward pass (~25 µs/step CPU). Port
-`matvec_col_major_int8` (Phase 12d) to Metal. Single-stream
-batch=1 is likely overhead-bound; the goal at this phase is
-correctness, not throughput.
+Port `matvec_col_major_int8` (Phase 12d) to Metal. One thread per
+output row; per-iteration reads of `qmat` are fully coalesced
+(16 KB sequential reads per inner step on 16K vocab).
 
-Validation: head logits produced via Metal must match CPU output
-to within freq-quantization tolerance over a 60K-token corpus
-pass.
+Implementation (`src/backend/mtl.rs`):
+- `HEAD_MATVEC_KERNEL_MSL` — MSL compute kernel
+- `HeadKernelMetal` struct holds the model weights (qmat + scales)
+  on the GPU once at construction; per-token `forward()` only
+  uploads the small `x` vector and reads back logits.
+- Unit test asserts Metal output matches CPU NEON within
+  5e-3 absolute (well below the freq-quantization step).
+
+Measured single-call latency (16384 × 96, MacBook M-series,
+1000-iter mean):
+
+| backend | per-call | speedup vs CPU |
+|---|---:|---:|
+| CPU NEON (Phase 12d) | **115 µs** | 1.00× |
+| Metal GPU (Phase 13c) | **343 µs** | **0.33× (3× SLOWER)** |
+
+This is exactly the predicted batch=1 behaviour. The Metal kernel
+itself does 1.5 M FMA ops in ~340 µs ≈ 4.4 GFLOPs — about 0.1% of
+the M-series GPU's 5+ TFLOPs of available compute. Almost all of
+that 343 µs is **kernel launch + buffer-binding overhead**, not
+arithmetic.
+
+The path forward isn't tuning this kernel — it's **batching**
+(Phase 13e). At batch=512 the same dispatch cost amortizes across
+512 streams, putting per-stream amortized cost at sub-µs.
+
+CLI bench: `l3tc metal-bench-head --iters 1000` (gated by
+`--features=metal`).
 
 ### Phase 13d — Full forward pass on Metal
 

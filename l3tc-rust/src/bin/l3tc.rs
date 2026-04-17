@@ -250,6 +250,16 @@ enum Command {
         #[arg(long, default_value_t = 1024)]
         n: usize,
     },
+
+    /// Phase 13c benchmark: time the INT8 head matvec on CPU NEON vs
+    /// Metal at the L3TC-200K shape (16384 × 96), single-call latency.
+    /// Available only when built with `--features=metal`.
+    #[cfg(feature = "metal")]
+    MetalBenchHead {
+        /// Iterations per backend (excluding warm-up).
+        #[arg(long, default_value_t = 200)]
+        iters: usize,
+    },
 }
 
 fn main() -> ExitCode {
@@ -281,6 +291,8 @@ fn main() -> ExitCode {
                 Err(e) => Err(anyhow::anyhow!("Metal smoke test failed: {}", e)),
             }
         }
+        #[cfg(feature = "metal")]
+        Command::MetalBenchHead { iters } => run_metal_bench_head(iters),
         Command::Compress {
             input,
             output,
@@ -346,6 +358,82 @@ fn main() -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+#[cfg(feature = "metal")]
+fn run_metal_bench_head(iters: usize) -> anyhow::Result<()> {
+    use l3tc::backend::mtl::{HeadKernelMetal, MetalError};
+    use l3tc::tensor;
+
+    // L3TC-200K head shape.
+    let rows: usize = 16384;
+    let cols: usize = 96;
+    let warmup: usize = 20;
+
+    // Synthetic weights mirroring the unit test.
+    let mut qmat = vec![0i8; rows * cols];
+    for j in 0..cols {
+        for i in 0..rows {
+            qmat[j * rows + i] = (((i as i32 * 31 + j as i32 * 7) % 251) - 125) as i8;
+        }
+    }
+    let scales: Vec<f32> = (0..cols).map(|j| 1e-4 + (j as f32) * 1e-5).collect();
+    let x: Vec<f32> = (0..cols).map(|j| ((j as f32) - 48.0) * 0.05).collect();
+
+    println!(
+        "head matvec INT8 bench — shape {}×{}, {} warm-up + {} iters",
+        rows, cols, warmup, iters
+    );
+
+    // CPU NEON (Phase 12d).
+    let mut cpu_out = vec![0.0f32; rows];
+    for _ in 0..warmup {
+        tensor::matvec_col_major_int8(&qmat, &scales, &x, &mut cpu_out, rows, cols);
+    }
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        tensor::matvec_col_major_int8(&qmat, &scales, &x, &mut cpu_out, rows, cols);
+    }
+    let cpu_total = t0.elapsed();
+    let cpu_per_call = cpu_total / iters as u32;
+
+    // Metal (Phase 13c).
+    let kernel = HeadKernelMetal::new(&qmat, &scales, rows, cols).map_err(|e| {
+        if matches!(e, MetalError::NoDevice) {
+            anyhow::anyhow!("no Metal device available on this machine")
+        } else {
+            anyhow::anyhow!("Metal kernel init failed: {}", e)
+        }
+    })?;
+    let mut gpu_out = vec![0.0f32; rows];
+    for _ in 0..warmup {
+        kernel.forward(&x, &mut gpu_out);
+    }
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        kernel.forward(&x, &mut gpu_out);
+    }
+    let gpu_total = t0.elapsed();
+    let gpu_per_call = gpu_total / iters as u32;
+
+    let speedup = cpu_per_call.as_secs_f64() / gpu_per_call.as_secs_f64();
+
+    println!(
+        "  CPU NEON   : {:?} per call ({:?} total)",
+        cpu_per_call, cpu_total
+    );
+    println!(
+        "  Metal GPU  : {:?} per call ({:?} total)",
+        gpu_per_call, gpu_total
+    );
+    println!(
+        "  GPU/CPU    : {:.2}× speedup at batch=1 (per-call latency)",
+        speedup
+    );
+    println!(
+        "\nNote: this is single-call latency (one logits vector per dispatch).\n      Real GPU win is at batch≥64 — see Phase 13e."
+    );
+    Ok(())
 }
 
 fn run_compress(
