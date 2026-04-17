@@ -204,18 +204,24 @@ The path forward isn't tuning this kernel — it's **batching**
 CLI bench: `l3tc metal-bench-head --iters 1000` (gated by
 `--features=metal`).
 
-### Phase 13d — Full forward pass on Metal
+### Phase 13d — De-prioritized after Phase 13c data
 
-Port the remaining Phase 12 NEON kernels to Metal:
-- `time_mix_step1` and `step2` (fused state-evolution)
-- `sub_exp` (the polynomial NEON exp pattern → Metal compute)
-- `sigmoid` (safe `-|x|` form via Metal `select`)
-- `layer_norm` (3-pass NEON reduction → Metal threadgroup sum)
-- `max_f32` (reduction via Metal threadgroup)
-- `matvec_96x96`, `matvec_256x256`, etc. (the per-shape kernels)
+Originally planned to port all kernels for single-stream GPU. The
+Phase 13c batched bench (4.2× per-token at batch=256, 0.43× at
+batch=1) shows single-stream GPU loses to CPU NEON because of
+dispatch sync overhead. Skip 13d as originally specified; jump
+directly to Phase 13e.
 
-Validation gate: `entropy-bound` subcommand returns 0.163723 on
-enwik6 (exact match with CPU and Python L3TC).
+A **batched** layer_norm kernel was ported as Phase 13e prep
+(see `LayerNormKernelMetal` in `src/backend/mtl.rs`). This proves
+the batched pattern works for kernels with intra-element
+reductions, not just matvecs. Test: `layer_norm_batched_metal_matches_cpu`
+asserts within 5e-4 vs CPU NEON.
+
+The remaining kernels needed for batched forward pass — `sub_exp`,
+`sigmoid`, `time_mix_step1`/`step2`, `matvec_96x96`/`256x256`/etc
+— all map to one of two patterns (embarrassingly-parallel matvec
+or intra-element reduction), both now demonstrated.
 
 ### Phase 13e — Batched encode/decode for GPU throughput
 
