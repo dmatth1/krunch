@@ -80,6 +80,14 @@ enum Command {
         /// twice.
         #[arg(long)]
         verify: bool,
+        /// Backend for the forward pass. `cpu` (default) uses Phase
+        /// 12 NEON; `metal` uses the Phase 13 GPU backend (only on
+        /// builds with `--features=metal`). Files compressed with
+        /// `metal` MUST be decompressed with `metal` (the FP
+        /// arithmetic differs by a few ULPs across backends and
+        /// would desync the AC).
+        #[arg(long, default_value = "cpu")]
+        backend: String,
     },
     /// Decompress a file produced by `compress`.
     Decompress {
@@ -100,6 +108,11 @@ enum Command {
         /// Print per-phase timing information.
         #[arg(long)]
         time: bool,
+        /// Backend hint. Default `auto` reads the file header's
+        /// FLAG_GPU_ENCODED bit and picks the matching backend.
+        /// Use `cpu` or `metal` to force a specific backend.
+        #[arg(long, default_value = "auto")]
+        backend: String,
     },
     /// Phase 4a debug: dump per-token logits to a binary file for
     /// numerical diff against the Python L3TC reference. Reads the
@@ -301,14 +314,32 @@ fn main() -> ExitCode {
             segment_bytes,
             time,
             verify,
-        } => run_compress(&input, output.as_deref(), &model, &tokenizer, segment_bytes, time, verify),
+            backend,
+        } => run_compress(
+            &input,
+            output.as_deref(),
+            &model,
+            &tokenizer,
+            segment_bytes,
+            time,
+            verify,
+            &backend,
+        ),
         Command::Decompress {
             input,
             output,
             model,
             tokenizer,
             time,
-        } => run_decompress(&input, output.as_deref(), &model, &tokenizer, time),
+            backend,
+        } => run_decompress(
+            &input,
+            output.as_deref(),
+            &model,
+            &tokenizer,
+            time,
+            &backend,
+        ),
         Command::DumpLogits {
             input,
             model,
@@ -465,6 +496,7 @@ fn run_compress(
     segment_bytes: usize,
     print_time: bool,
     verify: bool,
+    backend: &str,
 ) -> Result<()> {
     let default_out = input.with_extension({
         let ext = input.extension().and_then(|s| s.to_str()).unwrap_or("");
@@ -472,12 +504,10 @@ fn run_compress(
     });
     let output = output.unwrap_or(&default_out);
 
-    // Stat the input up front so we can report the ratio without
-    // having to hold the whole thing in memory.
     let input_bytes = std::fs::metadata(input)
         .with_context(|| format!("stat input {input:?}"))?
         .len() as usize;
-    let read_dt = Instant::now().elapsed(); // placeholder; streaming reads during compress
+    let read_dt = Instant::now().elapsed();
 
     let t0 = Instant::now();
     let model = load_model(model_path)?;
@@ -488,24 +518,46 @@ fn run_compress(
         .with_context(|| format!("loading tokenizer {tokenizer_path:?}"))?;
     let tok_load_dt = t0.elapsed();
 
-    // Streaming encode: read input in bounded batches, write each
-    // batch's compressed segments immediately. Peak RSS is the
-    // model + tokenizer + ~4 MB batch buffer, independent of
-    // input size.
     let t0 = Instant::now();
-    let in_file = std::fs::File::open(input)
-        .with_context(|| format!("opening input {input:?}"))?;
-    let src = std::io::BufReader::new(in_file);
-    let out_file = std::fs::File::create(output)
-        .with_context(|| format!("creating output {output:?}"))?;
-    let mut out_buf = std::io::BufWriter::new(out_file);
-    encode_reader(src, &mut out_buf, &tokenizer, &model, segment_bytes)
-        .with_context(|| "compression failed")?;
-    use std::io::Write;
-    out_buf
-        .flush()
-        .with_context(|| format!("flushing output {output:?}"))?;
-    drop(out_buf);
+    let _ = segment_bytes; // segment size honoured per-backend below
+    match backend {
+        "cpu" => {
+            let in_file = std::fs::File::open(input)
+                .with_context(|| format!("opening input {input:?}"))?;
+            let src = std::io::BufReader::new(in_file);
+            let out_file = std::fs::File::create(output)
+                .with_context(|| format!("creating output {output:?}"))?;
+            let mut out_buf = std::io::BufWriter::new(out_file);
+            encode_reader(src, &mut out_buf, &tokenizer, &model, segment_bytes)
+                .with_context(|| "compression failed")?;
+            use std::io::Write;
+            out_buf
+                .flush()
+                .with_context(|| format!("flushing output {output:?}"))?;
+        }
+        #[cfg(feature = "metal")]
+        "metal" => {
+            let text = std::fs::read_to_string(input)
+                .with_context(|| format!("reading input {input:?}"))?;
+            let bytes =
+                l3tc::codec::compress_with_metal(&text, &tokenizer, &model, segment_bytes, 1)
+                    .with_context(|| "metal compression failed")?;
+            std::fs::write(output, &bytes)
+                .with_context(|| format!("writing output {output:?}"))?;
+        }
+        #[cfg(not(feature = "metal"))]
+        "metal" => {
+            return Err(anyhow::anyhow!(
+                "this build does not include Metal support — \
+                 rebuild with `--features=metal` to use --backend=metal"
+            ));
+        }
+        other => {
+            return Err(anyhow::anyhow!(
+                "unknown backend {other:?}; expected `cpu` or `metal`"
+            ));
+        }
+    }
     let compress_dt = t0.elapsed();
     let write_dt = std::time::Duration::from_secs(0);
 
@@ -538,8 +590,15 @@ fn run_compress(
             .with_context(|| format!("verify: reading {output:?}"))?;
         let original = std::fs::read(input)
             .with_context(|| format!("verify: reading {input:?}"))?;
-        let decompressed = decompress_bytes(&compressed, &tokenizer, &model)
-            .with_context(|| "verify: decompression failed")?;
+        // verify uses the same backend the file was compressed with
+        let decompressed = match backend {
+            #[cfg(feature = "metal")]
+            "metal" => l3tc::codec::decompress_with_metal(&compressed, &tokenizer, &model)
+                .with_context(|| "verify: metal decompression failed")?
+                .into_bytes(),
+            _ => decompress_bytes(&compressed, &tokenizer, &model)
+                .with_context(|| "verify: decompression failed")?,
+        };
         let verify_dt = vt0.elapsed();
         if decompressed != original {
             return Err(anyhow::anyhow!(
@@ -560,6 +619,7 @@ fn run_decompress(
     model_path: &Path,
     tokenizer_path: &Path,
     print_time: bool,
+    backend: &str,
 ) -> Result<()> {
     // Default output strips the .l3tc extension and appends .out
     let default_out = {
@@ -582,24 +642,64 @@ fn run_decompress(
         .with_context(|| format!("loading tokenizer {tokenizer_path:?}"))?;
     let tok_load_dt = t0.elapsed();
 
-    // Streaming decode: pipe src → dst with bounded RSS for
-    // raw-store files. Tokenized files still slurp the compressed
-    // body internally (it's small) but the output write stays
-    // streaming.
+    // Auto-detect backend by reading the file's flag byte if
+    // requested. Allows GPU-encoded files to round-trip on a
+    // GPU-equipped machine without the user passing --backend=metal.
+    let chosen_backend = if backend == "auto" {
+        let buf = std::fs::read(input)
+            .with_context(|| format!("opening input {input:?}"))?;
+        // Header layout: magic(4) + version(1) + flags(1) + ...
+        let flags_byte = if buf.len() > 5 { buf[5] } else { 0 };
+        let gpu_flag = flags_byte & 0x02 != 0; // FLAG_GPU_ENCODED
+        if gpu_flag { "metal" } else { "cpu" }
+    } else {
+        backend
+    };
+    if backend == "auto" {
+        eprintln!("auto-detected backend: {chosen_backend}");
+    }
+
     let t0 = Instant::now();
-    let in_file = std::fs::File::open(input)
-        .with_context(|| format!("opening input {input:?}"))?;
-    let src = std::io::BufReader::new(in_file);
-    let out_file = std::fs::File::create(output)
-        .with_context(|| format!("creating output {output:?}"))?;
-    let mut out_buf = std::io::BufWriter::new(out_file);
-    let written = decode_writer(src, &mut out_buf, &tokenizer, &model)
-        .with_context(|| "decompression failed")?;
-    use std::io::Write;
-    out_buf
-        .flush()
-        .with_context(|| format!("flushing output {output:?}"))?;
-    drop(out_buf);
+    let written = match chosen_backend {
+        "cpu" => {
+            let in_file = std::fs::File::open(input)
+                .with_context(|| format!("opening input {input:?}"))?;
+            let src = std::io::BufReader::new(in_file);
+            let out_file = std::fs::File::create(output)
+                .with_context(|| format!("creating output {output:?}"))?;
+            let mut out_buf = std::io::BufWriter::new(out_file);
+            let n = decode_writer(src, &mut out_buf, &tokenizer, &model)
+                .with_context(|| "decompression failed")?;
+            use std::io::Write;
+            out_buf
+                .flush()
+                .with_context(|| format!("flushing output {output:?}"))?;
+            n
+        }
+        #[cfg(feature = "metal")]
+        "metal" => {
+            let bytes = std::fs::read(input)
+                .with_context(|| format!("reading input {input:?}"))?;
+            let text =
+                l3tc::codec::decompress_with_metal(&bytes, &tokenizer, &model)
+                    .with_context(|| "metal decompression failed")?;
+            std::fs::write(output, text.as_bytes())
+                .with_context(|| format!("writing output {output:?}"))?;
+            text.len() as u64
+        }
+        #[cfg(not(feature = "metal"))]
+        "metal" => {
+            return Err(anyhow::anyhow!(
+                "this build does not include Metal support — \
+                 rebuild with `--features=metal` to decompress GPU-encoded files"
+            ));
+        }
+        other => {
+            return Err(anyhow::anyhow!(
+                "unknown backend {other:?}; expected `cpu`, `metal`, or `auto`"
+            ));
+        }
+    };
     let decompress_dt = t0.elapsed();
     let write_dt = std::time::Duration::from_secs(0);
 
