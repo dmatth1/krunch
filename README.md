@@ -20,27 +20,50 @@ structured data types — see `docs/phases/PHASE_11.md`.
 
 ## Numbers
 
+### Speed by configuration (Phase 12 measured, Phase 13 in progress)
+
+All measurements on a clean Apple M-series MacBook (8 performance
++ 2 efficiency cores), 1 MB enwik6 input, 5-run mean.
+
+| backend | model | compress | decompress | ratio | bpb |
+|---|---|---:|---:|---:|---:|
+| CPU 1 thread | 200K | **22.7 KB/s** | **23.6 KB/s** | 0.1699 | ~1.43 |
+| CPU 10 threads (rayon) | 200K | **172 KB/s** | **180 KB/s** | 0.1699 | ~1.43 |
+| CPU 10 threads (rayon) | 3.2M | **40 KB/s** | **41 KB/s** | 0.1337 | ~1.07 |
+| GPU Metal (Apple Silicon) | 200K | _Phase 13 in progress_ | _Phase 13 in progress_ | 0.1699 | ~1.43 |
+| GPU Metal (Apple Silicon) | 3.2M | _Phase 13 in progress_ | _Phase 13 in progress_ | 0.1337 | ~1.07 |
+
+CPU multi-thread scaling: ~7.5× over single-thread (memory-bandwidth
+bound from 10 threads up). Phase 13 GPU backend is opt-in via
+`--features=metal` — projected throughput on M-series Metal:
+**1-3 MB/s** for 200K (6-18× current CPU multi-thread); on RTX 4090
+batched: **10-20 MB/s** for 200K. See
+[`docs/phases/PHASE_13.md`](docs/phases/PHASE_13.md).
+
 ### vs learned compressors (CPU, wall-clock)
 
 | Compressor | bpb | KB/s | Hardware |
 |---|---:|---:|---|
-| **l3tc-prod 200K** | **~1.43** | **131** | Apple M-series, 8 cores |
-| **l3tc-prod 3.2M** | **~1.07** | **26** | Apple M-series, 8 cores |
+| **l3tc-prod 200K (Phase 12h)** | **~1.43** | **172** | Apple M-series, 10 cores |
+| **l3tc-prod 3.2M (Phase 12g)** | **~1.07** | **40** | Apple M-series, 10 cores |
 | nncp v3.2 | 0.857 | 4.04 | RTX 3090 GPU |
 | cmix v21 | 0.866 | 1.57 | CPU |
 | lstm-compress v3 | ~1.39 | 10.58 | CPU |
+| Nacrith (2026) | 0.94 (enwik8) | ~200-280 | GTX 1050 Ti GPU |
+| ts_zip (Bellard) | 1.084 | ~1024 | RTX 4090 GPU |
 
-l3tc-prod is 10-83× faster wall-clock than every LTCB entry.
-The trade: ~67% behind the ratio frontier. See
-[`docs/COMPARISON.md`](docs/COMPARISON.md) for the full
-primary-source analysis.
+l3tc-prod is 10-83× faster wall-clock than every CPU-only LTCB entry,
+and the only learned compressor with first-class CPU and (in-progress)
+GPU backends. The trade vs the ratio frontier: ~67% behind. See
+[`docs/COMPARISON.md`](docs/COMPARISON.md) for the full primary-source
+analysis.
 
 ### vs classical compressors (enwik6, 1 MB)
 
 | Compressor | Ratio | Compress MB/s |
 |---|---:|---:|
-| **l3tc-prod 200K** | **0.1699** | **0.131** |
-| **l3tc-prod 3.2M** | **0.1337** | **0.026** |
+| **l3tc-prod 200K** | **0.1699** | **0.172** |
+| **l3tc-prod 3.2M** | **0.1337** | **0.040** |
 | bzip2-9 | 0.2813 | 16.67 |
 | xz-9e | 0.2907 | 3.77 |
 | zstd-22 | 0.3001 | 4.34 |

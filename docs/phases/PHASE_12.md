@@ -1,8 +1,17 @@
-# Optimizations
+# Phase 12 — CPU optimization sweep (NEON, fused kernels, kernel polish)
 
-Speed and ratio levers for the L3TC Rust runtime.
+**Goal:** drive single-thread and multi-thread CPU compress/decompress
+throughput as high as possible without regressing ratio. Built on
+top of Phase 4-11. Concluded April 2026.
 
-## Phase 12 results (2026-04, clean system, 1MB enwik6)
+**Status:** complete. Eight shipped commits (12a-h), several reverts
+documented inline. Tactical CPU lever set is exhausted on the 200K /
+16K-vocab default model. Remaining gains are architectural — see the
+"big-picture" section at the end. GPU work continues as Phase 13.
+
+---
+
+## Results (clean system, 1MB enwik6)
 
 | state | compress | decompress | single-thread |
 |---|---:|---:|---:|

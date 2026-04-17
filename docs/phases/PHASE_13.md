@@ -257,7 +257,7 @@ based on input size + GPU availability.
 
 ## References
 
-- Phase 12 work: `docs/OPTIMIZATIONS.md` (NEON kernel reference)
+- Phase 12 work: `docs/phases/PHASE_12.md` (NEON kernel reference)
 - Competitor landscape: `docs/COMPARISON.md` (GPU compressor field)
 - Backend dispatch: `src/backend.rs`
 - Project goals: `CLAUDE.md` (target use cases, ratio/speed gates)
