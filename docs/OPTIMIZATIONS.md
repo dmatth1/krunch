@@ -37,6 +37,7 @@ to recover similar gains.
 | 12d | Hand-tuned NEON 16-wide INT8 head matvec | +11% ST, +4–5% MT |
 | 12e | Fused `time_mix` step1+step2 NEON kernels (11 passes → 2) | +0.5% ST, +3–4% MT |
 | 12f | NEON `layer_norm` (3-pass NEON reduction) | −1 µs/step on forward |
+| 12g | NEON 256×256 + 256×512 + 512×256 matvecs (3.2M tier) | 3.2M: +55% compress, +63% decompress (25→40 KB/s) |
 
 ## Done in Phase 12 — reverted
 
@@ -45,6 +46,7 @@ to recover similar gains.
 | Head matvec pre-widen (simple full-column variant) | regressed compress −12% on 32K vocab; 128 KB widen scratch + 128 KB output buffer blow M1 L1. Tiled rework still possible — needed for future 32K-vocab models. |
 | Chunk-skip in softmax Pass 2 (4-wide + 16-wide attempts) | sub-noise gain; NEON exp polynomial (~30 cycles/chunk) too cheap to gate on horizontal-max-then-branch (~10 cycles overhead per chunk). |
 | `lto = "fat"` in `Cargo.toml` | equivalent throughput to thin LTO on this memory-bound workload, and incompatible with PGO instrumentation when revisited. |
+| Larger default segment size (4096 → 8192) | monotonic ratio improvement at monotonic compress speed cost (~6% per 2×). Speed is non-negotiable per CLAUDE.md, so default kept at 4096. Empirical sweep table now in codec.rs docstring. |
 
 ## Done in Phase 12 — skipped with justification
 
@@ -73,19 +75,6 @@ dependency: `cum[i+1] = cum[i] + freqs[i]`. A SIMD parallel
 prefix scan via shift-and-add (Hillis–Steele) could halve the
 loop, but the u32→u64 widening at the AC boundary complicates
 the kernel. Complex to write correctly.
-
-#### Hand-tuned NEON for non-96 shapes (3.2M tier)
-
-**File:** `l3tc-rust/src/tensor.rs` (matvec dispatcher)
-**Impact:** 3.2M opt-in tier 26 KB/s → targeting 40+ KB/s
-
-The 3.2M tier falls through to `matrixmultiply::sgemm` for
-its 256×256 attention projections and 512×256 / 256×512 FFN.
-Custom NEON matvec kernels modeled on `matvec_96x96_neon`
-would close most of the 200K/3.2M speed gap. Phase 4d flagged
-this; never shipped because the default 200K tier was the
-priority. Doesn't help the 200K default but unlocks the 3.2M
-tier as a viable speed/ratio knob.
 
 ### Speed — both paths
 
@@ -220,14 +209,12 @@ threshold. **Architecturally the biggest speed unlock left.**
 
 Ratio-of-impact-to-effort, ratio-neutral first.
 
-1. **Larger segments** + **entropy-driven boundaries** — config + bench
-2. **Vocab tokenizer retrain** — already in flight; measure when done
-3. **256×256 NEON kernel** — unlocks 3.2M tier
-4. **Ratio-preserving distillation** — biggest ratio lever at fixed speed
-5. **Two-tier predictor** — biggest speed unlock left
-6. **Domain dispatch** — product-direction dependent, weeks of training
-7. **Hybrid dispatch / Phase 8** — product polish, not a ratio win on target
-8. **Byte-level unk model** — last reachable slice of entropy-bound gap
-9. **INT4 head** — ratio-risky; only if speed still wanted after the above
-10. **Prefix-sum SIMD** — small win, complex
-11. **Per-core multi-stream** — niche (few-core / serial paths)
+1. **Vocab tokenizer retrain** — already in flight; measure when done
+2. **Ratio-preserving distillation** — biggest ratio lever at fixed speed
+3. **Two-tier predictor** — biggest speed unlock left
+4. **Domain dispatch** — product-direction dependent, weeks of training
+5. **Hybrid dispatch / Phase 8** — product polish, not a ratio win on target
+6. **Byte-level unk model** — last reachable slice of entropy-bound gap
+7. **INT4 head** — ratio-risky; only if speed still wanted after the above
+8. **Prefix-sum SIMD** — small win, complex
+9. **Per-core multi-stream** — niche (few-core / serial paths)
