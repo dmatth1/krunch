@@ -30,22 +30,20 @@ All measurements on a clean Apple M-series MacBook (8 performance
 | CPU 1 thread | 200K | **22.7 KB/s** | **23.6 KB/s** | 0.1699 | ~1.43 |
 | CPU 10 threads (rayon) | 200K | **172 KB/s** | **180 KB/s** | 0.1699 | ~1.43 |
 | CPU 10 threads (rayon) | 3.2M | **40 KB/s** | **41 KB/s** | 0.1337 | ~1.07 |
-| GPU Metal (Apple Silicon, 200K) | 200K | ~0.15 KB/s | ~0.15 KB/s | 0.1791 | ~1.43 |
+| GPU Metal (Apple Silicon, 200K, 8-lane lockstep) | 200K | ~1.12 KB/s | ~1.12 KB/s | 0.1791 | ~1.43 |
 
 CPU multi-thread scaling: ~7.5× over single-thread (memory-bandwidth
 bound from 10 threads up).
 
-**Phase 13 GPU backend status:** functional and bit-correct
-(`l3tc compress in.txt -o in.l3tc --backend=metal` round-trips
-exactly), but throughput is currently bottlenecked by
-single-token-per-dispatch sync overhead (~30 GPU sync barriers per
-token at batch=1). Per-token wall time on M-series ≈ 30 ms vs CPU
-0.18 ms. Single-segment mode is dominant in the current code path.
-The proper fix — chaining all per-token dispatches in one command
-buffer + processing N segments in true lockstep — is a documented
-follow-up. The 4× per-token GPU win shown in the head-matvec
-microbench (`l3tc metal-bench-head`) projects to ~5 MB/s aggregate
-once batching is fixed. See
+**Phase 13 GPU backend status:** functional, bit-correct, and (post
+Phase 13h) running 8 segments in true GPU lockstep. End-to-end
+50 KB enwik6 wall-clock on M-series: **~1.12 KB/s** Metal compress
+and decompress, ratio 0.1791, byte-identical round trip via auto-
+routed file header. That's a ~7.5× win over the original Phase 13e
+single-lane bring-up, with the full ~30× projected aggregate still
+gated on chaining the per-token kernel dispatches into one command
+buffer (Phase 13g step 2 — partially landed for cum_freqs, deferred
+for the rest of the forward pass). See
 [`docs/phases/PHASE_13.md`](docs/phases/PHASE_13.md) for the
 architecture and the bit-equivalence finding.
 

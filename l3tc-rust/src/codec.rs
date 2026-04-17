@@ -278,12 +278,13 @@ pub fn compress(
 /// bit set in the header. Decompression must use the same Metal
 /// backend (see the docstring on `FLAG_GPU_ENCODED` for why).
 ///
-/// `batch_size` controls how many segments are processed in lockstep
-/// per BatchedSession. The current `compress_segments_batched`
-/// implementation runs segments serially through lane 0 — proper
-/// lockstep N-segment encoding will land in a follow-up. For now
-/// `batch_size` should be 1 (it controls allocation, not actual
-/// concurrency).
+/// `batch_size` controls how many segments run in lockstep per
+/// BatchedSession (Phase 13h). At `batch_size > 1` the per-token GPU
+/// dispatch overhead amortizes across all active lanes, giving an
+/// approximately `batch_size`× wall-clock throughput improvement on
+/// inputs with multiple segments. Values 4-32 are typical; larger
+/// values bring more amortization at the cost of wider GPU buffer
+/// allocations.
 #[cfg(feature = "metal")]
 pub fn compress_with_metal(
     text: &str,
@@ -408,7 +409,9 @@ pub fn decompress_with_metal(
             bodies.push((seg.ac_body.to_vec(), seg.n_tokens, BOS_ID));
         }
     }
-    let decoded_tokens = decompress_segments_batched(model, &bodies, 1)?;
+    // Phase 13h: 8-lane lockstep mirrors compress_with_metal so
+    // decoder per-token GPU overhead amortizes the same way.
+    let decoded_tokens = decompress_segments_batched(model, &bodies, 8)?;
 
     // Reassemble text in segment order.
     let mut out = String::new();

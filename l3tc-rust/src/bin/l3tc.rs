@@ -539,8 +539,12 @@ fn run_compress(
         "metal" => {
             let text = std::fs::read_to_string(input)
                 .with_context(|| format!("reading input {input:?}"))?;
+            // Phase 13h: 8-lane lockstep amortizes per-token GPU
+            // dispatch overhead across all active segments. Single-
+            // segment inputs (rare on real corpora) fall back to a
+            // 1-lane chunk and behave like the pre-13h serial path.
             let bytes =
-                l3tc::codec::compress_with_metal(&text, &tokenizer, &model, segment_bytes, 1)
+                l3tc::codec::compress_with_metal(&text, &tokenizer, &model, segment_bytes, 8)
                     .with_context(|| "metal compression failed")?;
             std::fs::write(output, &bytes)
                 .with_context(|| format!("writing output {output:?}"))?;

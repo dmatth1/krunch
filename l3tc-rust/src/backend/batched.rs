@@ -452,51 +452,190 @@ pub fn compress_one_segment_batched(
 /// Compress multiple tokenized segments via Metal. Returns an AC
 /// body per input segment, in input order.
 ///
-/// **Current implementation:** processes segments serially through
-/// `compress_one_segment_batched` (which uses lane 0 of a
-/// BatchedSession with `batch_size` lanes). The lockstep N-segment
-/// batching with per-lane AC encoders is left to a follow-up — the
-/// borrow-check ergonomics for holding N concurrent encoders over
-/// N independent `Vec<u8>` outputs need a small refactor of
-/// `ArithmeticEncoder`.
-///
-/// For now this gives the GPU forward-pass speedup at the cost of
-/// running the rest of the lanes idle — single-segment latency is
-/// correct, but throughput is bounded by per-segment GPU dispatch
-/// overhead (~25 ms for 1000 tokens at batch=1).
+/// Phase 13h: true N-segment lockstep. Segments are processed in
+/// chunks of `batch_size`; every step inside a chunk runs all lanes
+/// in parallel through a single GPU forward pass + cum_freqs, then
+/// each lane encodes its own next token into its own `Vec<u8>` AC
+/// body. Ragged lengths are handled per-lane via an `active` gate.
+/// Per-token GPU overhead (~30 sync barriers in the current chained-
+/// dispatch state) thus amortizes across `n_active` lanes.
 pub fn compress_segments_batched(
     model: &Model,
     segments: &[Vec<u32>],
     batch_size: usize,
 ) -> Result<Vec<Vec<u8>>, crate::Error> {
+    use crate::arithmetic::ArithmeticEncoder;
     if segments.is_empty() {
         return Ok(Vec::new());
     }
-    let mut bs = BatchedSession::new(model, batch_size)
+    let batch = batch_size.max(1);
+    let mut bs = BatchedSession::new(model, batch)
         .map_err(|e| crate::Error::BadCheckpoint(format!("Metal init: {e}")))?;
-    let mut out: Vec<Vec<u8>> = Vec::with_capacity(segments.len());
-    for tokens in segments {
-        out.push(compress_one_segment_batched(&mut bs, tokens)?);
+    let vocab = bs.vocab;
+    let mut all_outputs: Vec<Vec<u8>> = Vec::with_capacity(segments.len());
+
+    for chunk in segments.chunks(batch) {
+        let n = chunk.len();
+        bs.reset();
+
+        // Bookkeeping for the lockstep loop.
+        let max_len = chunk.iter().map(|s| s.len()).max().unwrap_or(0);
+
+        // Per-lane outputs (one Vec<u8> per chunk lane). Pre-size so
+        // the encoder's BitWriter never reallocates during the hot
+        // loop on typical text.
+        let bufs: Vec<Vec<u8>> = (0..n).map(|i| Vec::with_capacity(chunk[i].len())).collect();
+
+        if max_len < 2 {
+            // Every segment in the chunk is empty / single-token: no
+            // symbols to encode, just finish a fresh encoder per lane.
+            for buf in bufs {
+                let body = ArithmeticEncoder::new(buf).finish()?;
+                all_outputs.push(body);
+            }
+            continue;
+        }
+
+        // Move buffers into encoders. `finish()` returns the inner
+        // Vec<u8> back at the end of the chunk.
+        let mut encs: Vec<ArithmeticEncoder<Vec<u8>>> =
+            bufs.into_iter().map(ArithmeticEncoder::new).collect();
+
+        // Initialize prev[lane] for the first forward step.
+        // For lanes 0..n: prev = first token of segment (or 0 if empty).
+        // For lanes n..batch (idle padding): copy lane 0's value so we
+        // feed something valid; output is discarded.
+        let mut prev = vec![0u32; batch];
+        for i in 0..n {
+            if !chunk[i].is_empty() {
+                prev[i] = chunk[i][0];
+            }
+        }
+        let pad_token = prev[0];
+        for lane in n..batch {
+            prev[lane] = pad_token;
+        }
+
+        // Reusable cum_freqs scratch (vocab+1 u64).
+        let mut cum: Vec<u64> = Vec::with_capacity(vocab + 1);
+
+        for step in 1..max_len {
+            bs.forward_batched(&prev);
+            bs.cum_freqs_batched();
+
+            for lane in 0..n {
+                let seg = &chunk[lane];
+                if step >= seg.len() {
+                    continue;
+                }
+                let lane_freqs = &bs.freqs[lane * vocab..(lane + 1) * vocab];
+                cum.clear();
+                cum.push(0u64);
+                let mut total: u64 = 0;
+                for &f in lane_freqs {
+                    total += f as u64;
+                    cum.push(total);
+                }
+                encs[lane].encode_symbol(&cum, seg[step])?;
+                prev[lane] = seg[step];
+            }
+        }
+
+        // Finish each encoder, push its Vec<u8> body in lane order.
+        for enc in encs {
+            all_outputs.push(enc.finish()?);
+        }
     }
-    Ok(out)
+
+    Ok(all_outputs)
 }
 
-/// Inverse of [`compress_segments_batched`].
+/// Inverse of [`compress_segments_batched`]. Same lockstep N-lane
+/// batching: chunk the bodies into groups of `batch_size`, run a
+/// single GPU forward + cum_freqs per step across every active lane,
+/// then per-lane decode the next token from each lane's own AC body.
 pub fn decompress_segments_batched(
     model: &Model,
     bodies: &[(Vec<u8>, u32, u32)],
     batch_size: usize,
 ) -> Result<Vec<Vec<u32>>, crate::Error> {
+    use crate::arithmetic::ArithmeticDecoder;
     if bodies.is_empty() {
         return Ok(Vec::new());
     }
-    let mut bs = BatchedSession::new(model, batch_size)
+    let batch = batch_size.max(1);
+    let mut bs = BatchedSession::new(model, batch)
         .map_err(|e| crate::Error::BadCheckpoint(format!("Metal init: {e}")))?;
-    let mut out: Vec<Vec<u32>> = Vec::with_capacity(bodies.len());
-    for (body, n_tokens, bos) in bodies {
-        out.push(decompress_one_segment_batched(&mut bs, body, *n_tokens, *bos)?);
+    let vocab = bs.vocab;
+    let mut all_outputs: Vec<Vec<u32>> = Vec::with_capacity(bodies.len());
+
+    for chunk in bodies.chunks(batch) {
+        let n = chunk.len();
+        bs.reset();
+
+        // Per-lane decoder + output tokens. Decoders borrow from
+        // chunk's bodies; their lifetime is bounded by the chunk loop.
+        let mut decs: Vec<Option<ArithmeticDecoder<&[u8]>>> = Vec::with_capacity(n);
+        let mut tokens: Vec<Vec<u32>> = Vec::with_capacity(n);
+        let mut prev = vec![0u32; batch];
+
+        for (lane, (body, n_tokens, bos)) in chunk.iter().enumerate() {
+            let mut t = Vec::with_capacity(*n_tokens as usize);
+            t.push(*bos);
+            tokens.push(t);
+            prev[lane] = *bos;
+            if *n_tokens <= 1 {
+                decs.push(None);
+            } else {
+                decs.push(Some(ArithmeticDecoder::new(body.as_slice())?));
+            }
+        }
+        let pad_token = prev[0];
+        for lane in n..batch {
+            prev[lane] = pad_token;
+        }
+
+        let max_len = chunk.iter().map(|(_, n_tok, _)| *n_tok as usize).max().unwrap_or(0);
+        if max_len <= 1 {
+            for t in tokens {
+                all_outputs.push(t);
+            }
+            continue;
+        }
+
+        let mut cum: Vec<u64> = Vec::with_capacity(vocab + 1);
+        for step in 1..max_len {
+            bs.forward_batched(&prev);
+            bs.cum_freqs_batched();
+
+            for lane in 0..n {
+                let n_tokens = chunk[lane].1 as usize;
+                if step >= n_tokens {
+                    continue;
+                }
+                let dec = decs[lane]
+                    .as_mut()
+                    .expect("active lane has a decoder");
+                let lane_freqs = &bs.freqs[lane * vocab..(lane + 1) * vocab];
+                cum.clear();
+                cum.push(0u64);
+                let mut total: u64 = 0;
+                for &f in lane_freqs {
+                    total += f as u64;
+                    cum.push(total);
+                }
+                let tok = dec.decode_symbol(&cum)?;
+                tokens[lane].push(tok);
+                prev[lane] = tok;
+            }
+        }
+
+        for t in tokens {
+            all_outputs.push(t);
+        }
     }
-    Ok(out)
+
+    Ok(all_outputs)
 }
 
 /// Decompress one segment via `BatchedSession`. Inverse of

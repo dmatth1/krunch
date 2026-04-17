@@ -15,6 +15,13 @@ buffers, chain ~30 per-token kernels into one command buffer)
 is the structural change still required to hit the 1-3 MB/s
 projected throughput.
 
+**Phase 13h (true N-segment lockstep) shipped:** Metal compress and
+decompress now run 8 segments concurrently through one BatchedSession
+with per-lane AC encoders/decoders. Per-token GPU dispatch overhead
+amortizes across all active lanes. Measured on 50 KB enwik6:
+**~7.5× wall-clock speedup (0.15 → 1.12 KB/s)** with ratio held at
+0.1791 and bit-identical round trip.
+
 **Major caveat from Phase 13e:** files compressed via Metal must be
 decompressed via Metal. Cross-backend interop (the original
 guardrail) is not achievable because the GPU forward pass diverges
@@ -342,10 +349,10 @@ Wall-time on 8 KB Metal compress: 0.19 KB/s (vs ~0.15 KB/s prior;
 small at this scope because cum_freqs is only ~3 of the 30 per-
 token syncs).
 
-**Step 2 — extend the pattern to the forward pass 🚧 next**
+**Step 2 — extend the pattern to the forward pass (deferred for now)**
 
-The bigger win requires that the rest of the forward pass kernels
-chain too. Per-layer the natural groupings are:
+The bigger remaining win requires that the rest of the forward pass
+kernels chain too. Per-layer the natural groupings are:
 
 - `time_mix`: 3 attention matvecs (att_k/att_v/att_r) + sigmoid
   + step1 + step2 + output projection — currently 8 separate
@@ -365,8 +372,43 @@ fresh GPU buffers per call. To chain into one cmd_buf we need:
    blends, relu/square, residual add) either move to GPU kernels
    too or stay CPU-side at the cost of mid-cmd-buf syncs.
 
-This is structurally the path to the projected 1-3 MB/s on
-M-series. Not yet attempted.
+Lower-priority now that 13h has unlocked most of the practical win;
+revisit if the next throughput target requires it.
+
+### Phase 13h — True N-segment lockstep ✅ shipped
+
+`compress_segments_batched` and `decompress_segments_batched`
+previously ran each segment serially through lane 0 of a
+`BatchedSession`, leaving the other lanes idle (and giving up the
+whole point of batching). 13h replaces both with chunked-lockstep
+loops:
+
+- Process segments in chunks of `batch_size` (default 8 from CLI).
+- Per step inside a chunk, run a single `forward_batched` +
+  `cum_freqs_batched` across all active lanes — one GPU dispatch
+  sequence per step instead of N.
+- Per-lane AC encoders own their own `Vec<u8>` outputs; per-lane
+  AC decoders borrow each chunk's body slice. `ArithmeticEncoder`
+  was already generic over `W: Write`, so no encoder refactor was
+  needed — earlier comment to the contrary was a misread.
+- Ragged segment lengths handled by skipping the per-lane encode
+  step once `step >= seg.len()` while the GPU keeps running other
+  lanes lockstep.
+
+Wall-clock measurements on the 50 KB enwik6 / L3TC-200K combo:
+
+| metric | pre-13h (lane-0 serial) | post-13h (8-lane lockstep) | speedup |
+|---|---:|---:|---:|
+| Metal compress | 0.15 KB/s | **1.12 KB/s** | **~7.5×** |
+| Metal decompress | 0.15 KB/s | **1.12 KB/s** | **~7.5×** |
+| Ratio | 0.1791 | 0.1791 | (held) |
+| Round trip | byte-identical | byte-identical | ✅ |
+
+Aligns with the expected `batch_size`× amortization. Larger batch
+sizes (16, 32, 64) should keep scaling until per-call GPU compute
+exceeds dispatch overhead — to be measured next. Auto-routing on
+decompress reads `FLAG_GPU_ENCODED` from the file header and picks
+the matching backend without user intervention.
 
 ---
 
