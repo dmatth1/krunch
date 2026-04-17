@@ -23,41 +23,37 @@ structured data types — see `docs/phases/PHASE_11.md`.
 ### Speed by configuration (Phase 12 measured, Phase 13 in progress)
 
 All measurements on a clean Apple M-series MacBook (8 performance
-+ 2 efficiency cores). CPU rows use 1 MB enwik6 (5-run mean); the
-GPU row uses 50 KB enwik6 (still in wall-clock calibration while
-Phase 13 continues). **The ratios are only comparable at matched
-input size** — see note after the table.
++ 2 efficiency cores) using 1 MB enwik6. Metal row uses the
+post-Phase-13n fused-layer kernel at batch=256.
 
-| backend | model | input | compress | decompress | ratio | bpb |
-|---|---|---|---:|---:|---:|---:|
-| CPU 1 thread | 200K | 1 MB | **22.7 KB/s** | **23.6 KB/s** | 0.1699 | ~1.43 |
-| CPU 10 threads (rayon) | 200K | 1 MB | **172 KB/s** | **180 KB/s** | 0.1699 | ~1.43 |
-| CPU 10 threads (rayon) | 3.2M | 1 MB | **40 KB/s** | **41 KB/s** | 0.1337 | ~1.07 |
-| GPU Metal (200K, 32-lane + chained dispatch) | 200K | 50 KB | ~5.0 KB/s | ~5.6 KB/s | 0.1791 | ~1.43 |
+| backend | model | compress | decompress | ratio | bpb |
+|---|---|---:|---:|---:|---:|
+| CPU 1 thread | 200K | **22.7 KB/s** | **23.6 KB/s** | 0.1699 | ~1.43 |
+| CPU 10 threads (rayon) | 200K | **172 KB/s** | **180 KB/s** | 0.1699 | ~1.43 |
+| CPU 10 threads (rayon) | 3.2M | **40 KB/s** | **41 KB/s** | 0.1337 | ~1.07 |
+| GPU Metal (200K, 256-lane + fused layers) | 200K | **~48 KB/s** | ~48 KB/s | 0.1699 | ~1.43 |
 
-Ratio note: on the matched 50 KB slice, CPU also produces 0.1792
-(identical within FP noise — Metal and CPU forward passes diverge
-by a few ULPs which at cum_freqs `round()` boundaries shift a
-handful of freq entries, but within a single backend the AC is
-deterministic and the round trip is byte-identical). The 0.1699
-number on 1 MB is better because model state warms up across more
-segments.
+Metal ratio now matches CPU exactly (0.1699) — the Phase 13n
+fused-layer kernel keeps per-layer intermediate state in registers
+rather than round-tripping through device memory, which
+eliminated the ~1 ULP/layer FP drift that previously left the
+Metal cum_freqs one byte off CPU's on the same input.
 
 CPU multi-thread scaling: ~7.5× over single-thread (memory-bandwidth
 bound from 10 threads up).
 
-**Phase 13 GPU backend status:** functional, bit-correct, and (post
-Phase 13j) running the entire forward pass + cum_freqs in a single
-GPU command buffer per token across 32 segments in lockstep. End-
-to-end 50 KB enwik6 wall-clock on M-series: **~5.0 KB/s** Metal
-compress, **~5.6 KB/s** decompress, ratio 0.1791, byte-identical
-round trip via auto-routed file header. That's ~33× over the
-original Phase 13e bring-up. Remaining gap to the 1 MB/s projection
-is per-token dispatch-encoder overhead inside the chained command
-buffer — next levers are fusing the elementwise glue kernels into
-one "forward-step" kernel and scaling to larger batch on multi-MB
-inputs. See [`docs/phases/PHASE_13.md`](docs/phases/PHASE_13.md)
-for the architecture and the bit-equivalence finding.
+**Phase 13 GPU backend status:** functional, bit-correct, and
+approximately ~28% of the single-thread CPU rate on 1 MB enwik6.
+End-to-end Metal compress on 1 MB: **~48 KB/s** at batch=256 with
+the post-13n fused-layer kernel (one MSL dispatch covers the whole
+per-layer forward pass). Ratio 0.1699 matches CPU. Cumulative
+across Phases 13e→13n: **~320× over the 0.15 KB/s bring-up** (and
+~10× over the 5 KB/s that the 50 KB lane-starved test was showing
+pre-Phase-13n). The 1-3 MB/s projection remains open — next levers
+are multi-queue parallel dispatch, simdgroup_matrix tiles for the
+7 per-layer matvecs, or INT8-quantizing the 9216-element block
+projections. See [`docs/phases/PHASE_13.md`](docs/phases/PHASE_13.md)
+for the full architecture and the bit-equivalence finding.
 
 **Backend choice:** pass `--backend=cpu` (default) or `--backend=metal`.
 Files compressed with `metal` MUST be decompressed with `metal`

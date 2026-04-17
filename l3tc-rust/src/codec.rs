@@ -409,12 +409,13 @@ pub fn decompress_with_metal(
             bodies.push((seg.ac_body.to_vec(), seg.n_tokens, BOS_ID));
         }
     }
-    // Phase 13h + 13i: 16-lane lockstep matches the default for
-    // compress_with_metal. The per-token GPU overhead amortizes
-    // across all active lanes; 16 is the measured knee on 50 KB
-    // enwik6 before idle-lane overhead starts costing more than
-    // amortization saves.
-    let decoded_tokens = decompress_segments_batched(model, &bodies, 16)?;
+    // Post-Phase-13n: 256-lane lockstep matches the default for
+    // compress_with_metal when inputs have enough segments (~256+);
+    // below that the decoder pays for idle lanes. For small files
+    // the amortization knee is lower — the CLI `--metal-batch=N`
+    // flag lets the caller pick, but the library default stays at
+    // 256 to match the primary target (multi-MB archives).
+    let decoded_tokens = decompress_segments_batched(model, &bodies, 256)?;
 
     // Reassemble text in segment order.
     let mut out = String::new();
