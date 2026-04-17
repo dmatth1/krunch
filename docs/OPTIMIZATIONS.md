@@ -38,6 +38,7 @@ to recover similar gains.
 | 12e | Fused `time_mix` step1+step2 NEON kernels (11 passes → 2) | +0.5% ST, +3–4% MT |
 | 12f | NEON `layer_norm` (3-pass NEON reduction) | −1 µs/step on forward |
 | 12g | NEON 256×256 + 256×512 + 512×256 matvecs (3.2M tier) | 3.2M: +55% compress, +63% decompress (25→40 KB/s) |
+| 12h | drop `saturating_add` on cum_freqs prefix sum (overflow provably impossible) | +3% compress, +1% decompress; cum_freqs 20→18 µs/step |
 
 ## Done in Phase 12 — reverted
 
@@ -47,6 +48,7 @@ to recover similar gains.
 | Chunk-skip in softmax Pass 2 (4-wide + 16-wide attempts) | sub-noise gain; NEON exp polynomial (~30 cycles/chunk) too cheap to gate on horizontal-max-then-branch (~10 cycles overhead per chunk). |
 | `lto = "fat"` in `Cargo.toml` | equivalent throughput to thin LTO on this memory-bound workload, and incompatible with PGO instrumentation when revisited. |
 | Larger default segment size (4096 → 8192) | monotonic ratio improvement at monotonic compress speed cost (~6% per 2×). Speed is non-negotiable per CLAUDE.md, so default kept at 4096. Empirical sweep table now in codec.rs docstring. |
+| `time_mix3` fused triple-blend helper (Phase 12i attempt) | regressed single-thread forward pass +2-3% vs three separate `time_mix` calls. The 96-float `x` and `prev` inputs trivially fit L1 so calls 2/3 hit cache; the fused version's higher register pressure (8 input slices vs 4) broke LLVM's autovec pattern. |
 
 ## Done in Phase 12 — skipped with justification
 
