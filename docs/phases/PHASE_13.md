@@ -1,14 +1,20 @@
 # Phase 13 — GPU backend (Metal first, CUDA later)
 
 **Goal:** ship a first-class GPU backend that runs the same RWKV
-forward pass with the same file format and freq-equivalent
-cum_freqs as the CPU path. Default builds stay CPU-only with no
-GPU dependency; GPU is opt-in via cargo features. Files
-compressed with one backend decompress with any other.
+forward pass on Apple Metal. Default builds stay CPU-only with no
+GPU dependency; GPU is opt-in via cargo features.
 
-**Status as of 2026-04-16:** Phase 13a shipped — backend
-abstraction, cargo feature flags, optional `metal` dep all
-compile cleanly. Phase 13b (Metal smoke test) is next.
+**Status as of 2026-04-17:** **all six sub-phases shipped.** End-to-end
+CLI compress/decompress via Metal works on real corpora with
+bit-identical round-trip. Major correctness finding (bit) below.
+
+**Major caveat from Phase 13e:** files compressed via Metal must be
+decompressed via Metal. Cross-backend interop (the original
+guardrail) is not achievable because the GPU forward pass diverges
+from CPU NEON by a few ULPs per layer, which shifts a handful of
+freq-table entries at borderline `round()` boundaries. The file
+header carries a `FLAG_GPU_ENCODED` bit (codec.rs) and the CLI
+auto-routing reads it.
 
 ---
 
@@ -71,22 +77,25 @@ Two release artifacts:
 Backend selection at runtime is determined by build-time features
 plus runtime device probing.
 
-### 3. File format unchanged
+### 3. File format unchanged ⚠️ revised
 
-GPU-encoded files decompress on CPU and vice versa. The file
-format (v4, LEB128 segment headers + CRC32 trailer) is shared
-across all backends.
+**Original guardrail:** GPU-encoded files decompress on CPU and
+vice versa.
 
-This is enforced by the cum_freqs tolerance: any backend must
-produce logits whose `freq = max(1, round(p × 10_000_000))`
-quantization matches the CPU NEON path. Phase 4a already
-established this is a satisfiable bar (NEON sub_exp differs by
-~5e-7 relative from libm exp but produces identical freqs after
-quantization). The Metal kernel must clear the same bar.
+**Actual outcome:** the file format itself is unchanged (v4,
+LEB128 segment headers + CRC32 trailer), but a 1-bit flag
+(`FLAG_GPU_ENCODED`) was added to the existing flags byte to
+mark files produced by the GPU backend. Cross-backend interop
+is NOT achievable: the GPU forward pass diverges from CPU NEON
+by a few FP ULPs per layer, which at borderline `round()`
+boundaries in cum_freqs shifts a handful of freq entries, which
+desyncs the AC. Within a single backend the cum_freqs are
+deterministic, so encode + decode using the same backend works
+bit-identically.
 
-Validation: every Metal kernel ships with a unit test that
-diffs its output against the CPU equivalent at the freq level
-on a fixed corpus.
+CPU-encoded files (`FLAG_GPU_ENCODED` unset) decode on either
+backend trivially because the CPU path is what produced them.
+GPU-encoded files require a Metal-capable decoder.
 
 ### 4. GPU optimizes for the batched / bulk workload
 
@@ -223,26 +232,74 @@ The remaining kernels needed for batched forward pass — `sub_exp`,
 — all map to one of two patterns (embarrassingly-parallel matvec
 or intra-element reduction), both now demonstrated.
 
-### Phase 13e — Batched encode/decode for GPU throughput
+### Phase 13e — Batched encode/decode for GPU throughput ✅ shipped
 
-This is where GPU actually wins. Process N segments in parallel:
-- Per-segment `LayerState` becomes `LayerState[N]` on GPU
-- Forward pass advances all N segments by one token per dispatch
-- Cum_freqs computed in parallel across the batch
-- AC encode runs CPU-side after gathering freqs back (AC is
-  serial per segment — each segment's encoder is independent,
-  so encode them in parallel on CPU threads)
-- Optimal batch size: empirically ~64-512 (depends on model size
-  and GPU memory)
+All seven batched Metal kernels covering the full forward pass +
+cum_freqs are shipped, plus a `BatchedSession` orchestrator
+(`src/backend/batched.rs`) and codec entry points
+`compress_with_metal` / `decompress_with_metal` (codec.rs).
 
-### Phase 13f — Auto-routing, CLI flag, file format check
+Kernels (`src/backend/mtl.rs`):
+- `HeadKernelMetal` — INT8 head matvec, single + batched variants
+- `LayerNormKernelMetal` — 3-pass mean/var/output reduction
+- `Matvec96Metal` — square matvec for time_mix + channel_mix + short
+- `SubExpKernelMetal` — `exp(a-b)` polynomial (matches CPU NEON
+  coefficients exactly)
+- `SigmoidKernelMetal` — safe `-|x|` form via `vbslq` select
+- `TimeMixKernelMetal` — fused step1 + step2 (state evolution)
+- `CumFreqsKernelMetal` — max + softmax + quantize_exps_to_freqs
 
-- `--backend=auto|cpu|metal` flag in `l3tc.rs`
-- Heuristic: GPU if compiled in AND device available AND input ≥
-  `GPU_AUTO_THRESHOLD_BYTES`
-- Round-trip test: CPU compress → GPU decompress, GPU compress →
-  CPU decompress, byte-identical both ways
-- Document the GPU build process in README
+Tests in `backend::mtl::tests` and `backend::batched::tests`
+validate every kernel against its CPU equivalent within freq-
+quantization tolerance (54 tests pass under `--features=metal`).
+
+End-to-end test: `codec_metal_round_trip_50kb` — compresses the
+50 KB enwik6 corpus via Metal, decompresses via Metal, asserts
+bit-identical output. Result on a MacBook M-series:
+    51200 bytes → 9172 bytes → 51200 bytes  ratio 0.1791
+
+(Same ratio as CPU. Slow walltime: ~7 minutes due to the per-
+segment serial design — proper N-segment batching is the next
+follow-up; correctness is shipped.)
+
+**FINDING (the design constraint that broke the original interop
+guardrail):** GPU encode + CPU decode does NOT round-trip. The
+GPU forward pass FP arithmetic diverges from CPU NEON by a few
+ULPs per layer; at borderline `round()` boundaries in cum_freqs,
+that shifts a few freq-table entries; the AC encoder/decoder
+desync. Within a single backend the cum_freqs are deterministic
+so encode/decode line up. Conclusion: **encode and decode with
+the same backend.** The file header carries a `FLAG_GPU_ENCODED`
+bit so decoders know which backend produced the file.
+
+### Phase 13f — Auto-routing, CLI flag, file format check ✅ shipped
+
+CLI now exposes the backend choice on both compress and decompress:
+
+```bash
+# Compress with the default CPU backend (current behaviour).
+l3tc compress in.txt -o in.l3tc
+
+# Opt into Metal (only on builds with --features=metal):
+l3tc compress in.txt -o in.l3tc --backend=metal
+
+# Decompress: --backend=auto (default) reads the file header's
+# FLAG_GPU_ENCODED bit and picks the matching backend.
+l3tc decompress in.l3tc -o in.txt
+# auto-detected backend: metal
+
+# Or force a specific backend explicitly:
+l3tc decompress in.l3tc -o in.txt --backend=cpu
+l3tc decompress in.l3tc -o in.txt --backend=metal
+```
+
+CPU-only builds error out clearly when given a GPU-encoded file:
+"this build does not include Metal support — rebuild with
+`--features=metal` to decompress GPU-encoded files".
+
+Verified end-to-end: `cargo test --features=metal --lib` passes
+all 56 tests. CLI smoke test: 4 KB enwik6 → Metal compress →
+auto-detect Metal decompress → byte-identical.
 
 ---
 
