@@ -30,15 +30,30 @@ All measurements on a clean Apple M-series MacBook (8 performance
 | CPU 1 thread | 200K | **22.7 KB/s** | **23.6 KB/s** | 0.1699 | ~1.43 |
 | CPU 10 threads (rayon) | 200K | **172 KB/s** | **180 KB/s** | 0.1699 | ~1.43 |
 | CPU 10 threads (rayon) | 3.2M | **40 KB/s** | **41 KB/s** | 0.1337 | ~1.07 |
-| GPU Metal (Apple Silicon) | 200K | _Phase 13 in progress_ | _Phase 13 in progress_ | 0.1699 | ~1.43 |
-| GPU Metal (Apple Silicon) | 3.2M | _Phase 13 in progress_ | _Phase 13 in progress_ | 0.1337 | ~1.07 |
+| GPU Metal (Apple Silicon, 200K) | 200K | ~0.15 KB/s | ~0.15 KB/s | 0.1791 | ~1.43 |
 
 CPU multi-thread scaling: ~7.5× over single-thread (memory-bandwidth
-bound from 10 threads up). Phase 13 GPU backend is opt-in via
-`--features=metal` — projected throughput on M-series Metal:
-**1-3 MB/s** for 200K (6-18× current CPU multi-thread); on RTX 4090
-batched: **10-20 MB/s** for 200K. See
-[`docs/phases/PHASE_13.md`](docs/phases/PHASE_13.md).
+bound from 10 threads up).
+
+**Phase 13 GPU backend status:** functional and bit-correct
+(`l3tc compress in.txt -o in.l3tc --backend=metal` round-trips
+exactly), but throughput is currently bottlenecked by
+single-token-per-dispatch sync overhead (~30 GPU sync barriers per
+token at batch=1). Per-token wall time on M-series ≈ 30 ms vs CPU
+0.18 ms. Single-segment mode is dominant in the current code path.
+The proper fix — chaining all per-token dispatches in one command
+buffer + processing N segments in true lockstep — is a documented
+follow-up. The 4× per-token GPU win shown in the head-matvec
+microbench (`l3tc metal-bench-head`) projects to ~5 MB/s aggregate
+once batching is fixed. See
+[`docs/phases/PHASE_13.md`](docs/phases/PHASE_13.md) for the
+architecture and the bit-equivalence finding.
+
+**Backend choice:** pass `--backend=cpu` (default) or `--backend=metal`.
+Files compressed with `metal` MUST be decompressed with `metal`
+(FP arithmetic differs between backends and would desync the AC).
+The decompress side defaults to `--backend=auto`, which reads the
+file header to pick the matching backend automatically.
 
 ### vs learned compressors (CPU, wall-clock)
 
