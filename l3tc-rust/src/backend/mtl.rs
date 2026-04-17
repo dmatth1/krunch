@@ -453,6 +453,179 @@ fn build_head_pipelines(
     Ok((mk("head_matvec_int8")?, mk("head_matvec_int8_batched")?))
 }
 
+// ===================================================================
+// Phase 13e prep: batched layer_norm (proves the batched pattern
+// works for kernels with intra-element reductions, not just
+// embarrassingly-parallel matvecs).
+// ===================================================================
+
+const LAYER_NORM_KERNEL_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+// Batched layer norm: out[b, i] = (x[b, i] - mean_b) / sqrt(var_b + eps)
+//                                 * weight[i] + bias[i]
+// One thread per batch lane; each thread does its own three-pass
+// reduction over h. For h=96 the pass cost is ~96 ops × 3, which
+// is fine — at batch=256 the dispatch handles 256 lanes in parallel.
+kernel void layer_norm_batched(
+    device const float* x      [[buffer(0)]],   // batch * h
+    device const float* weight [[buffer(1)]],   // h
+    device const float* bias   [[buffer(2)]],   // h
+    device float*       out    [[buffer(3)]],   // batch * h
+    constant uint&      h      [[buffer(4)]],
+    constant uint&      batch  [[buffer(5)]],
+    constant float&     eps    [[buffer(6)]],
+    uint                b      [[thread_position_in_grid]]
+) {
+    if (b >= batch) return;
+    device const float* xb = x + (b * h);
+    device float*       ob = out + (b * h);
+
+    // Pass 1: mean.
+    float sum = 0.0;
+    for (uint i = 0; i < h; ++i) {
+        sum += xb[i];
+    }
+    float mean = sum / float(h);
+
+    // Pass 2: variance via running (x - mean)².
+    float vsum = 0.0;
+    for (uint i = 0; i < h; ++i) {
+        float d = xb[i] - mean;
+        vsum = fma(d, d, vsum);
+    }
+    float inv_std = rsqrt(vsum / float(h) + eps);
+
+    // Pass 3: out = (x - mean) * inv_std * weight + bias.
+    for (uint i = 0; i < h; ++i) {
+        ob[i] = fma((xb[i] - mean) * inv_std, weight[i], bias[i]);
+    }
+}
+"#;
+
+/// Reusable batched layer-norm kernel. Holds the per-feature
+/// `weight` and `bias` vectors on the GPU once (these are tied to
+/// the model layer, not the per-token state).
+///
+/// CPU equivalent: [`crate::tensor::layer_norm`] (Phase 12f NEON).
+pub struct LayerNormKernelMetal {
+    queue: CommandQueue,
+    pipeline: ComputePipelineState,
+    weight_buf: Buffer,
+    bias_buf: Buffer,
+    h: usize,
+    h_u32: u32,
+    eps: f32,
+}
+
+impl LayerNormKernelMetal {
+    /// Build the kernel; uploads `weight` and `bias` (both length `h`)
+    /// to a pair of GPU-resident buffers.
+    pub fn new(weight: &[f32], bias: &[f32], h: usize, eps: f32) -> Result<Self, MetalError> {
+        assert_eq!(weight.len(), h);
+        assert_eq!(bias.len(), h);
+        let device = Device::system_default().ok_or(MetalError::NoDevice)?;
+        let queue = device.new_command_queue();
+        let pipeline = build_layer_norm_pipeline(&device)?;
+        let weight_buf = device.new_buffer_with_data(
+            weight.as_ptr() as *const std::ffi::c_void,
+            std::mem::size_of_val(weight) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let bias_buf = device.new_buffer_with_data(
+            bias.as_ptr() as *const std::ffi::c_void,
+            std::mem::size_of_val(bias) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        Ok(Self {
+            queue,
+            pipeline,
+            weight_buf,
+            bias_buf,
+            h,
+            h_u32: h as u32,
+            eps,
+        })
+    }
+
+    /// Apply layer_norm to a flat `batch * h` input → `batch * h`
+    /// output. Per-call buffers since batch can vary; weight/bias
+    /// stay GPU-resident.
+    pub fn forward_batched(&self, x: &[f32], out: &mut [f32], batch: usize) {
+        assert_eq!(x.len(), batch * self.h);
+        assert_eq!(out.len(), batch * self.h);
+
+        let device = self.queue.device();
+        let xb_buf = device.new_buffer_with_data(
+            x.as_ptr() as *const std::ffi::c_void,
+            std::mem::size_of_val(x) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let outb_buf = device.new_buffer(
+            (batch * self.h * std::mem::size_of::<f32>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let batch_u32 = batch as u32;
+
+        let cmd_buf = self.queue.new_command_buffer();
+        let encoder = cmd_buf.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&self.pipeline);
+        encoder.set_buffer(0, Some(&xb_buf), 0);
+        encoder.set_buffer(1, Some(&self.weight_buf), 0);
+        encoder.set_buffer(2, Some(&self.bias_buf), 0);
+        encoder.set_buffer(3, Some(&outb_buf), 0);
+        encoder.set_bytes(
+            4,
+            std::mem::size_of::<u32>() as u64,
+            &self.h_u32 as *const u32 as *const std::ffi::c_void,
+        );
+        encoder.set_bytes(
+            5,
+            std::mem::size_of::<u32>() as u64,
+            &batch_u32 as *const u32 as *const std::ffi::c_void,
+        );
+        encoder.set_bytes(
+            6,
+            std::mem::size_of::<f32>() as u64,
+            &self.eps as *const f32 as *const std::ffi::c_void,
+        );
+
+        let tg_width = self.pipeline.thread_execution_width().max(1).min(batch as u64);
+        encoder.dispatch_threads(
+            MTLSize {
+                width: batch as u64,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: tg_width,
+                height: 1,
+                depth: 1,
+            },
+        );
+        encoder.end_encoding();
+        commit_and_wait(cmd_buf);
+
+        unsafe {
+            let src = outb_buf.contents() as *const f32;
+            std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), batch * self.h);
+        }
+    }
+}
+
+fn build_layer_norm_pipeline(device: &Device) -> Result<ComputePipelineState, MetalError> {
+    let library = device
+        .new_library_with_source(LAYER_NORM_KERNEL_MSL, &metal::CompileOptions::new())
+        .map_err(MetalError::LibraryCompile)?;
+    let function = library
+        .get_function("layer_norm_batched", None)
+        .map_err(|e| MetalError::PipelineCreate(format!("layer_norm_batched: {e:?}")))?;
+    device
+        .new_compute_pipeline_state_with_function(&function)
+        .map_err(MetalError::PipelineCreate)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -549,6 +722,71 @@ mod tests {
             max_abs < 5e-3,
             "head matvec CPU vs Metal max abs diff = {max_abs} \
              (rel = {max_rel}) at index {max_idx} \
+             (cpu = {}, gpu = {})",
+            cpu_out[max_idx],
+            gpu_out[max_idx],
+        );
+    }
+
+    /// Phase 13e prep: batched layer_norm on Metal must match the
+    /// CPU NEON path within FMA-rounding tolerance, for every lane
+    /// in the batch.
+    #[test]
+    fn layer_norm_batched_metal_matches_cpu() {
+        use crate::tensor;
+
+        let h: usize = 96;
+        let batch: usize = 64;
+        let eps: f32 = 1e-5;
+
+        // Synthetic weight + bias.
+        let weight: Vec<f32> = (0..h).map(|i| 0.5 + (i as f32) * 0.01).collect();
+        let bias: Vec<f32> = (0..h).map(|i| -0.1 + (i as f32) * 0.005).collect();
+
+        // Each batch lane has its own input pattern.
+        let mut x = vec![0.0f32; batch * h];
+        for b in 0..batch {
+            for i in 0..h {
+                x[b * h + i] = ((i as f32) - 48.0) * 0.1 + (b as f32) * 0.001;
+            }
+        }
+
+        // CPU reference: apply layer_norm per batch lane.
+        let mut cpu_out = vec![0.0f32; batch * h];
+        for b in 0..batch {
+            tensor::layer_norm(
+                &x[b * h..(b + 1) * h],
+                &weight,
+                &bias,
+                eps,
+                &mut cpu_out[b * h..(b + 1) * h],
+            );
+        }
+
+        // Metal path.
+        let kernel = match LayerNormKernelMetal::new(&weight, &bias, h, eps) {
+            Ok(k) => k,
+            Err(MetalError::NoDevice) => return,
+            Err(other) => panic!("LayerNormKernelMetal::new failed: {other}"),
+        };
+        let mut gpu_out = vec![0.0f32; batch * h];
+        kernel.forward_batched(&x, &mut gpu_out, batch);
+
+        // Tolerance: layer norm uses sqrt + division → larger
+        // numerical spread than pure FMA. Per the Phase 12f tests
+        // we accept ~5e-5 relative.
+        let mut max_abs = 0.0f32;
+        let mut max_idx = 0usize;
+        for i in 0..(batch * h) {
+            let d = (cpu_out[i] - gpu_out[i]).abs();
+            if d > max_abs {
+                max_abs = d;
+                max_idx = i;
+            }
+        }
+        assert!(
+            max_abs < 5e-4,
+            "layer_norm CPU vs Metal max abs diff = {max_abs} at {max_idx} \
              (cpu = {}, gpu = {})",
             cpu_out[max_idx],
             gpu_out[max_idx],
