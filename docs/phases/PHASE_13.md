@@ -168,14 +168,34 @@ Measured single-call latency (16384 × 96, MacBook M-series,
 | backend | per-call | speedup vs CPU |
 |---|---:|---:|
 | CPU NEON (Phase 12d) | **113 µs** | 1.00× |
-| Metal GPU (12c, per-call alloc) | 343 µs | 0.33× |
-| Metal GPU (12c, pre-allocated buffers) | **269 µs** | **0.42×** |
+| Metal GPU batch=1 (per-call alloc) | 343 µs | 0.33× |
+| Metal GPU batch=1 (pre-allocated) | 264 µs | 0.43× |
 
-This is the predicted batch=1 behaviour. The kernel itself does 1.5 M
-FMA ops in single-digit µs (~0.1% of the M-series GPU's 5+ TFLOPs).
-The remaining 250+ µs is kernel launch + encoder setup + the
-`wait_until_completed` sync — none of which can be avoided when each
-token's prediction blocks on the previous.
+**Batched dispatch (the validation of the Phase 13e thesis):**
+
+| batch | per-token amortized | per-token vs CPU |
+|---:|---:|---:|
+| 1 | 264 µs | 0.43× (slower) |
+| 8 | 128 µs | 0.9× (~breakeven) |
+| 32 | 45 µs | **2.5× faster** |
+| 64 | 41 µs | 2.7× |
+| 128 | 40 µs | 2.8× |
+| **256** | **27 µs** | **4.2× faster** |
+| 512 | 28 µs | 4.1× |
+
+The crossover is at batch≈16. Past batch=256 the per-token cost
+plateaus around 27 µs — that's the actual GPU compute cost when
+launch overhead is fully amortized. The GPU is delivering ~4× the
+CPU's per-token throughput on this kernel alone.
+
+If the rest of the forward pass (~100 µs single-thread CPU) scales
+similarly under batching, full-forward GPU per-token at batch=256
+projects to ~50 µs → **per-stream ≈20 KB/s × 256 streams ≈ 5 MB/s
+aggregate**. That matches the Phase 13 projection (1-3 MB/s
+conservative, 5+ optimistic) for the 200K model on M-series.
+
+CLI bench: `l3tc metal-bench-head --iters 1000` (gated by
+`--features=metal`).
 
 The path forward isn't tuning this kernel — it's **batching**
 (Phase 13e). At batch=512 the same dispatch cost amortizes across

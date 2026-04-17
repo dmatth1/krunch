@@ -183,6 +183,9 @@ const HEAD_MATVEC_KERNEL_MSL: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
 
+// Single-stream head matvec.
+// out[i] = Σ_j (x[j] * scales[j] * qmat[j*rows + i])
+// One thread per output row. Dispatch grid = (rows, 1, 1).
 kernel void head_matvec_int8(
     device const char*  qmat   [[buffer(0)]],   // i8, column-major rows*cols
     device const float* scales [[buffer(1)]],   // length cols
@@ -200,6 +203,34 @@ kernel void head_matvec_int8(
     }
     out[i] = acc;
 }
+
+// Batched head matvec.
+// out[b * rows + i] = Σ_j (x[b * cols + j] * scales[j] * qmat[j*rows + i])
+// Dispatch grid = (rows, batch, 1). Each thread handles one
+// (batch, row) cell. The qmat read is shared across all batches —
+// adjacent threads in a warp coalesce on the row axis just as in
+// the single-stream case.
+kernel void head_matvec_int8_batched(
+    device const char*  qmat   [[buffer(0)]],   // i8, column-major rows*cols
+    device const float* scales [[buffer(1)]],   // length cols
+    device const float* x      [[buffer(2)]],   // batch * cols
+    device float*       out    [[buffer(3)]],   // batch * rows
+    constant uint&      rows   [[buffer(4)]],
+    constant uint&      cols   [[buffer(5)]],
+    constant uint&      batch  [[buffer(6)]],
+    uint2               gid    [[thread_position_in_grid]]
+) {
+    uint i = gid.x;  // row
+    uint b = gid.y;  // batch lane
+    if (i >= rows || b >= batch) return;
+    float acc = 0.0;
+    device const float* xb = x + (b * cols);
+    for (uint j = 0; j < cols; ++j) {
+        float xs = xb[j] * scales[j];
+        acc = fma(xs, (float)qmat[j * rows + i], acc);
+    }
+    out[b * rows + i] = acc;
+}
 "#;
 
 /// A reusable Metal pipeline for the head INT8 matvec, holding the
@@ -213,6 +244,7 @@ kernel void head_matvec_int8(
 pub struct HeadKernelMetal {
     queue: CommandQueue,
     pipeline: ComputePipelineState,
+    pipeline_batched: ComputePipelineState,
     qmat_buf: Buffer,
     scales_buf: Buffer,
     x_buf: Buffer,
@@ -232,7 +264,7 @@ impl HeadKernelMetal {
         assert_eq!(scales.len(), cols, "scales shape");
         let device = Device::system_default().ok_or(MetalError::NoDevice)?;
         let queue = device.new_command_queue();
-        let pipeline = build_head_pipeline(&device)?;
+        let (pipeline, pipeline_batched) = build_head_pipelines(&device)?;
         let qmat_buf = device.new_buffer_with_data(
             qmat.as_ptr() as *const std::ffi::c_void,
             std::mem::size_of_val(qmat) as u64,
@@ -256,6 +288,7 @@ impl HeadKernelMetal {
         Ok(Self {
             queue,
             pipeline,
+            pipeline_batched,
             qmat_buf,
             scales_buf,
             x_buf,
@@ -265,6 +298,81 @@ impl HeadKernelMetal {
             rows_u32: rows as u32,
             cols_u32: cols as u32,
         })
+    }
+
+    /// Batched forward — process `batch` independent x→out pairs in
+    /// one dispatch. Amortizes the per-call dispatch overhead across
+    /// the batch.
+    ///
+    /// `x` must be `batch * cols` floats laid out row-major (one
+    /// segment's input vector per row); `out` must be `batch * rows`.
+    /// Per-call buffers are allocated each invocation since batch
+    /// size can vary; the model weights stay resident.
+    pub fn forward_batched(&self, x: &[f32], out: &mut [f32], batch: usize) {
+        assert_eq!(x.len(), batch * self.cols, "x shape (batch*cols)");
+        assert_eq!(out.len(), batch * self.rows, "out shape (batch*rows)");
+
+        let device = self.queue.device();
+        let xb_buf = device.new_buffer_with_data(
+            x.as_ptr() as *const std::ffi::c_void,
+            std::mem::size_of_val(x) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let outb_buf = device.new_buffer(
+            (batch * self.rows * std::mem::size_of::<f32>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let batch_u32 = batch as u32;
+
+        let cmd_buf = self.queue.new_command_buffer();
+        let encoder = cmd_buf.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&self.pipeline_batched);
+        encoder.set_buffer(0, Some(&self.qmat_buf), 0);
+        encoder.set_buffer(1, Some(&self.scales_buf), 0);
+        encoder.set_buffer(2, Some(&xb_buf), 0);
+        encoder.set_buffer(3, Some(&outb_buf), 0);
+        encoder.set_bytes(
+            4,
+            std::mem::size_of::<u32>() as u64,
+            &self.rows_u32 as *const u32 as *const std::ffi::c_void,
+        );
+        encoder.set_bytes(
+            5,
+            std::mem::size_of::<u32>() as u64,
+            &self.cols_u32 as *const u32 as *const std::ffi::c_void,
+        );
+        encoder.set_bytes(
+            6,
+            std::mem::size_of::<u32>() as u64,
+            &batch_u32 as *const u32 as *const std::ffi::c_void,
+        );
+
+        // 2D grid: (rows, batch). Threadgroup along rows axis.
+        let tg_width = self
+            .pipeline_batched
+            .thread_execution_width()
+            .max(1)
+            .min(self.rows as u64);
+        encoder.dispatch_threads(
+            MTLSize {
+                width: self.rows as u64,
+                height: batch as u64,
+                depth: 1,
+            },
+            MTLSize {
+                width: tg_width,
+                height: 1,
+                depth: 1,
+            },
+        );
+        encoder.end_encoding();
+        commit_and_wait(cmd_buf);
+
+        // SAFETY: outb_buf has batch*rows*sizeof(f32), GPU has finished.
+        unsafe {
+            let src = outb_buf.contents() as *const f32;
+            std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), batch * self.rows);
+        }
     }
 
     /// One forward pass: copy `x` into the persistent input buffer,
@@ -328,16 +436,21 @@ impl HeadKernelMetal {
     }
 }
 
-fn build_head_pipeline(device: &Device) -> Result<ComputePipelineState, MetalError> {
+fn build_head_pipelines(
+    device: &Device,
+) -> Result<(ComputePipelineState, ComputePipelineState), MetalError> {
     let library = device
         .new_library_with_source(HEAD_MATVEC_KERNEL_MSL, &metal::CompileOptions::new())
         .map_err(MetalError::LibraryCompile)?;
-    let function = library
-        .get_function("head_matvec_int8", None)
-        .map_err(|e| MetalError::PipelineCreate(format!("{e:?}")))?;
-    device
-        .new_compute_pipeline_state_with_function(&function)
-        .map_err(MetalError::PipelineCreate)
+    let mk = |name: &str| -> Result<ComputePipelineState, MetalError> {
+        let f = library
+            .get_function(name, None)
+            .map_err(|e| MetalError::PipelineCreate(format!("{name}: {e:?}")))?;
+        device
+            .new_compute_pipeline_state_with_function(&f)
+            .map_err(MetalError::PipelineCreate)
+    };
+    Ok((mk("head_matvec_int8")?, mk("head_matvec_int8_batched")?))
 }
 
 #[cfg(test)]

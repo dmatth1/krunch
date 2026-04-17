@@ -397,7 +397,7 @@ fn run_metal_bench_head(iters: usize) -> anyhow::Result<()> {
     let cpu_total = t0.elapsed();
     let cpu_per_call = cpu_total / iters as u32;
 
-    // Metal (Phase 13c).
+    // Metal (Phase 13c) — batch=1.
     let kernel = HeadKernelMetal::new(&qmat, &scales, rows, cols).map_err(|e| {
         if matches!(e, MetalError::NoDevice) {
             anyhow::anyhow!("no Metal device available on this machine")
@@ -419,19 +419,40 @@ fn run_metal_bench_head(iters: usize) -> anyhow::Result<()> {
     let speedup = cpu_per_call.as_secs_f64() / gpu_per_call.as_secs_f64();
 
     println!(
-        "  CPU NEON   : {:?} per call ({:?} total)",
+        "  CPU NEON               : {:?} per call ({:?} total)",
         cpu_per_call, cpu_total
     );
     println!(
-        "  Metal GPU  : {:?} per call ({:?} total)",
-        gpu_per_call, gpu_total
+        "  Metal GPU batch=1      : {:?} per call ({:?} total) [{:.2}× CPU]",
+        gpu_per_call, gpu_total, speedup
     );
+
+    // Sweep batched throughput for representative batch sizes.
+    println!("\nBatched dispatch (per-token amortized):");
+    for &batch in &[8usize, 32, 64, 128, 256, 512] {
+        let xb: Vec<f32> = (0..batch).flat_map(|_| x.iter().copied()).collect();
+        let mut outb = vec![0.0f32; batch * rows];
+        // Warm up
+        for _ in 0..(warmup / 4).max(2) {
+            kernel.forward_batched(&xb, &mut outb, batch);
+        }
+        let n_calls = (iters / batch).max(4);
+        let t0 = Instant::now();
+        for _ in 0..n_calls {
+            kernel.forward_batched(&xb, &mut outb, batch);
+        }
+        let elapsed = t0.elapsed();
+        let per_call = elapsed / n_calls as u32;
+        let per_token = per_call / batch as u32;
+        let cpu_speedup = cpu_per_call.as_secs_f64() / per_token.as_secs_f64();
+        println!(
+            "  batch={:4} : {:>9?} per call, {:>9?} per token  [{:.1}× CPU per-token]",
+            batch, per_call, per_token, cpu_speedup
+        );
+    }
+
     println!(
-        "  GPU/CPU    : {:.2}× speedup at batch=1 (per-call latency)",
-        speedup
-    );
-    println!(
-        "\nNote: this is single-call latency (one logits vector per dispatch).\n      Real GPU win is at batch≥64 — see Phase 13e."
+        "\nNote: per-token amortized cost is what matters for throughput. \n      A compress workload runs ~60K predict steps per 200KB of text."
     );
     Ok(())
 }
