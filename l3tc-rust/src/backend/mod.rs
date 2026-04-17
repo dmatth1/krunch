@@ -42,6 +42,9 @@
 #[cfg(feature = "metal")]
 pub mod mtl;
 
+#[cfg(feature = "metal")]
+pub mod batched;
+
 /// The set of inference backends this build was compiled to support.
 ///
 /// `Cpu` is always present. `Metal` is present iff this crate was
