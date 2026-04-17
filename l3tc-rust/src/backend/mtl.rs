@@ -639,6 +639,26 @@ const MATVEC_96X96_KERNEL_MSL: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
 
+// Same polynomial exp as the standalone sigmoid kernel (matches
+// CPU Phase 12c). Used by act=2 (sigmoid) below.
+static inline float mv_poly_exp(float x) {
+    x = fmax(x, -50.0f);
+    float y = x * 1.442695041f;
+    float k = floor(y);
+    float r = y - k;
+    float p = 0.000154035303933f;
+    p = fma(p, r, 0.001333355814643f);
+    p = fma(p, r, 0.009618129107628f);
+    p = fma(p, r, 0.055504108664821f);
+    p = fma(p, r, 0.240226506959101f);
+    p = fma(p, r, 0.693147180559945f);
+    p = fma(p, r, 1.0f);
+    int  ki = int(k);
+    int  exp_bits = (ki + 127) << 23;
+    float two_k = as_type<float>(exp_bits);
+    return p * two_k;
+}
+
 // Batched 96x96 matvec, row-major.
 // out[b, i] = Σ_j mat[i, j] * x[b, j]
 // Dispatch grid = (h, batch). One thread per (batch, row) output.
@@ -663,6 +683,50 @@ kernel void matvec_96x96_batched(
     }
     out[b * h + i] = acc;
 }
+
+// Phase 13l: matvec + fused activation.
+// Same math as matvec_96x96_batched, but applies an elementwise
+// activation to the accumulated dot product before writing `out`:
+//   act=0: none
+//   act=1: relu      — max(0, acc)
+//   act=2: sigmoid   — safe -|x| form matching CPU NEON Phase 12c
+//   act=3: relu_sq   — max(0, acc)^2
+// The activation branch is uniform across all threads (constant
+// uniform), so no divergence cost.
+kernel void matvec_96x96_act_batched(
+    device const float* mat   [[buffer(0)]],
+    device const float* x     [[buffer(1)]],
+    device float*       out   [[buffer(2)]],
+    constant uint&      h     [[buffer(3)]],
+    constant uint&      batch [[buffer(4)]],
+    constant uint&      act   [[buffer(5)]],
+    uint2               gid   [[thread_position_in_grid]]
+) {
+    uint i = gid.x;
+    uint b = gid.y;
+    if (i >= h || b >= batch) return;
+    device const float* xb = x + (b * h);
+    device const float* row = mat + (i * h);
+    float acc = 0.0;
+    for (uint j = 0; j < h; ++j) {
+        acc = fma(row[j], xb[j], acc);
+    }
+    float y;
+    if (act == 1u) {
+        y = fmax(0.0f, acc);
+    } else if (act == 2u) {
+        // sigmoid, safe -|x| form
+        float e = mv_poly_exp(-fabs(acc));
+        float denom = 1.0f + e;
+        y = (acc >= 0.0f) ? (1.0f / denom) : (e / denom);
+    } else if (act == 3u) {
+        float v = fmax(0.0f, acc);
+        y = v * v;
+    } else {
+        y = acc;
+    }
+    out[b * h + i] = y;
+}
 "#;
 
 /// Reusable batched 96×96 matvec kernel. The matrix lives on the GPU
@@ -674,6 +738,7 @@ kernel void matvec_96x96_batched(
 pub struct Matvec96Metal {
     queue: CommandQueue,
     pipeline: ComputePipelineState,
+    pipeline_act: ComputePipelineState,
     mat_buf: Buffer,
     h: usize,
     h_u32: u32,
@@ -688,7 +753,7 @@ impl Matvec96Metal {
         assert_eq!(mat.len(), h * h);
         let device = Device::system_default().ok_or(MetalError::NoDevice)?;
         let queue = device.new_command_queue();
-        let pipeline = build_matvec96_pipeline(&device)?;
+        let (pipeline, pipeline_act) = build_matvec96_pipeline(&device)?;
         let mat_buf = device.new_buffer_with_data(
             mat.as_ptr() as *const std::ffi::c_void,
             std::mem::size_of_val(mat) as u64,
@@ -697,6 +762,7 @@ impl Matvec96Metal {
         Ok(Self {
             queue,
             pipeline,
+            pipeline_act,
             mat_buf,
             h,
             h_u32: h as u32,
@@ -766,18 +832,70 @@ impl Matvec96Metal {
         );
         encoder.end_encoding();
     }
+
+    /// Phase 13l: matvec + fused activation. `act` selects the
+    /// post-matvec elementwise function:
+    ///   0 = none (equivalent to `encode_into`)
+    ///   1 = relu — `max(0, acc)`
+    ///   2 = sigmoid — safe `-|x|` form matching CPU Phase 12c
+    ///   3 = relu_square — `max(0, acc)^2`
+    pub fn encode_into_act(
+        &self,
+        cmd_buf: &CommandBufferRef,
+        x: &Buffer,
+        out: &Buffer,
+        batch: usize,
+        act: u32,
+    ) {
+        let batch_u32 = batch as u32;
+        let encoder = cmd_buf.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&self.pipeline_act);
+        encoder.set_buffer(0, Some(&self.mat_buf), 0);
+        encoder.set_buffer(1, Some(x), 0);
+        encoder.set_buffer(2, Some(out), 0);
+        encoder.set_bytes(
+            3,
+            std::mem::size_of::<u32>() as u64,
+            &self.h_u32 as *const u32 as *const std::ffi::c_void,
+        );
+        encoder.set_bytes(
+            4,
+            std::mem::size_of::<u32>() as u64,
+            &batch_u32 as *const u32 as *const std::ffi::c_void,
+        );
+        encoder.set_bytes(
+            5,
+            std::mem::size_of::<u32>() as u64,
+            &act as *const u32 as *const std::ffi::c_void,
+        );
+        let tg_width = self
+            .pipeline_act
+            .thread_execution_width()
+            .max(1)
+            .min(self.h as u64);
+        encoder.dispatch_threads(
+            MTLSize { width: self.h as u64, height: batch as u64, depth: 1 },
+            MTLSize { width: tg_width, height: 1, depth: 1 },
+        );
+        encoder.end_encoding();
+    }
 }
 
-fn build_matvec96_pipeline(device: &Device) -> Result<ComputePipelineState, MetalError> {
+fn build_matvec96_pipeline(
+    device: &Device,
+) -> Result<(ComputePipelineState, ComputePipelineState), MetalError> {
     let library = device
         .new_library_with_source(MATVEC_96X96_KERNEL_MSL, &metal::CompileOptions::new())
         .map_err(MetalError::LibraryCompile)?;
-    let function = library
-        .get_function("matvec_96x96_batched", None)
-        .map_err(|e| MetalError::PipelineCreate(format!("matvec_96x96_batched: {e:?}")))?;
-    device
-        .new_compute_pipeline_state_with_function(&function)
-        .map_err(MetalError::PipelineCreate)
+    let mk = |name: &str| -> Result<ComputePipelineState, MetalError> {
+        let f = library
+            .get_function(name, None)
+            .map_err(|e| MetalError::PipelineCreate(format!("{name}: {e:?}")))?;
+        device
+            .new_compute_pipeline_state_with_function(&f)
+            .map_err(MetalError::PipelineCreate)
+    };
+    Ok((mk("matvec_96x96_batched")?, mk("matvec_96x96_act_batched")?))
 }
 
 // ===================================================================

@@ -370,11 +370,14 @@ impl<'a> BatchedSession<'a> {
         // elementwise encoders per token (2 per layer) without any
         // correctness change.
         for layer in 0..self.model.num_layers() {
-            // short = short_weight @ x; relu(short)
-            self.layers[layer]
-                .short
-                .encode_into(cmd_buf, &self.x_buf, &self.short_buf, batch_u);
-            self.glue.encode_relu_inplace(cmd_buf, &self.short_buf, bh);
+            // Phase 13l: short = relu(short_weight @ x), fused.
+            self.layers[layer].short.encode_into_act(
+                cmd_buf,
+                &self.x_buf,
+                &self.short_buf,
+                batch_u,
+                1, // relu
+            );
 
             // ln1: x → normed (x preserved so we can add rwkv into it)
             self.layers[layer]
@@ -474,18 +477,20 @@ impl<'a> BatchedSession<'a> {
             batch_u32,
         );
 
-        // 3 matvecs (independent, safe to chain).
+        // 3 matvecs (independent, safe to chain). The receptance
+        // matvec fuses the follow-up `sigmoid(r)` into its final
+        // store per Phase 13l — saves one encoder per layer.
         lk.att_k
             .encode_into(cmd_buf, &self.xk_buf, &self.k_buf, self.batch);
         lk.att_v
             .encode_into(cmd_buf, &self.xv_buf, &self.v_buf, self.batch);
-        lk.att_r
-            .encode_into(cmd_buf, &self.xr_buf, &self.r_buf, self.batch);
-
-        // sigmoid(r) in-place: the MSL elementwise kernel writes
-        // out[i] from in[i] so aliasing r=in=out is safe.
-        self.sigmoid
-            .encode_into(cmd_buf, &self.r_buf, &self.r_buf, self.batch);
+        lk.att_r.encode_into_act(
+            cmd_buf,
+            &self.xr_buf,
+            &self.r_buf,
+            self.batch,
+            2, // sigmoid
+        );
 
         // time_mix step1 reads state_p/a/b + k + v, writes ww/p/a/b.
         lk.time_mix.encode_step1_into(
@@ -550,16 +555,23 @@ impl<'a> BatchedSession<'a> {
             batch_u32,
         );
 
-        // r = sigmoid(ffn_r @ xr)
-        lk.ffn_r
-            .encode_into(cmd_buf, &self.xr_buf, &self.r_buf, self.batch);
-        self.sigmoid
-            .encode_into(cmd_buf, &self.r_buf, &self.r_buf, self.batch);
+        // Phase 13l: r = sigmoid(ffn_r @ xr), fused.
+        lk.ffn_r.encode_into_act(
+            cmd_buf,
+            &self.xr_buf,
+            &self.r_buf,
+            self.batch,
+            2, // sigmoid
+        );
 
-        // k = relu(ffn_k @ xk); k = k^2 (fused relu+square kernel)
-        lk.ffn_k
-            .encode_into(cmd_buf, &self.xk_buf, &self.k_buf, self.batch);
-        self.glue.encode_relu_square_inplace(cmd_buf, &self.k_buf, bh);
+        // Phase 13l: k = max(0, ffn_k @ xk)^2, fused.
+        lk.ffn_k.encode_into_act(
+            cmd_buf,
+            &self.xk_buf,
+            &self.k_buf,
+            self.batch,
+            3, // relu_square
+        );
 
         // v = ffn_v @ k
         lk.ffn_v
@@ -698,10 +710,22 @@ pub fn compress_segments_batched(
         // Reusable cum_freqs scratch (vocab+1 u64).
         let mut cum: Vec<u64> = Vec::with_capacity(vocab + 1);
 
+        // Phase 13l profiling: time the GPU forward pass vs CPU AC
+        // encode per step; print the breakdown on the first chunk so
+        // we can see which side is the actual bottleneck.
+        let profile = std::env::var("L3TC_PROFILE_METAL").is_ok();
+        let mut fwd_ns: u128 = 0;
+        let mut ac_ns: u128 = 0;
+
         for step in 1..max_len {
+            let t_fwd = std::time::Instant::now();
             bs.forward_batched(&prev);
             bs.cum_freqs_batched();
+            if profile {
+                fwd_ns += t_fwd.elapsed().as_nanos();
+            }
 
+            let t_ac = std::time::Instant::now();
             for lane in 0..n {
                 let seg = &chunk[lane];
                 if step >= seg.len() {
@@ -718,6 +742,22 @@ pub fn compress_segments_batched(
                 encs[lane].encode_symbol(&cum, seg[step])?;
                 prev[lane] = seg[step];
             }
+            if profile {
+                ac_ns += t_ac.elapsed().as_nanos();
+            }
+        }
+
+        if profile {
+            let fwd_ms = fwd_ns as f64 / 1e6;
+            let ac_ms = ac_ns as f64 / 1e6;
+            let steps = (max_len.saturating_sub(1)) as f64;
+            eprintln!(
+                "  chunk n={n:<3} steps={:<5} fwd={fwd_ms:>8.1}ms ({:.0}µs/step) \
+                 ac={ac_ms:>6.1}ms ({:.0}µs/step)",
+                max_len - 1,
+                (fwd_ns as f64 / steps) / 1e3,
+                (ac_ns as f64 / steps) / 1e3,
+            );
         }
 
         // Finish each encoder, push its Vec<u8> body in lane order.
