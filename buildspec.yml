@@ -1,0 +1,60 @@
+# AWS CodeBuild spec for the training + compression Docker images.
+#
+# Why CodeBuild: laptop uploads at ~5 Mbps hit 30-90 min cold pushes of
+# the ~5 GB PyTorch CUDA devel image. CodeBuild runs inside AWS and
+# pushes to ECR over the AWS backbone in ~3 min.
+#
+# Trigger this manually during iteration:
+#   aws codebuild start-build --project-name krunch-image-build \
+#     --source-version refs/heads/main \
+#     --region us-east-1
+#
+# Then pull the resulting image tag from the build's primary artifact
+# (printed at the end as IMAGE_TAG=...).
+
+version: 0.2
+
+env:
+  variables:
+    AWS_REGION: us-east-1
+    ECR_REPO: cdk-hnb659fds-container-assets-584956668248-us-east-1
+    DOCKERFILE: cdk/docker/training/Dockerfile
+    IMAGE_NAME: krunch-train
+
+phases:
+  pre_build:
+    commands:
+      - echo "=== pre_build ==="
+      - AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+      - ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}"
+      - aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin "${ECR_URI}"
+      - SHORT_SHA=$(git rev-parse --short=12 HEAD)
+      - IMAGE_TAG="${IMAGE_NAME}-${SHORT_SHA}"
+      - echo "building ${ECR_URI}:${IMAGE_TAG}"
+      # vendor/L3TC is gitignored in this repo — clone it fresh from
+      # upstream so the Dockerfile's COPY vendor/L3TC finds it. Pin to
+      # the main branch SHA for now; TODO: replace with a fork SHA (see
+      # PRODUCTION_TODO item 9).
+      - git clone --depth 1 https://github.com/alipay/L3TC-leveraging-rwkv-for-learned-lossless-low-complexity-text-compression.git vendor/L3TC
+      - echo "L3TC cloned at $(git -C vendor/L3TC rev-parse HEAD)"
+
+  build:
+    commands:
+      - echo "=== build ==="
+      - docker build -f ${DOCKERFILE} --platform linux/amd64 -t ${ECR_URI}:${IMAGE_TAG} .
+      # Also push as "latest-train" for easy shell-out.
+      - docker tag ${ECR_URI}:${IMAGE_TAG} ${ECR_URI}:latest-train
+
+  post_build:
+    commands:
+      - echo "=== post_build ==="
+      - docker push ${ECR_URI}:${IMAGE_TAG}
+      - docker push ${ECR_URI}:latest-train
+      - echo "IMAGE_TAG=${IMAGE_TAG}"
+      - echo "IMAGE_URI=${ECR_URI}:${IMAGE_TAG}"
+      - printf '{"image_uri":"%s","tag":"%s","sha":"%s"}\n' "${ECR_URI}:${IMAGE_TAG}" "${IMAGE_TAG}" "${SHORT_SHA}" > image-info.json
+
+artifacts:
+  files:
+    - image-info.json
+  name: krunch-image-build

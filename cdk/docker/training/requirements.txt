@@ -1,8 +1,7 @@
-# Minimal deps to run scripts/train_l3tc_phase11.py on CPU.
-# NOTE: PyTorch CPU wheel — we train on c6i instance class, no GPU.
-# If/when we move to GPU training, switch to the CUDA wheel.
-torch==2.11.0 --index-url https://download.pytorch.org/whl/cpu
+# PyTorch is baked into the base image (pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime),
+# so we only add the rest of the training deps here.
 numpy==1.26.4
 sentencepiece==0.2.1
 boto3==1.35.0
 zstandard==0.23.0
+tqdm==4.66.5

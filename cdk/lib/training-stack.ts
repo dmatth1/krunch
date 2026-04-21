@@ -45,7 +45,10 @@ export class TrainingStack extends cdk.Stack {
     // egress needed for inference data.
     // -----------------------------------------------------------------
     const vpc = new ec2.Vpc(this, "BatchVpc", {
-      maxAzs: 2,
+      // Spot g5.xlarge is capacity-constrained in us-east-1; give Batch
+      // more AZs to shop across. Bumped to 4 after UnfulfillableCapacity
+      // in the initial 2-AZ run.
+      maxAzs: 4,
       natGateways: 0,
       subnetConfiguration: [
         {
@@ -71,9 +74,18 @@ export class TrainingStack extends cdk.Stack {
     });
 
     // -----------------------------------------------------------------
-    // Batch compute environment — spot EC2, minimal for MVP.
-    // Single c6i.2xlarge (8 vCPU, 16 GB RAM) covers 2L × 96H × 16K
-    // training on CPU. Bump to GPU later if Spike 1 passes.
+    // Batch compute environment — spot EC2 g5.xlarge (1× NVIDIA A10G
+    // 24 GB VRAM, 4 vCPU, 16 GB RAM). Chosen because:
+    //   · 200K-param training on GPU is ~50× faster than CPU
+    //   · A10G has headroom for up to ~3-4B param models later
+    //   · Spot pricing ~$0.25/hr vs on-demand ~$1/hr
+    //
+    // maxvCpus=8 allows 2 concurrent g5.xlarge instances, matching the
+    // default AWS G/VT spot instance quota of 8 vCPUs. Bump the quota
+    // before bumping maxvCpus here.
+    //
+    // Setting images to a GPU-optimized ECS AMI is handled automatically
+    // by Batch when the compute env contains G-class instances.
     // -----------------------------------------------------------------
     const computeEnv = new batch.ManagedEc2EcsComputeEnvironment(
       this,
@@ -83,10 +95,16 @@ export class TrainingStack extends cdk.Stack {
         vpc,
         vpcSubnets: { subnetType: ec2.SubnetType.PUBLIC },
         minvCpus: 0,
-        maxvCpus: 16,
-        spot: true,
+        maxvCpus: 8,
+        // Spot g5.xlarge was UnfulfillableCapacity across 4 AZs on
+        // 2026-04-21 — the spike switched to ON_DEMAND to unblock. Flip
+        // back to spot=true for production runs where we can tolerate
+        // queueing for spot capacity.
+        spot: false,
         instanceTypes: [
-          ec2.InstanceType.of(ec2.InstanceClass.C6I, ec2.InstanceSize.XLARGE2),
+          ec2.InstanceType.of(ec2.InstanceClass.G5, ec2.InstanceSize.XLARGE),
+          ec2.InstanceType.of(ec2.InstanceClass.G5, ec2.InstanceSize.XLARGE2),
+          ec2.InstanceType.of(ec2.InstanceClass.G6, ec2.InstanceSize.XLARGE),
         ],
         useOptimalInstanceClasses: false,
         updateToLatestImageVersion: true,
@@ -115,8 +133,11 @@ export class TrainingStack extends cdk.Stack {
       jobDefinitionName: named(props.envName, "training-jobdef"),
       container: new batch.EcsEc2ContainerDefinition(this, "TrainingContainer", {
         image: ecs.ContainerImage.fromDockerImageAsset(trainingImage),
-        cpu: 8,
+        // g5.xlarge = 4 vCPU, 16 GB RAM, 1 A10G. Reserve enough for
+        // data loading + torch overhead but leave some headroom.
+        cpu: 4,
         memory: cdk.Size.gibibytes(14),
+        gpu: 1,
         jobRole,
       }),
       retryAttempts: 1,

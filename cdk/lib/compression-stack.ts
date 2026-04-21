@@ -79,6 +79,8 @@ export class CompressionStack extends cdk.Stack {
         memoryLimitMiB: 2048,
         minScalingCapacity: 0,
         maxScalingCapacity: 4,
+        // VPC has no NAT gateway, so tasks need public IPs to reach ECR / S3 over the internet.
+        assignPublicIp: true,
         enableLogging: true,
         logDriver: ecs.LogDrivers.awsLogs({
           streamPrefix: named(props.envName, "compression"),
