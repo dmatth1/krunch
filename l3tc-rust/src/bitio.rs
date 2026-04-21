@@ -267,7 +267,7 @@ mod tests {
 
     #[test]
     fn writer_reader_roundtrip_random() {
-        use rand::{Rng, SeedableRng, rngs::StdRng};
+        use rand::{rngs::StdRng, Rng, SeedableRng};
         let mut rng = StdRng::seed_from_u64(0xDEADBEEF);
         // Generate 1000 random (value, width) pairs where width in 1..=32
         let pairs: Vec<(u64, u8)> = (0..1000)

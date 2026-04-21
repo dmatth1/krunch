@@ -28,8 +28,12 @@ fn forward_pass_is_finite_and_deterministic() {
     let mut ckpt = Checkpoint::load(&path).expect("failed to load checkpoint");
     let model = Model::from_checkpoint(&mut ckpt).expect("failed to build model");
 
-    println!("model: vocab={}, hidden={}, layers={}",
-        model.vocab_size, model.hidden_size, model.num_layers());
+    println!(
+        "model: vocab={}, hidden={}, layers={}",
+        model.vocab_size,
+        model.hidden_size,
+        model.num_layers()
+    );
     assert_eq!(model.vocab_size, 16384);
     assert_eq!(model.hidden_size, 96);
     assert_eq!(model.num_layers(), 2);
@@ -68,9 +72,7 @@ fn forward_pass_is_finite_and_deterministic() {
         }
         last_sum = sum;
 
-        println!(
-            "  step {i} token={t}: min={min:.3} max={max:.3} sum={sum:.3}"
-        );
+        println!("  step {i} token={t}: min={min:.3} max={max:.3} sum={sum:.3}");
     }
 }
 

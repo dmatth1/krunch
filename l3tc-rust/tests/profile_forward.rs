@@ -77,8 +77,7 @@ fn profile_full_forward_breakdown() {
     use l3tc::{Checkpoint, Model, Session};
     use std::path::PathBuf;
 
-    let path =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("checkpoints/l3tc_200k.bin");
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("checkpoints/l3tc_200k.bin");
     if !path.exists() {
         eprintln!("skipping: no checkpoint at {path:?}");
         return;

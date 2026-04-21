@@ -308,16 +308,8 @@ unsafe fn matvec_256x256_neon(mat: &[f32], x: &[f32], out: &mut [f32]) {
         while k < 64 {
             let off = k * 4;
             a0 = vfmaq_f32(a0, vld1q_f32(row.add(off)), vld1q_f32(x_p.add(off)));
-            a1 = vfmaq_f32(
-                a1,
-                vld1q_f32(row.add(off + 4)),
-                vld1q_f32(x_p.add(off + 4)),
-            );
-            a2 = vfmaq_f32(
-                a2,
-                vld1q_f32(row.add(off + 8)),
-                vld1q_f32(x_p.add(off + 8)),
-            );
+            a1 = vfmaq_f32(a1, vld1q_f32(row.add(off + 4)), vld1q_f32(x_p.add(off + 4)));
+            a2 = vfmaq_f32(a2, vld1q_f32(row.add(off + 8)), vld1q_f32(x_p.add(off + 8)));
             a3 = vfmaq_f32(
                 a3,
                 vld1q_f32(row.add(off + 12)),
@@ -415,16 +407,8 @@ unsafe fn matvec_rect_neon<const ROWS: usize, const COLS: usize>(
         while k < n16 {
             let off = k * 16;
             a0 = vfmaq_f32(a0, vld1q_f32(row.add(off)), vld1q_f32(x_p.add(off)));
-            a1 = vfmaq_f32(
-                a1,
-                vld1q_f32(row.add(off + 4)),
-                vld1q_f32(x_p.add(off + 4)),
-            );
-            a2 = vfmaq_f32(
-                a2,
-                vld1q_f32(row.add(off + 8)),
-                vld1q_f32(x_p.add(off + 8)),
-            );
+            a1 = vfmaq_f32(a1, vld1q_f32(row.add(off + 4)), vld1q_f32(x_p.add(off + 4)));
+            a2 = vfmaq_f32(a2, vld1q_f32(row.add(off + 8)), vld1q_f32(x_p.add(off + 8)));
             a3 = vfmaq_f32(
                 a3,
                 vld1q_f32(row.add(off + 12)),
@@ -462,11 +446,7 @@ unsafe fn matvec_rect_neon<const ROWS: usize, const COLS: usize>(
 /// Inputs with `x < -50` are clamped: `exp(-50) ≈ 2e-22`, far
 /// below any freq the coder would assign, so the clamp is
 /// lossless against the final `max(1)` step.
-pub fn softmax_shifted_exp_sum(
-    logits: &[f32],
-    max: f32,
-    exps: &mut [f32],
-) -> f32 {
+pub fn softmax_shifted_exp_sum(logits: &[f32], max: f32, exps: &mut [f32]) -> f32 {
     debug_assert_eq!(logits.len(), exps.len());
 
     #[cfg(target_arch = "aarch64")]
@@ -510,17 +490,21 @@ pub fn softmax_shifted_exp_sum(
 #[target_feature(enable = "neon")]
 #[allow(unsafe_code)]
 #[inline]
-unsafe fn exp_f32x4_neon(
-    x: std::arch::aarch64::float32x4_t,
-) -> std::arch::aarch64::float32x4_t {
+unsafe fn exp_f32x4_neon(x: std::arch::aarch64::float32x4_t) -> std::arch::aarch64::float32x4_t {
     use std::arch::aarch64::*;
 
     // Clamp to [-50, 0) — exp below -50 is ~2e-22, irrelevant
     // for any freq the AC would assign (post-`max(1)` clamp).
     let x = vmaxq_f32(x, vdupq_n_f32(-50.0_f32));
 
-    // y = x * log2(e); exp(x) = 2^y
-    let log2e = vdupq_n_f32(1.442_695_041_f32);
+    // y = x * log2(e); exp(x) = 2^y.
+    // The literal below is the cephes minimax log2(e) coefficient,
+    // *not* f32::consts::LOG2_E. Keeping it as a hard-coded literal
+    // gives bit-identical cum_freqs across CPU/GPU backends; see
+    // FLAG_GPU_ENCODED in codec.rs — a few-ULP drift here desyncs
+    // the arithmetic coder. Do not "fix" it.
+    #[allow(clippy::approx_constant)]
+    let log2e = vdupq_n_f32(1.442_695_f32);
     let y = vmulq_f32(x, log2e);
 
     // k = floor(y). Since y ≤ 0, vrndmq_f32 (round toward
@@ -531,13 +515,17 @@ unsafe fn exp_f32x4_neon(
     // Degree-6 Horner minimax polynomial for 2^r on [0, 1]:
     //   P(r) = 1 + r*(c1 + r*(c2 + r*(c3 + r*(c4 + r*(c5 + r*c6)))))
     // Coefficients from cephes-family minimax tables, max
-    // relative error ≈ 4e-7 over [0, 1].
-    let c1 = vdupq_n_f32(0.693_147_180_559_945_f32);
-    let c2 = vdupq_n_f32(0.240_226_506_959_101_f32);
-    let c3 = vdupq_n_f32(0.055_504_108_664_821_f32);
-    let c4 = vdupq_n_f32(0.009_618_129_107_628_f32);
-    let c5 = vdupq_n_f32(0.001_333_355_814_643_f32);
-    let c6 = vdupq_n_f32(0.000_154_035_303_933_f32);
+    // relative error ≈ 4e-7 over [0, 1]. These are *not* f32::consts
+    // values — they are the tuned polynomial coefficients that make
+    // cum_freqs bit-identical across backends (see FLAG_GPU_ENCODED
+    // in codec.rs). Do not "fix" them.
+    #[allow(clippy::approx_constant)]
+    let c1 = vdupq_n_f32(0.693_147_2_f32);
+    let c2 = vdupq_n_f32(0.240_226_5_f32);
+    let c3 = vdupq_n_f32(0.055_504_11_f32);
+    let c4 = vdupq_n_f32(0.009_618_129_f32);
+    let c5 = vdupq_n_f32(0.001_333_355_8_f32);
+    let c6 = vdupq_n_f32(0.000_154_035_3_f32);
     let one = vdupq_n_f32(1.0_f32);
 
     let mut p = c6;
@@ -579,6 +567,12 @@ unsafe fn exp_f32x4_neon(
 ///
 /// All input buffers are length `h`; outputs are length `h`.
 /// `h` is debug-asserted to be a multiple of 4 (NEON chunk).
+///
+/// The arg count reflects the RWKV time_mix update rule — a + b,
+/// p, k, v, ww, rwkv, and scratch buffers. Wrapping in a struct
+/// would push them onto the stack and defeat the NEON register
+/// tiling this function exists to exploit.
+#[allow(clippy::too_many_arguments)]
 #[inline]
 pub fn time_mix_step1(
     state_p: &[f32],
@@ -609,7 +603,6 @@ pub fn time_mix_step1(
         unsafe {
             time_mix_step1_neon(state_p, time_first, k, state_a, state_b, v, ww, p, a, b);
         }
-        return;
     }
 
     #[cfg(not(target_arch = "aarch64"))]
@@ -630,6 +623,7 @@ pub fn time_mix_step1(
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 #[allow(unsafe_code)]
+#[allow(clippy::too_many_arguments)] // see `time_mix_step1` doc — NEON register tiling
 unsafe fn time_mix_step1_neon(
     state_p: &[f32],
     time_first: &[f32],
@@ -740,7 +734,6 @@ pub fn time_mix_step2(
         unsafe {
             time_mix_step2_neon(neg_exp_decay, k, v, state_p, state_a, state_b, ww);
         }
-        return;
     }
 
     #[cfg(not(target_arch = "aarch64"))]
@@ -845,7 +838,6 @@ pub fn sub_exp(a: &[f32], b: &[f32], out: &mut [f32]) {
         unsafe {
             sub_exp_neon(a, b, out);
         }
-        return;
     }
 
     #[cfg(not(target_arch = "aarch64"))]
@@ -893,11 +885,7 @@ unsafe fn sub_exp_neon(a: &[f32], b: &[f32], out: &mut [f32]) {
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 #[allow(unsafe_code)]
-unsafe fn softmax_shifted_exp_sum_neon(
-    logits: &[f32],
-    max: f32,
-    exps: &mut [f32],
-) -> f32 {
+unsafe fn softmax_shifted_exp_sum_neon(logits: &[f32], max: f32, exps: &mut [f32]) -> f32 {
     use std::arch::aarch64::*;
 
     let n = logits.len();
@@ -955,7 +943,6 @@ pub fn quantize_exps_to_freqs(exps: &[f32], scale: f32, freqs: &mut [u32]) {
         #[allow(unsafe_code)]
         unsafe {
             quantize_exps_to_freqs_neon(exps, scale, freqs);
-            return;
         }
     }
 
@@ -1063,12 +1050,11 @@ pub fn matvec_col_major_par(
             }
 
             // AXPY over each column, restricted to this chunk's rows
-            for j in 0..cols {
+            for (j, &xj) in x.iter().enumerate().take(cols) {
                 let col_start = j * rows + row_start;
                 let col = &mat_col_major[col_start..col_start + chunk_len];
-                let xj = x[j];
-                for i in 0..chunk_len {
-                    out_chunk[i] += xj * col[i];
+                for (o, &c) in out_chunk.iter_mut().zip(col.iter()) {
+                    *o += xj * c;
                 }
             }
         });
@@ -1212,7 +1198,6 @@ pub fn matvec_col_major_int8(
         unsafe {
             matvec_col_major_int8_neon(qmat, scales, x, out, rows, cols);
         }
-        return;
     }
 
     #[cfg(not(target_arch = "aarch64"))]
@@ -1304,9 +1289,9 @@ unsafe fn matvec_col_major_int8_neon(
             let o2 = vld1q_f32(out_p.add(off + 8));
             let o3 = vld1q_f32(out_p.add(off + 12));
 
-            vst1q_f32(out_p.add(off),      vfmaq_f32(o0, f0, xs_v));
-            vst1q_f32(out_p.add(off + 4),  vfmaq_f32(o1, f1, xs_v));
-            vst1q_f32(out_p.add(off + 8),  vfmaq_f32(o2, f2, xs_v));
+            vst1q_f32(out_p.add(off), vfmaq_f32(o0, f0, xs_v));
+            vst1q_f32(out_p.add(off + 4), vfmaq_f32(o1, f1, xs_v));
+            vst1q_f32(out_p.add(off + 8), vfmaq_f32(o2, f2, xs_v));
             vst1q_f32(out_p.add(off + 12), vfmaq_f32(o3, f3, xs_v));
             k += 1;
         }
@@ -1398,16 +1383,16 @@ fn matvec_sgemm(mat: &[f32], x: &[f32], out: &mut [f32], rows: usize, cols: usiz
     #[allow(unsafe_code)]
     unsafe {
         matrixmultiply::sgemm(
-            rows,       // m
-            cols,       // k
-            1,          // n
-            1.0,        // alpha
+            rows, // m
+            cols, // k
+            1,    // n
+            1.0,  // alpha
             mat.as_ptr(),
             cols as isize, // row stride of A
             1,             // col stride of A
             x.as_ptr(),
-            1, // row stride of B (irrelevant for n=1, but must be valid)
-            1, // col stride of B
+            1,   // row stride of B (irrelevant for n=1, but must be valid)
+            1,   // col stride of B
             0.0, // beta
             out.as_mut_ptr(),
             1, // row stride of C
@@ -1445,7 +1430,6 @@ pub fn layer_norm(x: &[f32], weight: &[f32], bias: &[f32], eps: f32, out: &mut [
         unsafe {
             layer_norm_neon(x, weight, bias, eps, out);
         }
-        return;
     }
 
     #[cfg(not(target_arch = "aarch64"))]
@@ -1475,13 +1459,7 @@ pub fn layer_norm(x: &[f32], weight: &[f32], bias: &[f32], eps: f32, out: &mut [
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 #[allow(unsafe_code)]
-unsafe fn layer_norm_neon(
-    x: &[f32],
-    weight: &[f32],
-    bias: &[f32],
-    eps: f32,
-    out: &mut [f32],
-) {
+unsafe fn layer_norm_neon(x: &[f32], weight: &[f32], bias: &[f32], eps: f32, out: &mut [f32]) {
     use std::arch::aarch64::*;
 
     let n = x.len();
@@ -1559,7 +1537,6 @@ pub fn sigmoid_inplace(x: &mut [f32]) {
         unsafe {
             sigmoid_inplace_neon(x);
         }
-        return;
     }
 
     #[cfg(not(target_arch = "aarch64"))]
@@ -1853,7 +1830,10 @@ mod tests {
         let mean: f32 = out.iter().sum::<f32>() / 4.0;
         let var: f32 = out.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / 4.0;
         assert!((mean).abs() < 1e-5, "mean after LN should be 0, got {mean}");
-        assert!((var - 1.0).abs() < 1e-3, "var after LN should be 1, got {var}");
+        assert!(
+            (var - 1.0).abs() < 1e-3,
+            "var after LN should be 1, got {var}"
+        );
     }
 
     #[test]
@@ -1925,6 +1905,7 @@ mod tests {
         //   - a few values below -50 that should clamp cleanly
         let n = 16384;
         let mut logits = vec![0.0f32; n];
+        #[allow(clippy::needless_range_loop)] // `i` gates several synthetic branches below
         for i in 0..n {
             let t = i as f32 / n as f32;
             logits[i] = if i % 97 == 0 {
@@ -2104,9 +2085,9 @@ mod tests {
         assert!(sum.is_finite());
         assert!((exps[0] - 1.0).abs() < 1e-5);
         // Clamped path: exp(-50) ≈ 1.93e-22 is the floor.
-        for i in 1..4 {
-            assert!(exps[i] >= 0.0);
-            assert!(exps[i] < 1e-20, "exps[{i}] = {}", exps[i]);
+        for (i, &e) in exps.iter().enumerate().take(4).skip(1) {
+            assert!(e >= 0.0);
+            assert!(e < 1e-20, "exps[{i}] = {e}");
         }
     }
 }

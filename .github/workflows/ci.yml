@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'l3tc-rust/**'
+      - '.github/workflows/ci.yml'
+  pull_request:
+    paths:
+      - 'l3tc-rust/**'
+      - '.github/workflows/ci.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+defaults:
+  run:
+    working-directory: l3tc-rust
+
+jobs:
+  # rustfmt and clippy are blocking gates. The tree was cleaned up in
+  # task #24; new PRs that introduce unformatted code or clippy
+  # warnings fail CI. If a lint is genuinely wrong for this codebase
+  # (e.g., `too_many_arguments` on a NEON kernel) prefer a scoped
+  # `#[allow(...)]` with a load-bearing comment over silencing the
+  # category crate-wide.
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install SentencePiece
+        run: sudo apt-get update && sudo apt-get install -y libsentencepiece-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: l3tc-rust -> target
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+
+  build-test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-arm64
+            os: macos-14
+            target: aarch64-apple-darwin
+            sp-install: brew install sentencepiece pkg-config
+          - name: macos-x86_64
+            os: macos-13
+            target: x86_64-apple-darwin
+            sp-install: brew install sentencepiece pkg-config
+          - name: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            sp-install: sudo apt-get update && sudo apt-get install -y libsentencepiece-dev pkg-config
+          - name: linux-arm64
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            sp-install: sudo apt-get update && sudo apt-get install -y libsentencepiece-dev pkg-config
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install SentencePiece
+        run: ${{ matrix.sp-install }}
+        working-directory: .
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: l3tc-rust -> target
+          key: ${{ matrix.target }}
+
+      - name: Build (release)
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Unit tests (lib)
+        run: cargo test --release --target ${{ matrix.target }} --lib
+
+      - name: Smoke test — round-trip
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Hello world from ${{ matrix.name }} on $(date)" > /tmp/l3tc_ci_input.txt
+          ./target/${{ matrix.target }}/release/l3tc \
+            compress /tmp/l3tc_ci_input.txt \
+            -o /tmp/l3tc_ci.l3tc --verify

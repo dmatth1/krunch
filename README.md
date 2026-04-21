@@ -1,168 +1,161 @@
-# l3tc-prod
+# Krunch
 
-A neural lossless compressor for text and structured data.
-10-83× faster than every other neural/PAQ compressor on the
-[Large Text Compression Benchmark](http://mattmahoney.net/dc/text.html),
-with 30-45% better compression ratio than zstd/xz/bzip2 on
-text.
+> **Repo home:** [github.com/dmatth1/Krunch](https://github.com/dmatth1/Krunch) (private, pre-MVP)
 
-Built for backup, archival, log shipping, and cold storage —
-anywhere ratio matters more than speed. Production Rust
-implementation of RWKV-v4 + HiRA driving an arithmetic coder.
-6.6K LOC, minimal deps, hand-rolled NEON kernels, no ML
-framework at runtime.
+_Internal codename: learned-archive. AWS resources are named `archive-{env}-*`._
 
-**Current status:** the shipped 200K model is trained on
-Wikipedia (enwik8) and compresses prose well. A generalist
-model trained on 52 GB of diverse data (prose + GitHub code +
-configs + logs + CSV) is in development to cover all text and
-structured data types — see `docs/phases/PHASE_11.md`.
+> **Status: pre-spike.** No service code yet. The compression
+> technology from the archived `l3tc-prod` project is reusable but the
+> service itself hasn't been validated against real customer data. See
+> `STORAGE_SERVICE.md` for the full product spec and spike plan.
 
-## Numbers
+A managed storage service for text-heavy data. Customer PUTs events
+via an S3-compatible API; we train a custom compression model on their
+data distribution, compress, store. GET decompresses and returns in
+seconds. Targets 2-4× better compression than `zstd -22` on
+homogeneous log-like data, at retrieval latency comparable to
+S3 Standard — meaningfully better than Glacier Deep Archive's
+12-48h SLA.
 
-### Speed by configuration (Phase 12 measured, Phase 13 in progress)
+## The pitch
 
-All measurements on a clean Apple M-series MacBook (8 performance
-+ 2 efficiency cores) using 1 MB enwik6. Metal row uses the
-post-Phase-13n fused-layer kernel at batch=256.
+Your logs / audit records / transaction streams / document archives
+are costing you too much on S3 Standard + zstd, or too much hassle on
+Glacier with rehydrate + re-index tax, or too much per GB on
+Axiom/Datadog/Elastic. We train a **small model on YOUR data** once,
+then compress everything with that model from then on. Per-customer
+specialization produces ratios that generic compression cannot match,
+so our storage bill is dramatically smaller — and we pass most of the
+savings on.
 
-| backend | model | compress | decompress | ratio | bpb |
-|---|---|---:|---:|---:|---:|
-| CPU 1 thread | 200K | **22.7 KB/s** | **23.6 KB/s** | 0.1699 | ~1.43 |
-| CPU 10 threads (rayon) | 200K | **172 KB/s** | **180 KB/s** | 0.1699 | ~1.43 |
-| CPU 10 threads (rayon) | 3.2M | **40 KB/s** | **41 KB/s** | 0.1337 | ~1.07 |
-| GPU Metal (200K, 256-lane + fused layers + pipelined) | 200K | **~100 KB/s** | ~48 KB/s | 0.1699 | ~1.43 |
+Retrieval is sub-10 seconds for typical ranges, not the 12+ hours that
+Glacier Deep Archive imposes.
 
-Metal ratio now matches CPU exactly (0.1699) — the Phase 13n
-fused-layer kernel keeps per-layer intermediate state in registers
-rather than round-tripping through device memory, which
-eliminated the ~1 ULP/layer FP drift that previously left the
-Metal cum_freqs one byte off CPU's on the same input.
+## Why this is the right product shape (vs. the archived CLI)
 
-CPU multi-thread scaling: ~7.5× over single-thread (memory-bandwidth
-bound from 10 threads up).
+The previous direction (`l3tc-prod`) tried to be a CLI compressor
+competing with `zstd`. Three structural problems killed it:
+- zstd is 1000× faster and shipped in every OS
+- Per-user model distribution is operationally ugly
+- Ratio win on heterogeneous text is marginal
 
-**Phase 13 GPU backend status:** functional, bit-correct, and
-approximately **~45% of the single-thread CPU rate** on 1 MB enwik6.
-End-to-end Metal compress on 1 MB: **~100 KB/s** at batch=256 with
-the post-13s pipelined path (GPU forward(t+1) overlapped with CPU
-AC encode(t)). Ratio 0.1699 matches CPU exactly. Cumulative across
-Phases 13e→13s: **~667× over the 0.15 KB/s bring-up**, landed via
-N-segment lockstep (13h), GPU-resident state + chained dispatch
-(13j), per-layer fused MSL kernel (13n), parallelized cum_freqs
-stages (13q), and GPU/CPU pipelining (13s). The 1-3 MB/s projection
-remains open — next levers are simdgroup_matrix tiles for the
-7 per-layer matvecs, or INT8-quantizing the 9216-element block
-projections. See [`docs/phases/PHASE_13.md`](docs/phases/PHASE_13.md)
-for the full architecture and the bit-equivalence finding.
+The service model fixes all three:
+- Compression runs on our infrastructure; customer never waits
+- Model lives with us forever, no distribution concern
+- **Per-customer models on homogeneous data win by 3-5×, not 1.3×**
 
-**Backend choice:** pass `--backend=cpu` (default) or `--backend=metal`.
-Files compressed with `metal` MUST be decompressed with `metal`
-(FP arithmetic differs between backends and would desync the AC).
-The decompress side defaults to `--backend=auto`, which reads the
-file header to pick the matching backend automatically.
+See `STORAGE_SERVICE.md` for the detailed argument.
 
-### vs learned compressors (CPU, wall-clock)
+## Competitive landscape
 
-| Compressor | bpb | KB/s | Hardware |
-|---|---:|---:|---|
-| **l3tc-prod 200K (Phase 12h)** | **~1.43** | **172** | Apple M-series, 10 cores |
-| **l3tc-prod 3.2M (Phase 12g)** | **~1.07** | **40** | Apple M-series, 10 cores |
-| nncp v3.2 | 0.857 | 4.04 | RTX 3090 GPU |
-| cmix v21 | 0.866 | 1.57 | CPU |
-| lstm-compress v3 | ~1.39 | 10.58 | CPU |
-| Nacrith (2026) | 0.94 (enwik8) | ~200-280 | GTX 1050 Ti GPU |
-| ts_zip (Bellard) | 1.084 | ~1024 | RTX 4090 GPU |
+Category exists (cheap log / text archive). Differentiator is
+compression tech, not product shape.
 
-l3tc-prod is 10-83× faster wall-clock than every CPU-only LTCB entry,
-and the only learned compressor with first-class CPU and (in-progress)
-GPU backends. The trade vs the ratio frontier: ~67% behind. See
-[`docs/COMPARISON.md`](docs/COMPARISON.md) for the full primary-source
-analysis.
+| product | compression approach |
+|---|---|
+| Datadog Flex Logs / Flex Frozen | Generic; rehydrate tax on search |
+| Elastic Frozen Tier (searchable snapshots) | Generic; zstd-class ratios |
+| Grafana Loki | Index-free chunked; generic LZ |
+| Axiom | "95% compression" via hand-tuned data store; generic |
+| Humio / Logscale | Streaming; generic |
+| **this project** | **Per-customer learned models** |
 
-### vs classical compressors (enwik6, 1 MB)
+Nobody in this category ships per-customer trained compression. That
+is the wedge.
 
-| Compressor | Ratio | Compress MB/s |
-|---|---:|---:|
-| **l3tc-prod 200K** | **0.1699** | **0.172** |
-| **l3tc-prod 3.2M** | **0.1337** | **0.040** |
-| bzip2-9 | 0.2813 | 16.67 |
-| xz-9e | 0.2907 | 3.77 |
-| zstd-22 | 0.3001 | 4.34 |
+## API (planned — not built)
 
-Best ratio in the suite — 41% better than bzip2, 43% better than
-zstd. The cost is wall time: xz is ~30× faster. This is a
-ratio-first tool for cold archive, compliance, and scientific
-text corpora.
+Time-sharded log ingest, following Grafana Loki / Elastic conventions:
 
-## Quick start
+```
+POST   /v1/customers/{cid}/datasets             # create dataset
+DELETE /v1/customers/{cid}/datasets/{dsid}      # delete dataset + data
 
-```bash
-cd l3tc-rust
-cargo build --release
-cargo test --release
+PUT    /v1/customers/{cid}/datasets/{dsid}/events
+  # body: application/x-ndjson
+  # 202 Accepted + batch-id
 
-# Round-trip compress + verify
-./iter.sh
+GET    /v1/customers/{cid}/datasets/{dsid}/events
+  # ?start_ts=<iso8601>&end_ts=<iso8601>&limit=N&cursor=...
+  # returns decompressed NDJSON
 
-# Explicit CLI
-./target/release/l3tc compress input.txt -o out.l3tc --verify --time
-./target/release/l3tc decompress out.l3tc -o back.txt --time
+DELETE /v1/customers/{cid}/datasets/{dsid}/events?before_ts=...
+  # compliance / GDPR retention
 
-# Use the high-ratio 3.2M model
-./target/release/l3tc compress input.txt --model checkpoints/l3tc_3m2.bin -o out.l3tc
+GET    /v1/customers/{cid}/datasets             # list
+GET    /v1/customers/{cid}/datasets/{dsid}      # metadata + model status
 ```
 
-## How it works
+No query language, no content search, no tags, no dashboards.
+Storage, not analytics.
 
-A small recurrent language model (RWKV-v4 + HiRA, 200K non-embed
-params) predicts the next BPE token given the context. The
-prediction's probability distribution feeds an arithmetic coder
-that encodes the actual next token in fewer bits when the model
-is confident. Better predictions = fewer bits = smaller file.
+## Ingest flow
 
-The Rust runtime hand-rolls the forward pass with NEON intrinsics,
-INT8-quantizes the head weight, and parallelizes across segments
-via rayon. Runs at batch-1 on CPU — no GPU, no Python, no
-framework.
+```
+PUT /events
+  → stored raw in s3://bucket/{cid}/{dsid}/raw/
+  → if dataset has trained model: compress, delete raw
+  → else: queued; compress when model is ready
 
-## Building from source
+First N GB to a new dataset:
+  → accumulate in raw/
+  → kick off training job on GPU
+  → model registered
+  → raw data compressed, raw cleaned up
+  → subsequent PUTs compress inline
 
-```bash
-# Prerequisites: Rust toolchain, Python 3.10+ (for checkpoint conversion)
-git clone https://github.com/dmatth1/ltec.git l3tc-prod
-cd l3tc-prod
-
-# Set up the L3TC reference (for checkpoint conversion)
-./scripts/setup.sh
-
-# Convert the checkpoint to Rust format
-cd vendor/L3TC && source .venv/bin/activate
-python ../../l3tc-rust/scripts/convert_checkpoint.py \
-    --input checkpoints/l3tc_checkpoints/l3tc_200k_bpe16k_c999_checkpoint0019.pth \
-    --config config/l3tc/l3tc_200k.py \
-    --output ../../l3tc-rust/checkpoints/l3tc_200k.bin
-
-# Build and test
-cd ../../l3tc-rust
-cargo build --release
-cargo test --release
-./iter.sh
+Background:
+  drift monitor samples incoming events
+  if ratio degrades > threshold → schedule retrain
+  new model_version_id for new data; old data stays on old model
 ```
 
-## Documentation
+## Current state
 
-- [`docs/COMPARISON.md`](docs/COMPARISON.md) — primary-source
-  compressor landscape analysis with LTCB numbers
-- [`docs/DECISIONS.md`](docs/DECISIONS.md) — architectural
-  decision log including reversals
-- [`docs/phases/`](docs/phases/) — per-phase plans
-- [`docs/phase-findings/`](docs/phase-findings/) — per-phase
-  results
-- [`docs/DETAILED_README.md`](docs/DETAILED_README.md) — full
-  project history and detailed status
+**All compression technology carries over from the archived
+`l3tc-prod` project.** The Rust inference runtime, RWKV-v4 training
+pipeline, `.pth → .bin` converter, Metal backend, Phase 11 spot-fleet
+training infra — all usable as-is for the compression engine.
+
+**None of the service is built.** Planned spike sequence:
+
+1. **Spike 1 (5 days):** validate compression ratio on 3 real log
+   corpora (nginx access, JSON events, syslog). Pass = ≥2× `zstd -22`
+   on at least 2 of 3.
+2. **Spike 2 (3 days):** corpus-size ablation (how much data does a
+   customer need to upload before their model asymptotes).
+3. **Spike 3 (1 week):** end-to-end retrieval latency. Single EC2 +
+   S3 + pre-trained model. Pass = 10 MB decompressed in ≤5 seconds.
+4. **Spike 4 (1 day):** unit economics with measured numbers.
+
+Full plan: `STORAGE_SERVICE.md`.
+
+## Target customer
+
+- Multi-TB to multi-PB text-heavy data
+- 5-30 year retention (compliance, audit, regulatory)
+- Rare retrieval (<5% per year)
+- OK with sub-10s retrieval latency (not ms-sensitive)
+- Homogeneous data within a dataset (one format per bucket)
+
+Verticals:
+- Finance / fintech transaction archives
+- Healthcare / pharma trial data
+- Legal / e-discovery document archives
+- SaaS platform log retention (7+ year compliance)
+
+## Install / use
+
+Not yet. Pre-spike. See `STORAGE_SERVICE.md` for the plan.
 
 ## License
 
-See the L3TC paper license. This is a research-to-product
-translation of L3TC (AAAI 2025).
+Apache-2.0. See [LICENSE](LICENSE).
+
+Compression technology derives from L3TC (AAAI 2025) and RWKV-LM
+(Apache-2.0). See [NOTICE](NOTICE) for attribution.
+
+## History
+
+Forked from `l3tc-prod` on 2026-04-21. See
+`docs/ARCHIVE_l3tc.md` (pending) for l3tc history.

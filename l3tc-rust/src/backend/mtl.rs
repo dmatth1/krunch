@@ -3,12 +3,27 @@
 //! Smoke test (Phase 13b) + head matvec kernel (Phase 13c).
 //! Phase 13d will add the rest of the forward pass.
 
+// Metal kernel constructors take one `&[f32]` per weight tensor
+// (embeddings, layer-norm gamma/beta, attention Q/K/V/O weights, FFN
+// weights, time-mix parameters, etc.). Wrapping them in a struct is
+// a layer of indirection that adds no safety — each slice is still
+// validated against a fixed layer shape — and complicates the call
+// sites in `BatchedSession::new`. `too_many_arguments` is expected
+// for this module and not a signal of confused design.
+#![allow(clippy::too_many_arguments)]
+// The individual kernel-constructor / encode-helper methods are
+// small wrappers around specific MSL shader dispatches. The module
+// docs at the top explain the shared shape/args contract; per-item
+// docs would be mostly "dispatches shader X" noise. Re-enable when
+// the backend stabilizes and a contributor guide covers naming.
+#![allow(missing_docs)]
+
 use std::error::Error;
 use std::fmt;
 
 use metal::{
-    Buffer, CommandBufferRef, CommandQueue, ComputePipelineState, Device,
-    MTLResourceOptions, MTLSize,
+    Buffer, CommandBufferRef, CommandQueue, ComputePipelineState, Device, MTLResourceOptions,
+    MTLSize,
 };
 
 /// Errors produced by the Metal backend.
@@ -141,10 +156,7 @@ fn dispatch_add(
     encoder.set_buffer(2, Some(c), 0);
 
     // Threadgroup width — pipeline-recommended; falls back to 64.
-    let tg_width = pipeline
-        .thread_execution_width()
-        .max(1)
-        .min(n as u64) as u64;
+    let tg_width = pipeline.thread_execution_width().max(1).min(n as u64);
 
     encoder.dispatch_threads(
         MTLSize {
@@ -292,6 +304,9 @@ pub struct HeadKernelMetal {
     queue: CommandQueue,
     pipeline: ComputePipelineState,
     pipeline_batched: ComputePipelineState,
+    // Retained alternate pipeline kept loaded for micro-benchmarks
+    // that select between dispatch variants at runtime.
+    #[allow(dead_code)]
     pipeline_batched_simd: ComputePipelineState,
     qmat_buf: Buffer,
     scales_buf: Buffer,
@@ -312,8 +327,7 @@ impl HeadKernelMetal {
         assert_eq!(scales.len(), cols, "scales shape");
         let device = Device::system_default().ok_or(MetalError::NoDevice)?;
         let queue = device.new_command_queue();
-        let (pipeline, pipeline_batched, pipeline_batched_simd) =
-            build_head_pipelines(&device)?;
+        let (pipeline, pipeline_batched, pipeline_batched_simd) = build_head_pipelines(&device)?;
         let qmat_buf = device.new_buffer_with_data(
             qmat.as_ptr() as *const std::ffi::c_void,
             std::mem::size_of_val(qmat) as u64,
@@ -397,13 +411,7 @@ impl HeadKernelMetal {
     /// experimentation but `encode_into` uses the faster 1-thread
     /// kernel. The SIMD kernel MSL remains in the source so a future
     /// tile-based rewrite can start from it.
-    pub fn encode_into(
-        &self,
-        cmd_buf: &CommandBufferRef,
-        x: &Buffer,
-        out: &Buffer,
-        batch: usize,
-    ) {
+    pub fn encode_into(&self, cmd_buf: &CommandBufferRef, x: &Buffer, out: &Buffer, batch: usize) {
         let batch_u32 = batch as u32;
         let encoder = cmd_buf.new_compute_command_encoder();
         encoder.set_compute_pipeline_state(&self.pipeline_batched);
@@ -432,8 +440,16 @@ impl HeadKernelMetal {
             .max(1)
             .min(self.rows as u64);
         encoder.dispatch_threads(
-            MTLSize { width: self.rows as u64, height: batch as u64, depth: 1 },
-            MTLSize { width: tg_width, height: 1, depth: 1 },
+            MTLSize {
+                width: self.rows as u64,
+                height: batch as u64,
+                depth: 1,
+            },
+            MTLSize {
+                width: tg_width,
+                height: 1,
+                depth: 1,
+            },
         );
         encoder.end_encoding();
     }
@@ -652,13 +668,7 @@ impl LayerNormKernelMetal {
     }
 
     /// Phase 13j: encode into a caller-provided command buffer.
-    pub fn encode_into(
-        &self,
-        cmd_buf: &CommandBufferRef,
-        x: &Buffer,
-        out: &Buffer,
-        batch: usize,
-    ) {
+    pub fn encode_into(&self, cmd_buf: &CommandBufferRef, x: &Buffer, out: &Buffer, batch: usize) {
         let batch_u32 = batch as u32;
         let encoder = cmd_buf.new_compute_command_encoder();
         encoder.set_compute_pipeline_state(&self.pipeline);
@@ -681,10 +691,22 @@ impl LayerNormKernelMetal {
             std::mem::size_of::<f32>() as u64,
             &self.eps as *const f32 as *const std::ffi::c_void,
         );
-        let tg_width = self.pipeline.thread_execution_width().max(1).min(batch as u64);
+        let tg_width = self
+            .pipeline
+            .thread_execution_width()
+            .max(1)
+            .min(batch as u64);
         encoder.dispatch_threads(
-            MTLSize { width: batch as u64, height: 1, depth: 1 },
-            MTLSize { width: tg_width, height: 1, depth: 1 },
+            MTLSize {
+                width: batch as u64,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: tg_width,
+                height: 1,
+                depth: 1,
+            },
         );
         encoder.end_encoding();
     }
@@ -870,13 +892,7 @@ impl Matvec96Metal {
     /// Phase 13j: encode the matvec into a caller-provided command
     /// buffer without committing. Used by `BatchedSession` to chain
     /// many kernel dispatches into one commit.
-    pub fn encode_into(
-        &self,
-        cmd_buf: &CommandBufferRef,
-        x: &Buffer,
-        out: &Buffer,
-        batch: usize,
-    ) {
+    pub fn encode_into(&self, cmd_buf: &CommandBufferRef, x: &Buffer, out: &Buffer, batch: usize) {
         let batch_u32 = batch as u32;
         let encoder = cmd_buf.new_compute_command_encoder();
         encoder.set_compute_pipeline_state(&self.pipeline);
@@ -899,8 +915,16 @@ impl Matvec96Metal {
             .max(1)
             .min(self.h as u64);
         encoder.dispatch_threads(
-            MTLSize { width: self.h as u64, height: batch as u64, depth: 1 },
-            MTLSize { width: tg_width, height: 1, depth: 1 },
+            MTLSize {
+                width: self.h as u64,
+                height: batch as u64,
+                depth: 1,
+            },
+            MTLSize {
+                width: tg_width,
+                height: 1,
+                depth: 1,
+            },
         );
         encoder.end_encoding();
     }
@@ -946,8 +970,16 @@ impl Matvec96Metal {
             .max(1)
             .min(self.h as u64);
         encoder.dispatch_threads(
-            MTLSize { width: self.h as u64, height: batch as u64, depth: 1 },
-            MTLSize { width: tg_width, height: 1, depth: 1 },
+            MTLSize {
+                width: self.h as u64,
+                height: batch as u64,
+                depth: 1,
+            },
+            MTLSize {
+                width: tg_width,
+                height: 1,
+                depth: 1,
+            },
         );
         encoder.end_encoding();
     }
@@ -1116,8 +1148,16 @@ impl SubExpKernelMetal {
             .max(1)
             .min(self.h as u64);
         encoder.dispatch_threads(
-            MTLSize { width: self.h as u64, height: batch as u64, depth: 1 },
-            MTLSize { width: tg_width, height: 1, depth: 1 },
+            MTLSize {
+                width: self.h as u64,
+                height: batch as u64,
+                depth: 1,
+            },
+            MTLSize {
+                width: tg_width,
+                height: 1,
+                depth: 1,
+            },
         );
         encoder.end_encoding();
     }
@@ -1239,13 +1279,7 @@ impl SigmoidKernelMetal {
     }
 
     /// Phase 13j: encode into a caller-provided command buffer.
-    pub fn encode_into(
-        &self,
-        cmd_buf: &CommandBufferRef,
-        x: &Buffer,
-        out: &Buffer,
-        batch: usize,
-    ) {
+    pub fn encode_into(&self, cmd_buf: &CommandBufferRef, x: &Buffer, out: &Buffer, batch: usize) {
         let batch_u32 = batch as u32;
         let encoder = cmd_buf.new_compute_command_encoder();
         encoder.set_compute_pipeline_state(&self.pipeline);
@@ -1267,8 +1301,16 @@ impl SigmoidKernelMetal {
             .max(1)
             .min(self.h as u64);
         encoder.dispatch_threads(
-            MTLSize { width: self.h as u64, height: batch as u64, depth: 1 },
-            MTLSize { width: tg_width, height: 1, depth: 1 },
+            MTLSize {
+                width: self.h as u64,
+                height: batch as u64,
+                depth: 1,
+            },
+            MTLSize {
+                width: tg_width,
+                height: 1,
+                depth: 1,
+            },
         );
         encoder.end_encoding();
     }
@@ -1504,8 +1546,8 @@ impl TimeMixKernelMetal {
 
         let cmd_buf = self.queue.new_command_buffer();
         self.encode_step1_into(
-            cmd_buf, &sp_buf, &k_buf, &sa_buf, &sb_buf, &v_buf, &ww_buf, &p_buf, &a_buf,
-            &b_buf, batch,
+            cmd_buf, &sp_buf, &k_buf, &sa_buf, &sb_buf, &v_buf, &ww_buf, &p_buf, &a_buf, &b_buf,
+            batch,
         );
         commit_and_wait(cmd_buf);
 
@@ -1561,8 +1603,16 @@ impl TimeMixKernelMetal {
             .max(1)
             .min(self.h as u64);
         encoder.dispatch_threads(
-            MTLSize { width: self.h as u64, height: batch as u64, depth: 1 },
-            MTLSize { width: tg_width, height: 1, depth: 1 },
+            MTLSize {
+                width: self.h as u64,
+                height: batch as u64,
+                depth: 1,
+            },
+            MTLSize {
+                width: tg_width,
+                height: 1,
+                depth: 1,
+            },
         );
         encoder.end_encoding();
     }
@@ -1654,8 +1704,16 @@ impl TimeMixKernelMetal {
             .max(1)
             .min(self.h as u64);
         encoder.dispatch_threads(
-            MTLSize { width: self.h as u64, height: batch as u64, depth: 1 },
-            MTLSize { width: tg_width, height: 1, depth: 1 },
+            MTLSize {
+                width: self.h as u64,
+                height: batch as u64,
+                depth: 1,
+            },
+            MTLSize {
+                width: tg_width,
+                height: 1,
+                depth: 1,
+            },
         );
         encoder.end_encoding();
     }
@@ -1945,8 +2003,16 @@ impl CumFreqsKernelMetal {
                 &batch_u32 as *const u32 as *const std::ffi::c_void,
             );
             encoder.dispatch_thread_groups(
-                MTLSize { width: batch as u64, height: 1, depth: 1 },
-                MTLSize { width: CUM_TPL, height: 1, depth: 1 },
+                MTLSize {
+                    width: batch as u64,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: CUM_TPL,
+                    height: 1,
+                    depth: 1,
+                },
             );
             encoder.end_encoding();
         }
@@ -1972,8 +2038,16 @@ impl CumFreqsKernelMetal {
                 &batch_u32 as *const u32 as *const std::ffi::c_void,
             );
             encoder.dispatch_thread_groups(
-                MTLSize { width: batch as u64, height: 1, depth: 1 },
-                MTLSize { width: CUM_TPL, height: 1, depth: 1 },
+                MTLSize {
+                    width: batch as u64,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: CUM_TPL,
+                    height: 1,
+                    depth: 1,
+                },
             );
             encoder.end_encoding();
         }
@@ -2000,8 +2074,16 @@ impl CumFreqsKernelMetal {
                 .max(1)
                 .min(batch as u64);
             encoder.dispatch_threads(
-                MTLSize { width: batch as u64, height: 1, depth: 1 },
-                MTLSize { width: tg_width, height: 1, depth: 1 },
+                MTLSize {
+                    width: batch as u64,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: tg_width,
+                    height: 1,
+                    depth: 1,
+                },
             );
             encoder.end_encoding();
         }
@@ -2034,7 +2116,11 @@ impl CumFreqsKernelMetal {
                     height: batch as u64,
                     depth: 1,
                 },
-                MTLSize { width: tg_width, height: 1, depth: 1 },
+                MTLSize {
+                    width: tg_width,
+                    height: 1,
+                    depth: 1,
+                },
             );
             encoder.end_encoding();
         }
@@ -2373,9 +2459,7 @@ impl ForwardLayerKernelMetal {
             .map_err(MetalError::LibraryCompile)?;
         let function = library
             .get_function("forward_layer_96h", None)
-            .map_err(|e| {
-                MetalError::PipelineCreate(format!("forward_layer_96h: {e:?}"))
-            })?;
+            .map_err(|e| MetalError::PipelineCreate(format!("forward_layer_96h: {e:?}")))?;
         let pipeline = device
             .new_compute_pipeline_state_with_function(&function)
             .map_err(MetalError::PipelineCreate)?;
@@ -2466,8 +2550,16 @@ impl ForwardLayerKernelMetal {
         // Grid: (96 * batch threads, arranged as `batch` threadgroups
         // of 96 threads each).
         encoder.dispatch_thread_groups(
-            MTLSize { width: batch as u64, height: 1, depth: 1 },
-            MTLSize { width: 96, height: 1, depth: 1 },
+            MTLSize {
+                width: batch as u64,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 96,
+                height: 1,
+                depth: 1,
+            },
         );
         encoder.end_encoding();
         let _ = &self.queue; // field silences dead-code; queue reserved for standalone tests
@@ -2729,8 +2821,16 @@ impl GlueKernelsMetal {
         );
         let tg = pipe.thread_execution_width().max(1).min(width as u64);
         encoder.dispatch_threads(
-            MTLSize { width: width as u64, height: height as u64, depth: 1 },
-            MTLSize { width: tg, height: 1, depth: 1 },
+            MTLSize {
+                width: width as u64,
+                height: height as u64,
+                depth: 1,
+            },
+            MTLSize {
+                width: tg,
+                height: 1,
+                depth: 1,
+            },
         );
         encoder.end_encoding();
     }
@@ -2754,8 +2854,16 @@ impl GlueKernelsMetal {
         );
         let tg = pipe.thread_execution_width().max(1).min(n as u64);
         encoder.dispatch_threads(
-            MTLSize { width: n as u64, height: 1, depth: 1 },
-            MTLSize { width: tg, height: 1, depth: 1 },
+            MTLSize {
+                width: n as u64,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: tg,
+                height: 1,
+                depth: 1,
+            },
         );
         encoder.end_encoding();
     }
@@ -2856,23 +2964,11 @@ impl GlueKernelsMetal {
         Self::encode_1d(cmd_buf, &self.pipe_add, &[a, b, out], n);
     }
 
-    pub fn encode_add_inplace(
-        &self,
-        cmd_buf: &CommandBufferRef,
-        a: &Buffer,
-        b: &Buffer,
-        n: u32,
-    ) {
+    pub fn encode_add_inplace(&self, cmd_buf: &CommandBufferRef, a: &Buffer, b: &Buffer, n: u32) {
         Self::encode_1d(cmd_buf, &self.pipe_add_inplace, &[a, b], n);
     }
 
-    pub fn encode_copy(
-        &self,
-        cmd_buf: &CommandBufferRef,
-        src: &Buffer,
-        dst: &Buffer,
-        n: u32,
-    ) {
+    pub fn encode_copy(&self, cmd_buf: &CommandBufferRef, src: &Buffer, dst: &Buffer, n: u32) {
         Self::encode_1d(cmd_buf, &self.pipe_copy, &[src, dst], n);
     }
 
@@ -2903,12 +2999,7 @@ impl GlueKernelsMetal {
         Self::encode_1d(cmd_buf, &self.pipe_relu, &[a], n);
     }
 
-    pub fn encode_relu_square_inplace(
-        &self,
-        cmd_buf: &CommandBufferRef,
-        a: &Buffer,
-        n: u32,
-    ) {
+    pub fn encode_relu_square_inplace(&self, cmd_buf: &CommandBufferRef, a: &Buffer, n: u32) {
         Self::encode_1d(cmd_buf, &self.pipe_relu_sq, &[a], n);
     }
 }
@@ -2956,17 +3047,12 @@ mod tests {
         let mut qmat = vec![0i8; rows * cols];
         for j in 0..cols {
             for i in 0..rows {
-                qmat[j * rows + i] =
-                    (((i as i32 * 31 + j as i32 * 7) % 251) - 125) as i8;
+                qmat[j * rows + i] = (((i as i32 * 31 + j as i32 * 7) % 251) - 125) as i8;
             }
         }
-        let scales: Vec<f32> = (0..cols)
-            .map(|j| 1e-4 + (j as f32) * 1e-5)
-            .collect();
+        let scales: Vec<f32> = (0..cols).map(|j| 1e-4 + (j as f32) * 1e-5).collect();
         // Input vector with mixed magnitudes.
-        let x: Vec<f32> = (0..cols)
-            .map(|j| ((j as f32) - 48.0) * 0.05)
-            .collect();
+        let x: Vec<f32> = (0..cols).map(|j| ((j as f32) - 48.0) * 0.05).collect();
 
         // CPU reference (Phase 12d hand-tuned NEON).
         let mut cpu_out = vec![0.0f32; rows];
@@ -3344,8 +3430,16 @@ mod tests {
         let tol = 5e-4;
         assert!(max_abs(&cpu_ww, &gpu_ww) < tol, "ww diff");
         assert!(max_abs(&cpu_p, &gpu_p) < tol, "p diff");
-        assert!(max_abs(&cpu_a, &gpu_a) < tol, "a diff: {}", max_abs(&cpu_a, &gpu_a));
-        assert!(max_abs(&cpu_b, &gpu_b) < tol, "b diff: {}", max_abs(&cpu_b, &gpu_b));
+        assert!(
+            max_abs(&cpu_a, &gpu_a) < tol,
+            "a diff: {}",
+            max_abs(&cpu_a, &gpu_a)
+        );
+        assert!(
+            max_abs(&cpu_b, &gpu_b) < tol,
+            "b diff: {}",
+            max_abs(&cpu_b, &gpu_b)
+        );
     }
 
     /// Phase 13e prep: batched time_mix step2 on Metal must match

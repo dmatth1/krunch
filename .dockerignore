@@ -1,0 +1,35 @@
+# CDK Docker image asset builds use the repo root as build context.
+# Exclude everything that isn't needed in the training or compression
+# container to keep the context small.
+
+.git/
+cdk/node_modules/
+cdk/cdk.out/
+cdk/dist/
+node_modules/
+
+# Large archived artifacts — not needed in training or compression images
+corpus_build/
+data/
+checkpoints-phase11/
+tokenizer_pile/
+tokenizer_balanced_32k/
+tokenizer_pile_32k/
+l3tc-rust/target/
+l3tc-rust/fuzz/
+vendor/L3TC/.venv/
+vendor/L3TC/checkpoints/
+bench/corpora/
+bench/work/
+bench/work_traditional/
+bench/v010_benchmark/
+bench/detection_corpus/
+bench/__pycache__/
+**/__pycache__/
+**/.pytest_cache/
+
+# IDE / misc
+.idea/
+.vscode/
+.DS_Store
+*.log

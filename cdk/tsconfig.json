@@ -1,0 +1,25 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "CommonJS",
+    "moduleResolution": "node",
+    "lib": ["ES2022"],
+    "types": ["node"],
+    "strict": true,
+    "noImplicitAny": true,
+    "strictNullChecks": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUnusedLocals": false,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "declaration": true,
+    "inlineSourceMap": true,
+    "inlineSources": true,
+    "outDir": "dist",
+    "rootDir": ".",
+    "skipLibCheck": true
+  },
+  "include": ["bin/**/*.ts", "lib/**/*.ts", "src/**/*.ts"],
+  "exclude": ["node_modules", "dist", "cdk.out"]
+}

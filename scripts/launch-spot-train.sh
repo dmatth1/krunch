@@ -59,16 +59,42 @@ echo "AMI: ${AMI}"
 
 # Build userdata from template
 TEMPLATE="${SCRIPT_DIR}/spot-train-userdata.sh.template"
-USERDATA=$(sed \
+SCRIPT_RAW=$(sed \
     -e "s|__GITHUB_PAT__|${L3TC_GITHUB_PAT}|g" \
     -e "s|__RUN_ID__|${RUN_ID}|g" \
     -e "s|__S3_RUN__|${S3_RUN}|g" \
     -e "s|__TRAIN_ARGS__|${TRAIN_ARGS}|g" \
-    "$TEMPLATE" | base64)
+    "$TEMPLATE")
+SCRIPT_B64=$(echo "$SCRIPT_RAW" | base64 | tr -d '\n')
 
-SIZE_RAW=$(sed -e "s|__GITHUB_PAT__|${L3TC_GITHUB_PAT}|g" -e "s|__RUN_ID__|${RUN_ID}|g" -e "s|__S3_RUN__|${S3_RUN}|g" -e "s|__TRAIN_ARGS__|${TRAIN_ARGS}|g" "$TEMPLATE" | wc -c)
-echo "userdata: ${SIZE_RAW} bytes"
-if [ "$SIZE_RAW" -gt 12000 ]; then
+# Wrap as cloud-config so we can run bootcmd BEFORE atd starts (the
+# baked AMI has stale at-jobs from Apr 10 that fire shutdown 30s after
+# boot otherwise — see docs/phases/PHASE_11.md "Lessons" section).
+# bootcmd: clear at queue early in cloud-init init phase.
+# write_files: drop the training script.
+# runcmd: execute it after bootcmd + write_files.
+CLOUD_CONFIG=$(cat <<EOF
+#cloud-config
+bootcmd:
+  - rm -f /var/spool/cron/atjobs/a*
+  - rm -f /var/spool/at/*
+  - rm -f /var/spool/atd/*
+
+write_files:
+  - path: /usr/local/bin/l3tc-train.sh
+    permissions: '0755'
+    encoding: b64
+    content: ${SCRIPT_B64}
+
+runcmd:
+  - /usr/local/bin/l3tc-train.sh
+EOF
+)
+USERDATA=$(echo "$CLOUD_CONFIG" | base64 | tr -d '\n')
+
+SIZE_RAW=$(echo "$CLOUD_CONFIG" | wc -c)
+echo "userdata: ${SIZE_RAW} bytes (cloud-config wrapper + base64 script)"
+if [ "$SIZE_RAW" -gt 16000 ]; then
     echo "WARNING: userdata is large (${SIZE_RAW} bytes). EC2 limit is 16384 base64."
 fi
 

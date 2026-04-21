@@ -12,8 +12,7 @@ fn repo_root() -> PathBuf {
 #[test]
 #[ignore]
 fn where_does_time_go() {
-    let ckpt_path =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("checkpoints/l3tc_200k.bin");
+    let ckpt_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("checkpoints/l3tc_200k.bin");
     let tok_path = repo_root().join(
         "vendor/L3TC/dictionary/vocab_enwik8_bpe_16384_0.999/spm_enwik8_bpe_16384_0.999.model",
     );

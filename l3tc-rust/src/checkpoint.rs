@@ -294,11 +294,12 @@ impl<'a> Parser<'a> {
         let data_len = self.read_u64()? as usize;
         self.ensure(data_len)?;
 
-        let expected_numel: usize = shape.iter().try_fold(1usize, |acc, &d| {
-            acc.checked_mul(d)
-        }).ok_or_else(|| Error::BadCheckpoint(format!(
-            "{name}: shape {shape:?} overflows usize"
-        )))?;
+        let expected_numel: usize = shape
+            .iter()
+            .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+            .ok_or_else(|| {
+                Error::BadCheckpoint(format!("{name}: shape {shape:?} overflows usize"))
+            })?;
         let expected_bytes = expected_numel.checked_mul(4).ok_or_else(|| {
             Error::BadCheckpoint(format!("{name}: numel {expected_numel} * 4 overflows"))
         })?;

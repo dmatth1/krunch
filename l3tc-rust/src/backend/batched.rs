@@ -179,12 +179,12 @@ pub struct BatchedSession<'a> {
     state_ffn: Vec<Buffer>,
 
     // Shared per-token scratch on the GPU.
-    emb_buf: Buffer,           // vocab * h (uploaded once at construction)
-    prev_tokens_buf: Buffer,   // batch u32
-    x_buf: Buffer,             // batch * h
-    residual_buf: Buffer,      // batch * h
-    short_buf: Buffer,         // batch * h
-    normed_buf: Buffer,        // batch * h
+    emb_buf: Buffer,         // vocab * h (uploaded once at construction)
+    prev_tokens_buf: Buffer, // batch u32
+    x_buf: Buffer,           // batch * h
+    residual_buf: Buffer,    // batch * h
+    short_buf: Buffer,       // batch * h
+    normed_buf: Buffer,      // batch * h
     xk_buf: Buffer,
     xv_buf: Buffer,
     xr_buf: Buffer,
@@ -198,13 +198,13 @@ pub struct BatchedSession<'a> {
     rwkv_buf: Buffer,
     out_proj_buf: Buffer,
     ffn_out_buf: Buffer,
-    logits_buf: Buffer,        // batch * vocab f32
+    logits_buf: Buffer, // batch * vocab f32
     // cum_freqs scratch (reused across calls).
-    cum_max_buf: Buffer,       // batch f32
-    cum_exps_buf: Buffer,      // batch * vocab f32
-    cum_sum_buf: Buffer,       // batch f32
-    cum_scale_buf: Buffer,     // batch f32
-    freqs_buf: Buffer,         // batch * vocab u32
+    cum_max_buf: Buffer,   // batch f32
+    cum_exps_buf: Buffer,  // batch * vocab f32
+    cum_sum_buf: Buffer,   // batch f32
+    cum_scale_buf: Buffer, // batch f32
+    freqs_buf: Buffer,     // batch * vocab u32
 
     /// Host-side copy of the final `batch * vocab` logits. Populated
     /// after `forward_batched` returns.
@@ -231,8 +231,7 @@ impl<'a> BatchedSession<'a> {
         let num_layers = model.num_layers();
 
         let ln0 = LayerNormKernelMetal::new(&model.ln0.weight, &model.ln0.bias, h, 1e-5)?;
-        let ln_out =
-            LayerNormKernelMetal::new(&model.ln_out.weight, &model.ln_out.bias, h, 1e-5)?;
+        let ln_out = LayerNormKernelMetal::new(&model.ln_out.weight, &model.ln_out.bias, h, 1e-5)?;
         let head = HeadKernelMetal::new(&model.head_q, &model.head_scales, vocab, h)?;
         let cum_freqs = CumFreqsKernelMetal::new(vocab)?;
         let sub_exp = SubExpKernelMetal::new(h)?;
@@ -412,8 +411,10 @@ impl<'a> BatchedSession<'a> {
         );
 
         // 2. ln0 with input aliased to x (out → normed), then copy back.
-        self.ln0.encode_into(cmd_buf, &self.x_buf, &self.normed_buf, batch_u);
-        self.glue.encode_copy(cmd_buf, &self.normed_buf, &self.x_buf, bh);
+        self.ln0
+            .encode_into(cmd_buf, &self.x_buf, &self.normed_buf, batch_u);
+        self.glue
+            .encode_copy(cmd_buf, &self.normed_buf, &self.x_buf, bh);
 
         // 3. Per-layer block.
         //
@@ -423,6 +424,7 @@ impl<'a> BatchedSession<'a> {
         // from ~50 down to ~6 (embed + ln0 + copy + N_layers +
         // ln_out + head + cum_freqs_4).
         if let Some(fused) = &self.layers_fused {
+            #[allow(clippy::needless_range_loop)] // `layer` indexes parallel per-layer state Vecs
             for layer in 0..self.model.num_layers() {
                 fused[layer].encode_into(
                     cmd_buf,
@@ -437,47 +439,47 @@ impl<'a> BatchedSession<'a> {
                 );
             }
         } else {
-        // --- unfused fallback path (non-h=96 models) ---
-        //
-        // Phase 13k: eliminate the two `residual = x` copies per layer.
-        for layer in 0..self.model.num_layers() {
-            // Phase 13l: short = relu(short_weight @ x), fused.
-            self.layers[layer].short.encode_into_act(
-                cmd_buf,
-                &self.x_buf,
-                &self.short_buf,
-                batch_u,
-                1, // relu
-            );
+            // --- unfused fallback path (non-h=96 models) ---
+            //
+            // Phase 13k: eliminate the two `residual = x` copies per layer.
+            for layer in 0..self.model.num_layers() {
+                // Phase 13l: short = relu(short_weight @ x), fused.
+                self.layers[layer].short.encode_into_act(
+                    cmd_buf,
+                    &self.x_buf,
+                    &self.short_buf,
+                    batch_u,
+                    1, // relu
+                );
 
-            // ln1: x → normed (x preserved so we can add rwkv into it)
-            self.layers[layer]
-                .ln1
-                .encode_into(cmd_buf, &self.x_buf, &self.normed_buf, batch_u);
+                // ln1: x → normed (x preserved so we can add rwkv into it)
+                self.layers[layer]
+                    .ln1
+                    .encode_into(cmd_buf, &self.x_buf, &self.normed_buf, batch_u);
 
-            // time_mix: produces rwkv, updates state_x/a/b/p.
-            // Reads only `normed` + state — `x` is safe to keep.
-            self.encode_time_mix(cmd_buf, layer);
+                // time_mix: produces rwkv, updates state_x/a/b/p.
+                // Reads only `normed` + state — `x` is safe to keep.
+                self.encode_time_mix(cmd_buf, layer);
 
-            // x += rwkv (residual connection)
-            self.glue
-                .encode_add_inplace(cmd_buf, &self.x_buf, &self.rwkv_buf, bh);
+                // x += rwkv (residual connection)
+                self.glue
+                    .encode_add_inplace(cmd_buf, &self.x_buf, &self.rwkv_buf, bh);
 
-            // ln2: x → normed
-            self.layers[layer]
-                .ln2
-                .encode_into(cmd_buf, &self.x_buf, &self.normed_buf, batch_u);
+                // ln2: x → normed
+                self.layers[layer]
+                    .ln2
+                    .encode_into(cmd_buf, &self.x_buf, &self.normed_buf, batch_u);
 
-            // channel_mix: produces ffn_out, updates state_ffn.
-            // Reads only `normed` + state_ffn — `x` is safe to keep.
-            self.encode_channel_mix(cmd_buf, layer);
+                // channel_mix: produces ffn_out, updates state_ffn.
+                // Reads only `normed` + state_ffn — `x` is safe to keep.
+                self.encode_channel_mix(cmd_buf, layer);
 
-            // x += ffn_out; x += short
-            self.glue
-                .encode_add_inplace(cmd_buf, &self.x_buf, &self.ffn_out_buf, bh);
-            self.glue
-                .encode_add_inplace(cmd_buf, &self.x_buf, &self.short_buf, bh);
-        }
+                // x += ffn_out; x += short
+                self.glue
+                    .encode_add_inplace(cmd_buf, &self.x_buf, &self.ffn_out_buf, bh);
+                self.glue
+                    .encode_add_inplace(cmd_buf, &self.x_buf, &self.short_buf, bh);
+            }
         } // end unfused path
 
         // 4. Final layer norm.
@@ -494,17 +496,17 @@ impl<'a> BatchedSession<'a> {
 
         // 6. cum_freqs: logits → freqs (u32).
         if !skip_cum {
-        self.cum_freqs.encode_into(
-            cmd_buf,
-            &self.logits_buf,
-            &self.cum_max_buf,
-            &self.cum_exps_buf,
-            &self.cum_sum_buf,
-            &self.cum_scale_buf,
-            &self.freqs_buf,
-            batch_u,
-            PYTHON_FREQ_TOTAL,
-        );
+            self.cum_freqs.encode_into(
+                cmd_buf,
+                &self.logits_buf,
+                &self.cum_max_buf,
+                &self.cum_exps_buf,
+                &self.cum_sum_buf,
+                &self.cum_scale_buf,
+                &self.freqs_buf,
+                batch_u,
+                PYTHON_FREQ_TOTAL,
+            );
         } // end skip_cum guard
 
         // 7. Commit without waiting; retain ownership so the
@@ -668,13 +670,8 @@ impl<'a> BatchedSession<'a> {
             .encode_into(cmd_buf, &self.k_buf, &self.v_buf, self.batch);
 
         // ffn_out = r * v
-        self.glue.encode_mul(
-            cmd_buf,
-            &self.r_buf,
-            &self.v_buf,
-            &self.ffn_out_buf,
-            bh,
-        );
+        self.glue
+            .encode_mul(cmd_buf, &self.r_buf, &self.v_buf, &self.ffn_out_buf, bh);
     }
 }
 
@@ -793,9 +790,7 @@ pub fn compress_segments_batched(
             }
         }
         let pad_token = prev[0];
-        for lane in n..batch {
-            prev[lane] = pad_token;
-        }
+        prev[n..batch].fill(pad_token);
 
         // Reusable cum_freqs scratch (vocab+1 u64).
         let mut cum: Vec<u64> = Vec::with_capacity(vocab + 1);
@@ -920,7 +915,7 @@ pub fn compress_segments_batched_parallel(
         return compress_segments_batched(model, segments, batch_size);
     }
     let n_segs = segments.len();
-    let per_worker = (n_segs + n_workers - 1) / n_workers;
+    let per_worker = n_segs.div_ceil(n_workers);
 
     std::thread::scope(|scope| {
         let handles: Vec<_> = segments
@@ -954,14 +949,12 @@ pub fn decompress_segments_batched_parallel(
         return decompress_segments_batched(model, bodies, batch_size);
     }
     let n_bodies = bodies.len();
-    let per_worker = (n_bodies + n_workers - 1) / n_workers;
+    let per_worker = n_bodies.div_ceil(n_workers);
 
     std::thread::scope(|scope| {
         let handles: Vec<_> = bodies
             .chunks(per_worker)
-            .map(|chunk| {
-                scope.spawn(move || decompress_segments_batched(model, chunk, batch_size))
-            })
+            .map(|chunk| scope.spawn(move || decompress_segments_batched(model, chunk, batch_size)))
             .collect();
         let mut out: Vec<Vec<u32>> = Vec::with_capacity(n_bodies);
         for h in handles {
@@ -1013,11 +1006,13 @@ pub fn decompress_segments_batched(
             }
         }
         let pad_token = prev[0];
-        for lane in n..batch {
-            prev[lane] = pad_token;
-        }
+        prev[n..batch].fill(pad_token);
 
-        let max_len = chunk.iter().map(|(_, n_tok, _)| *n_tok as usize).max().unwrap_or(0);
+        let max_len = chunk
+            .iter()
+            .map(|(_, n_tok, _)| *n_tok as usize)
+            .max()
+            .unwrap_or(0);
         if max_len <= 1 {
             for t in tokens {
                 all_outputs.push(t);
@@ -1035,9 +1030,7 @@ pub fn decompress_segments_batched(
                 if step >= n_tokens {
                     continue;
                 }
-                let dec = decs[lane]
-                    .as_mut()
-                    .expect("active lane has a decoder");
+                let dec = decs[lane].as_mut().expect("active lane has a decoder");
                 let lane_freqs = &bs.freqs[lane * vocab..(lane + 1) * vocab];
                 cum.clear();
                 cum.push(0u64);
@@ -1142,14 +1135,15 @@ mod tests {
 
         // CPU reference: run N independent sessions, capture per-step
         // logits per lane.
-        let mut cpu_logits_per_step: Vec<Vec<f32>> =
-            (0..n_steps).map(|_| vec![0.0; batch * model.vocab_size]).collect();
+        let mut cpu_logits_per_step: Vec<Vec<f32>> = (0..n_steps)
+            .map(|_| vec![0.0; batch * model.vocab_size])
+            .collect();
         for b in 0..batch {
             let mut s = Session::new(&model);
             for (t, &tok) in sequences[b].iter().enumerate() {
                 let logits = s.forward(tok);
-                let dst = &mut cpu_logits_per_step[t]
-                    [b * model.vocab_size..(b + 1) * model.vocab_size];
+                let dst =
+                    &mut cpu_logits_per_step[t][b * model.vocab_size..(b + 1) * model.vocab_size];
                 dst.copy_from_slice(logits);
             }
         }
@@ -1168,8 +1162,7 @@ mod tests {
 
             // Compare logits per lane.
             for b in 0..batch {
-                let cpu = &cpu_logits_per_step[t]
-                    [b * model.vocab_size..(b + 1) * model.vocab_size];
+                let cpu = &cpu_logits_per_step[t][b * model.vocab_size..(b + 1) * model.vocab_size];
                 let gpu = &bs.logits[b * model.vocab_size..(b + 1) * model.vocab_size];
                 let mut max_abs = 0.0f32;
                 for i in 0..model.vocab_size {
@@ -1226,8 +1219,7 @@ mod tests {
         let mut cpu_freqs = vec![0u32; batch * model.vocab_size];
         let mut exps = vec![0.0f32; model.vocab_size];
         for b in 0..batch {
-            let logits =
-                &bs.logits[b * model.vocab_size..(b + 1) * model.vocab_size];
+            let logits = &bs.logits[b * model.vocab_size..(b + 1) * model.vocab_size];
             let m = tensor::max_f32(logits);
             let s = tensor::softmax_shifted_exp_sum(logits, m, &mut exps);
             let scale = (1.0 / s) * 10_000_000.0;
@@ -1248,6 +1240,7 @@ mod tests {
         // freq drift across 16K elements.
         let mut total_per_lane = vec![0i64; batch];
         let mut max_diff = 0i64;
+        #[allow(clippy::needless_range_loop)] // test path: `b`/`i` compute flat lane*vocab indices
         for b in 0..batch {
             let mut sum = 0i64;
             for i in 0..model.vocab_size {
@@ -1319,6 +1312,7 @@ mod tests {
             &model,
             crate::codec::DEFAULT_SEGMENT_BYTES,
             1,
+            0,
         )
         .expect("compress_with_metal");
 
@@ -1375,17 +1369,11 @@ mod tests {
         };
 
         // Encode.
-        let ac_bytes = compress_one_segment_batched(&mut bs, &tokens)
-            .expect("batched compress");
+        let ac_bytes = compress_one_segment_batched(&mut bs, &tokens).expect("batched compress");
 
         // Decode using the same backend (must reset state internally).
-        let decoded = decompress_one_segment_batched(
-            &mut bs,
-            &ac_bytes,
-            tokens.len() as u32,
-            bos,
-        )
-        .expect("batched decompress");
+        let decoded = decompress_one_segment_batched(&mut bs, &ac_bytes, tokens.len() as u32, bos)
+            .expect("batched decompress");
 
         assert_eq!(decoded.len(), tokens.len(), "length mismatch");
         let mut mismatches = 0usize;
@@ -1401,7 +1389,8 @@ mod tests {
             }
         }
         assert_eq!(
-            mismatches, 0,
+            mismatches,
+            0,
             "GPU encode → GPU decode round-trip failed: {mismatches}/{} tokens",
             tokens.len()
         );

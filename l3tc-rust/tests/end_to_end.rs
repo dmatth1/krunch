@@ -22,8 +22,9 @@ fn checkpoint_path() -> PathBuf {
 }
 
 fn spm_path() -> PathBuf {
-    repo_root()
-        .join("vendor/L3TC/dictionary/vocab_enwik8_bpe_16384_0.999/spm_enwik8_bpe_16384_0.999.model")
+    repo_root().join(
+        "vendor/L3TC/dictionary/vocab_enwik8_bpe_16384_0.999/spm_enwik8_bpe_16384_0.999.model",
+    )
 }
 
 fn assert_exists(p: &PathBuf, what: &str) {
@@ -48,7 +49,7 @@ fn roundtrip_short_ascii() {
     let (model, tok) = load_model_and_tokenizer();
     let text = "The quick brown fox jumps over the lazy dog.\n";
 
-    let compressed = compress(text, &tok, &model, DEFAULT_SEGMENT_BYTES).unwrap();
+    let compressed = compress(text, &tok, &model, DEFAULT_SEGMENT_BYTES, 0).unwrap();
     let decompressed = decompress(&compressed, &tok, &model).unwrap();
 
     assert_eq!(decompressed, text, "short ASCII round trip failed");
@@ -67,7 +68,7 @@ fn roundtrip_multi_segment_ascii() {
     // Force multiple segments by using a very small segment size
     let text = "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat.\n".repeat(5);
 
-    let compressed = compress(&text, &tok, &model, 128).unwrap();
+    let compressed = compress(&text, &tok, &model, 128, 0).unwrap();
     let decompressed = decompress(&compressed, &tok, &model).unwrap();
 
     assert_eq!(decompressed, text, "multi-segment ASCII round trip failed");
@@ -93,7 +94,7 @@ fn roundtrip_enwik6_subset() {
     let text = &full[..full.len().min(10_000)];
 
     let start = Instant::now();
-    let compressed = compress(text, &tok, &model, DEFAULT_SEGMENT_BYTES).unwrap();
+    let compressed = compress(text, &tok, &model, DEFAULT_SEGMENT_BYTES, 0).unwrap();
     let compress_dt = start.elapsed();
 
     let start = Instant::now();
@@ -112,8 +113,14 @@ fn roundtrip_enwik6_subset() {
         compressed.len(),
         ratio,
     );
-    println!("    compress:   {:?}  ({:.1} KB/s)", compress_dt, compress_kb_s);
-    println!("    decompress: {:?}  ({:.1} KB/s)", decompress_dt, decompress_kb_s);
+    println!(
+        "    compress:   {:?}  ({:.1} KB/s)",
+        compress_dt, compress_kb_s
+    );
+    println!(
+        "    decompress: {:?}  ({:.1} KB/s)",
+        decompress_dt, decompress_kb_s
+    );
 }
 
 #[test]
@@ -128,7 +135,7 @@ fn roundtrip_full_enwik6_with_timing() {
     println!("  enwik6: {} bytes", text_len);
 
     let start = Instant::now();
-    let compressed = compress(&text, &tok, &model, DEFAULT_SEGMENT_BYTES).unwrap();
+    let compressed = compress(&text, &tok, &model, DEFAULT_SEGMENT_BYTES, 0).unwrap();
     let compress_dt = start.elapsed();
 
     let start = Instant::now();
@@ -152,11 +159,6 @@ fn roundtrip_full_enwik6_with_timing() {
         "  decompress wall: {:?} = {:.2} KB/s",
         decompress_dt, decompress_kb_s
     );
-    println!(
-        "\n  Python reference on same corpus: L3TC-200K = 13.24 KB/s (ratio 0.1665)"
-    );
-    println!(
-        "  Speedup factor: {:.2}x",
-        compress_kb_s / 13.24
-    );
+    println!("\n  Python reference on same corpus: L3TC-200K = 13.24 KB/s (ratio 0.1665)");
+    println!("  Speedup factor: {:.2}x", compress_kb_s / 13.24);
 }

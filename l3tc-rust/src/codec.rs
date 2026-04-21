@@ -52,27 +52,22 @@
 //!
 //! # Compression flow
 //!
-//! 1. Read input text (full file into memory for now)
-//! 2. Tokenize into segments using [`Tokenizer::encode_file`]
-//! 3. For each segment:
-//!     a. Reset model state
-//!     b. For each token after BOS:
-//!        - Run `session.forward(previous_token)` to get logits
-//!        - Build a frequency table from the logits (softmax → integer freqs)
-//!        - Encode the current token with the arithmetic coder
-//!     c. Write the arithmetic-coded bytes and unk payloads
+//! 1. Read input text (full file into memory for now).
+//! 2. Tokenize into segments using [`Tokenizer::encode_file`].
+//! 3. For each segment: reset model state; for each token after BOS
+//!    run `session.forward(prev)` to get logits, build a frequency
+//!    table (softmax → integer freqs), encode the token with the
+//!    arithmetic coder; finally write the AC bytes and unk payloads.
 //!
 //! # Decompression flow
 //!
-//! 1. Read the header to learn segment count and metadata
-//! 2. For each segment:
-//!     a. Reset model state
-//!     b. Initialize arithmetic decoder from the segment's ac_body
-//!     c. Feed tokens through the model the same way the encoder did
-//!        (start with BOS, then decode next token against logits)
-//!     d. Apply unks at their unk-token positions
-//!     e. Detokenize to text
-//! 3. Concatenate segment texts
+//! 1. Read the header to learn segment count and metadata.
+//! 2. For each segment: reset model state, initialize AC decoder
+//!    from the segment's `ac_body`, feed tokens through the model the
+//!    same way the encoder did (start with BOS, then decode next
+//!    token against logits), apply unks at their positions, and
+//!    detokenize to text.
+//! 3. Concatenate segment texts.
 //!
 //! # Model-driven probability table
 //!
@@ -228,6 +223,7 @@ pub fn compress(
     tokenizer: &Tokenizer,
     model: &Model,
     segment_bytes: usize,
+    model_id: u8,
 ) -> Result<Vec<u8>> {
     use rayon::prelude::*;
 
@@ -261,7 +257,7 @@ pub fn compress(
     // Serialize the header + each segment + trailer. This is
     // sequential but trivial — just byte copies.
     let mut out = Vec::with_capacity(text.len() / 8);
-    write_header(&mut out, total_bytes, segments.len() as u32, 0)?;
+    write_header(&mut out, total_bytes, segments.len() as u32, 0, model_id)?;
     for (seg, body) in segments.iter().zip(segment_bodies.iter()) {
         write_segment(&mut out, seg, body)?;
     }
@@ -292,8 +288,17 @@ pub fn compress_with_metal(
     model: &Model,
     segment_bytes: usize,
     batch_size: usize,
+    model_id: u8,
 ) -> Result<Vec<u8>> {
-    compress_with_metal_workers(text, tokenizer, model, segment_bytes, batch_size, 1)
+    compress_with_metal_workers(
+        text,
+        tokenizer,
+        model,
+        segment_bytes,
+        batch_size,
+        1,
+        model_id,
+    )
 }
 
 /// Phase 13o: parallel-worker variant of [`compress_with_metal`].
@@ -308,17 +313,23 @@ pub fn compress_with_metal_workers(
     segment_bytes: usize,
     batch_size: usize,
     n_workers: usize,
+    model_id: u8,
 ) -> Result<Vec<u8>> {
     use crate::backend::batched::compress_segments_batched_parallel;
 
     let segments = tokenizer.encode_file(text, segment_bytes)?;
     let total_bytes = text.len() as u64;
 
-    let raw_fallback_indices: Vec<bool> =
-        segments.iter().map(|s| s.needs_raw_fallback).collect();
+    let raw_fallback_indices: Vec<bool> = segments.iter().map(|s| s.needs_raw_fallback).collect();
     let token_inputs: Vec<Vec<u32>> = segments
         .iter()
-        .map(|s| if s.needs_raw_fallback { Vec::new() } else { s.tokens.clone() })
+        .map(|s| {
+            if s.needs_raw_fallback {
+                Vec::new()
+            } else {
+                s.tokens.clone()
+            }
+        })
         .collect();
 
     let mut bodies = compress_segments_batched_parallel(
@@ -336,7 +347,13 @@ pub fn compress_with_metal_workers(
     }
 
     let mut out = Vec::with_capacity(text.len() / 8);
-    write_header(&mut out, total_bytes, segments.len() as u32, FLAG_GPU_ENCODED)?;
+    write_header(
+        &mut out,
+        total_bytes,
+        segments.len() as u32,
+        FLAG_GPU_ENCODED,
+        model_id,
+    )?;
     for (seg, body) in segments.iter().zip(bodies.iter()) {
         write_segment(&mut out, seg, body)?;
     }
@@ -355,11 +372,7 @@ pub fn compress_with_metal_workers(
 /// AC decoding to the BatchedSession path so the freq tables match
 /// what `compress_with_metal` produced.
 #[cfg(feature = "metal")]
-pub fn decompress_with_metal(
-    bytes: &[u8],
-    tokenizer: &Tokenizer,
-    model: &Model,
-) -> Result<String> {
+pub fn decompress_with_metal(bytes: &[u8], tokenizer: &Tokenizer, model: &Model) -> Result<String> {
     use crate::backend::batched::decompress_segments_batched;
 
     // CRC + version check mirrors decompress_bytes().
@@ -387,14 +400,12 @@ pub fn decompress_with_metal(
         }
         VERSION_V2_COMPAT => bytes,
         v => {
-            return Err(Error::BadCheckpoint(format!(
-                "unsupported version: {v}"
-            )));
+            return Err(Error::BadCheckpoint(format!("unsupported version: {v}")));
         }
     };
 
     let mut cursor = std::io::Cursor::new(body);
-    let (_total_bytes, n_segments, flags) = read_header(&mut cursor)?;
+    let (_total_bytes, n_segments, flags, _model_id) = read_header(&mut cursor)?;
     if flags & FLAG_GPU_ENCODED == 0 {
         return Err(Error::BadCheckpoint(
             "decompress_with_metal called on a CPU-encoded file; \
@@ -468,17 +479,16 @@ pub fn decompress_with_metal(
 /// [`decompress`] requires UTF-8 output. For raw-store files, the
 /// tokenizer and model arguments are ignored (the payload is
 /// returned verbatim).
-pub fn decompress_bytes(
-    bytes: &[u8],
-    tokenizer: &Tokenizer,
-    model: &Model,
-) -> Result<Vec<u8>> {
+pub fn decompress_bytes(bytes: &[u8], tokenizer: &Tokenizer, model: &Model) -> Result<Vec<u8>> {
     // Peek the CRC + version the same way `decompress` does.
     if bytes.len() < 5 {
         return Err(Error::BadCheckpoint("file too short".into()));
     }
     if &bytes[..4] != MAGIC {
-        return Err(Error::BadCheckpoint(format!("bad magic: {:?}", &bytes[..4])));
+        return Err(Error::BadCheckpoint(format!(
+            "bad magic: {:?}",
+            &bytes[..4]
+        )));
     }
     let version = bytes[4];
     let body: &[u8] = match version {
@@ -495,9 +505,7 @@ pub fn decompress_bytes(
         }
         VERSION_V2_COMPAT => bytes,
         v => {
-            return Err(Error::BadCheckpoint(format!(
-                "unsupported version: {v}"
-            )));
+            return Err(Error::BadCheckpoint(format!("unsupported version: {v}")));
         }
     };
 
@@ -543,7 +551,10 @@ pub fn decompress(bytes: &[u8], tokenizer: &Tokenizer, model: &Model) -> Result<
         return Err(Error::BadCheckpoint("file too short".into()));
     }
     if &bytes[..4] != MAGIC {
-        return Err(Error::BadCheckpoint(format!("bad magic: {:?}", &bytes[..4])));
+        return Err(Error::BadCheckpoint(format!(
+            "bad magic: {:?}",
+            &bytes[..4]
+        )));
     }
     let version = bytes[4];
     let body: &[u8] = match version {
@@ -563,9 +574,7 @@ pub fn decompress(bytes: &[u8], tokenizer: &Tokenizer, model: &Model) -> Result<
         }
         VERSION_V2_COMPAT => bytes,
         v => {
-            return Err(Error::BadCheckpoint(format!(
-                "unsupported version: {v}"
-            )));
+            return Err(Error::BadCheckpoint(format!("unsupported version: {v}")));
         }
     };
 
@@ -576,7 +585,7 @@ pub fn decompress(bytes: &[u8], tokenizer: &Tokenizer, model: &Model) -> Result<
     let varint_segments = version == VERSION;
 
     let mut cursor = std::io::Cursor::new(body);
-    let (total_bytes, n_segments, flags) = read_header(&mut cursor)?;
+    let (total_bytes, n_segments, flags, _model_id) = read_header(&mut cursor)?;
 
     // Raw-store mode: the payload between header and trailer is
     // the exact original bytes. Validate the trailer and return
@@ -672,8 +681,13 @@ pub fn decompress(bytes: &[u8], tokenizer: &Tokenizer, model: &Model) -> Result<
             }
             let mut session = Session::new(model);
             let mut scratch = CodecScratch::new(model.vocab_size);
-            let tokens =
-                decompress_segment(seg.n_tokens, &seg.ac_body, &mut session, model, &mut scratch)?;
+            let tokens = decompress_segment(
+                seg.n_tokens,
+                &seg.ac_body,
+                &mut session,
+                model,
+                &mut scratch,
+            )?;
             tokenizer.decode_segment(&tokens, &seg.unks)
         })
         .collect();
@@ -709,6 +723,7 @@ pub fn encode_reader<R: Read, W: Write>(
     tokenizer: &Tokenizer,
     model: &Model,
     segment_bytes: usize,
+    model_id: u8,
 ) -> Result<u64> {
     use rayon::prelude::*;
 
@@ -752,14 +767,16 @@ pub fn encode_reader<R: Read, W: Write>(
             // Incomplete final codepoint is fine — the carry boundary
             // will move when we read more. Real invalid bytes mean
             // the input isn't text at all.
-            e.error_len().is_none()
-                && std::str::from_utf8(&carry[..e.valid_up_to()]).is_ok()
+            e.error_len().is_none() && std::str::from_utf8(&carry[..e.valid_up_to()]).is_ok()
         }
     };
 
     if !utf8_ok {
         // --- Raw-store mode: stream bytes verbatim. ---
-        write_header(&mut dst, 0, 0, FLAG_RAW_STORE)?;
+        // Specialist id is meaningless for raw-store files (no model
+        // runs on decompress), so we write 0 regardless of what the
+        // caller requested.
+        write_header(&mut dst, 0, 0, FLAG_RAW_STORE, 0)?;
         // Flush the already-buffered first batch.
         dst.write_all(&carry).map_err(Error::Io)?;
         total_in += carry.len() as u64;
@@ -784,7 +801,7 @@ pub fn encode_reader<R: Read, W: Write>(
     // placeholder. Consumers that need the exact count can derive
     // it from the reconstructed output. The CLI's --time path
     // doesn't rely on this field.
-    write_header(&mut dst, 0, N_SEGMENTS_IMPLICIT, 0)?;
+    write_header(&mut dst, 0, N_SEGMENTS_IMPLICIT, 0, model_id)?;
 
     while !eof || !carry.is_empty() {
         // Fill carry to BATCH_BYTES (or until EOF).
@@ -1123,10 +1140,8 @@ pub fn dump_teacher<W: Write>(
     let segments = tokenizer.encode_file(text, segment_bytes)?;
     // Filter out raw-fallback segments; the teacher dump only
     // covers segments that went through the LM path.
-    let tokenized: Vec<&EncodedSegment> = segments
-        .iter()
-        .filter(|s| !s.needs_raw_fallback)
-        .collect();
+    let tokenized: Vec<&EncodedSegment> =
+        segments.iter().filter(|s| !s.needs_raw_fallback).collect();
     let n_segments = tokenized.len();
     let n_predict_steps: u64 = tokenized
         .iter()
@@ -1138,7 +1153,8 @@ pub fn dump_teacher<W: Write>(
     dst.write_u32::<LittleEndian>(2).map_err(Error::Io)?; // version
     dst.write_u32::<LittleEndian>(model.vocab_size as u32)
         .map_err(Error::Io)?;
-    dst.write_u32::<LittleEndian>(top_k as u32).map_err(Error::Io)?;
+    dst.write_u32::<LittleEndian>(top_k as u32)
+        .map_err(Error::Io)?;
     dst.write_u32::<LittleEndian>(n_segments as u32)
         .map_err(Error::Io)?;
     dst.write_u64::<LittleEndian>(n_predict_steps)
@@ -1165,8 +1181,7 @@ pub fn dump_teacher<W: Write>(
             // Working buffer for per-step (prob, token_id) pairs.
             // Full-size (vocab) because we compute all probs,
             // then partial-sort to pick the top K.
-            let mut scratch: Vec<(f32, u32)> =
-                Vec::with_capacity(model.vocab_size);
+            let mut scratch: Vec<(f32, u32)> = Vec::with_capacity(model.vocab_size);
 
             for i in 1..seg.tokens.len() {
                 let input = seg.tokens[i - 1];
@@ -1188,8 +1203,7 @@ pub fn dump_teacher<W: Write>(
 
                 scratch.clear();
                 for (id, &l) in logits.iter().enumerate() {
-                    let p =
-                        (((l - max) as f64).exp() * inv_sum) as f32;
+                    let p = (((l - max) as f64).exp() * inv_sum) as f32;
                     scratch.push((p, id as u32));
                 }
 
@@ -1202,15 +1216,11 @@ pub fn dump_teacher<W: Write>(
                 let k = top_k.min(scratch.len());
                 if k < scratch.len() {
                     scratch.select_nth_unstable_by(k, |a, b| {
-                        b.0.partial_cmp(&a.0)
-                            .unwrap_or(std::cmp::Ordering::Equal)
+                        b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
                     });
                 }
                 let head = &mut scratch[..k];
-                head.sort_by(|a, b| {
-                    b.0.partial_cmp(&a.0)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
+                head.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
                 // Append input + target + top-K (token_id, prob) pairs.
                 out.extend_from_slice(&input.to_le_bytes());
@@ -1280,7 +1290,7 @@ pub fn audit_compress(
         stats.segment_header_bytes += varint_len(seg.tokens.len() as u64);
         stats.segment_header_bytes += varint_len(seg.unks.len() as u64);
         stats.segment_header_bytes += 1; // flags byte
-        // ac_len is filled in below once we know it.
+                                         // ac_len is filled in below once we know it.
         for unk in &seg.unks {
             stats.segment_header_bytes += varint_len(unk.len() as u64);
             stats.unk_payload_bytes += unk.len() as u64;
@@ -1427,9 +1437,9 @@ pub fn profile_compress(
         }
     }
     stats.total_ns = outer.elapsed().as_nanos();
-    stats.other_ns = stats.total_ns.saturating_sub(
-        stats.forward_ns + stats.cum_freqs_ns + stats.ac_encode_ns,
-    );
+    stats.other_ns = stats
+        .total_ns
+        .saturating_sub(stats.forward_ns + stats.cum_freqs_ns + stats.ac_encode_ns);
 
     Ok(stats)
 }
@@ -1529,12 +1539,13 @@ struct CodecScratch {
     ///
     /// Separate from `cum` so the scaling loop has no sequential
     /// dependency and the prefix-sum pass is a simple running-add
-    /// in a dedicated loop. Phase 4c3 changed this from `Vec<u64>`
-    /// to `Vec<u32>` because freqs never exceed `PYTHON_FREQ_TOTAL
-    /// + n ≈ 10M + 16k` — easily fits in u32, halves memory
-    /// bandwidth on the scale loop, and lets NEON's f32→u32
-    /// instruction produce the quantized values directly without
-    /// a second widening pass.
+    /// in a dedicated loop.
+    ///
+    /// Phase 4c3 changed this from `Vec<u64>` to `Vec<u32>` because
+    /// freqs never exceed `PYTHON_FREQ_TOTAL + n ≈ 10M + 16k` —
+    /// easily fits in u32, halves memory bandwidth on the scale
+    /// loop, and lets NEON's f32→u32 instruction produce the
+    /// quantized values directly without a second widening pass.
     freqs: Vec<u32>,
 }
 
@@ -1695,8 +1706,8 @@ fn uniform_fallback(n: usize, cum: &mut [u64]) {
         // but residual < n so it's bounded; for our sizes n=16384
         // and residual < 16384 it's a few ms at worst in the
         // pathological path.
-        for j in i..=n {
-            cum[j] += 1;
+        for c in cum[i..=n].iter_mut() {
+            *c += 1;
         }
     }
 }
@@ -1708,17 +1719,24 @@ fn write_header<W: Write>(
     total_bytes: u64,
     n_segments: u32,
     flags: u8,
+    model_id: u8,
 ) -> Result<()> {
     w.write_all(MAGIC)?;
     w.write_u8(VERSION)?;
     w.write_u8(flags)?;
-    w.write_u16::<LittleEndian>(0)?; // reserved
+    // Phase 14: byte 6 (was first byte of the reserved u16) carries
+    // the specialist id so the decompressor can auto-load the right
+    // model. Byte 7 stays reserved for future use. Pre-Phase-14 files
+    // wrote 0 here, which decodes back to `Specialist::Unspecified`
+    // and preserves the existing single-model behavior.
+    w.write_u8(model_id)?;
+    w.write_u8(0)?; // reserved
     w.write_u64::<LittleEndian>(total_bytes)?;
     w.write_u32::<LittleEndian>(n_segments)?;
     Ok(())
 }
 
-fn read_header<R: Read>(r: &mut R) -> Result<(u64, u32, u8)> {
+fn read_header<R: Read>(r: &mut R) -> Result<(u64, u32, u8, u8)> {
     let mut magic = [0u8; 4];
     r.read_exact(&mut magic)?;
     if &magic != MAGIC {
@@ -1731,15 +1749,61 @@ fn read_header<R: Read>(r: &mut R) -> Result<(u64, u32, u8)> {
         )));
     }
     let flags = r.read_u8()?;
-    let _reserved = r.read_u16::<LittleEndian>()?;
+    // Phase 14 reads the model_id byte at offset 6. Pre-Phase-14
+    // files have 0 here, which is `Specialist::Unspecified`.
+    let model_id = r.read_u8()?;
+    let _reserved = r.read_u8()?;
     let total_bytes = r.read_u64::<LittleEndian>()?;
     let n_segments = r.read_u32::<LittleEndian>()?;
-    Ok((total_bytes, n_segments, flags))
+    Ok((total_bytes, n_segments, flags, model_id))
 }
 
 /// Fixed size of the on-disk header, used by the decoder to
 /// locate the raw payload range for `FLAG_RAW_STORE` files.
 const HEADER_SIZE: usize = 4 + 1 + 1 + 2 + 8 + 4;
+
+/// Header bytes exposed by [`peek_header`]. The CLI uses this to
+/// pick the right specialist model before committing to reading
+/// the rest of the file.
+#[derive(Debug, Clone, Copy)]
+pub struct HeaderPeek {
+    /// File format version. Currently 4; v2/v3 files are still
+    /// accepted on decompress for backward compatibility.
+    pub version: u8,
+    /// Raw flag byte (`FLAG_RAW_STORE` etc).
+    pub flags: u8,
+    /// Phase 14 specialist id (0 = unspecified, pre-Phase-14 file).
+    pub model_id: u8,
+}
+
+/// Read just the fixed prefix of a compressed file (magic, version,
+/// flags, model_id) without consuming the rest of the header. After
+/// this returns the reader is positioned 7 bytes past the start.
+///
+/// Used by the CLI to decide which specialist model to load before
+/// calling [`decompress`] / [`decode_writer`]. On disk the layout
+/// is `MAGIC(4) | version(1) | flags(1) | model_id(1) | reserved(1)
+/// | total_bytes(8) | n_segments(4)`.
+pub fn peek_header<R: Read>(r: &mut R) -> Result<HeaderPeek> {
+    let mut magic = [0u8; 4];
+    r.read_exact(&mut magic).map_err(Error::Io)?;
+    if &magic != MAGIC {
+        return Err(Error::BadCheckpoint(format!("bad magic: {magic:?}")));
+    }
+    let version = r.read_u8().map_err(Error::Io)?;
+    if version != VERSION && version != VERSION_V3_COMPAT && version != VERSION_V2_COMPAT {
+        return Err(Error::BadCheckpoint(format!(
+            "unsupported version: {version}"
+        )));
+    }
+    let flags = r.read_u8().map_err(Error::Io)?;
+    let model_id = r.read_u8().map_err(Error::Io)?;
+    Ok(HeaderPeek {
+        version,
+        flags,
+        model_id,
+    })
+}
 
 /// Per-segment data read back from a compressed file.
 struct SegmentRead {
@@ -1789,9 +1853,9 @@ fn read_varint<R: Read>(r: &mut R) -> Result<u64> {
         if shift >= 64 {
             return Err(Error::BadCheckpoint("varint overflow".into()));
         }
-        result |= bits.checked_shl(shift).ok_or_else(|| {
-            Error::BadCheckpoint("varint shift overflow".into())
-        })?;
+        result |= bits
+            .checked_shl(shift)
+            .ok_or_else(|| Error::BadCheckpoint("varint shift overflow".into()))?;
         if byte & 0x80 == 0 {
             return Ok(result);
         }
@@ -2092,5 +2156,4 @@ mod tests {
         let (payload, crc_bytes) = bad.split_at(bad.len() - 4);
         assert_ne!(LittleEndian::read_u32(crc_bytes), crc32fast::hash(payload));
     }
-
 }

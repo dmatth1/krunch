@@ -1,0 +1,49 @@
+learned-archive
+Copyright 2025-2026 Dan Mattheiss and learned-archive contributors
+
+This product includes software developed by learned-archive
+contributors. Licensed under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance with the
+License. A copy of the License is in the LICENSE file at the root of
+this repository and at <http://www.apache.org/licenses/LICENSE-2.0>.
+
+================================================================================
+Third-party components
+================================================================================
+
+RWKV-LM (RWKV reference architecture)
+  Upstream: https://github.com/BlinkDL/RWKV-LM
+  Used in:  our Rust inference runtime at l3tc-rust/src/rwkv.rs is a
+            re-implementation of the RWKV-v4 forward pass from the
+            published RWKV-v4 paper and reference implementation.
+            MSL kernels in l3tc-rust/src/backend/mtl.rs and the fused
+            WKV kernel at scripts/metal_wkv/wkv.metal are clean-room
+            ports of the reference CUDA implementation.
+  License:  Apache-2.0.
+
+L3TC (AAAI 2025 paper reference implementation)
+  Upstream: https://github.com/jkooy/L3TC
+  Used in:  vendor/L3TC/ (reference Python implementation, not shipped
+            in service binaries). The initial Rust inference runtime
+            was derived from this reference. Training pipeline
+            scripts (scripts/train_l3tc_phase11.py, related tooling)
+            follow the L3TC training recipe.
+  License:  Research use under Apache-2.0, consistent with the RWKV
+            dependency.
+
+SentencePiece (optional runtime dependency)
+  Upstream: https://github.com/google/sentencepiece
+  Used in:  dynamically linked via the `sentencepiece` Rust crate for
+            tokenization. Not statically bundled in default service
+            binaries.
+  License:  Apache-2.0.
+
+Rust crate dependencies
+  All direct and transitive Rust crate dependencies are permissive
+  (Apache-2.0 / MIT / BSD / ISC / Unicode / CC0 / Zlib / MPL-2.0).
+  Audited via `cargo deny check licenses` when a release configuration
+  is set up.
+
+MLX (Apple) — referenced in archived exploration
+  Upstream: https://github.com/ml-explore/mlx
+  License:  MIT.

@@ -1,0 +1,37 @@
+{
+  "name": "learned-archive-cdk",
+  "version": "0.1.0",
+  "description": "AWS CDK infrastructure for the learned-archive service",
+  "private": true,
+  "bin": {
+    "app": "bin/app.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc -w",
+    "test": "jest",
+    "cdk": "cdk",
+    "lint": "eslint src lib bin --ext .ts",
+    "deploy": "cdk deploy --all --context env=dev",
+    "destroy": "cdk destroy --all --context env=dev",
+    "synth": "cdk synth --context env=dev"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.145",
+    "@types/node": "^22.7.0",
+    "aws-cdk": "^2.160.0",
+    "esbuild": "^0.25.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.6.0"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "^2.160.0",
+    "constructs": "^10.3.0",
+    "@aws-sdk/client-dynamodb": "^3.668.0",
+    "@aws-sdk/client-s3": "^3.668.0",
+    "@aws-sdk/client-sqs": "^3.668.0",
+    "@aws-sdk/client-batch": "^3.668.0",
+    "@aws-sdk/lib-dynamodb": "^3.668.0",
+    "@aws-sdk/s3-request-presigner": "^3.668.0"
+  }
+}

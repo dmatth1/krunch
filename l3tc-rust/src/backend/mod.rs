@@ -50,9 +50,10 @@ pub mod batched;
 /// `Cpu` is always present. `Metal` is present iff this crate was
 /// built with `--features=metal`. Future variants (`Cuda`) follow
 /// the same pattern.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Backend {
     /// Phase 12 NEON / scalar CPU path. Always available.
+    #[default]
     Cpu,
 
     /// Apple Metal GPU. Requires the `metal` cargo feature **and**
@@ -65,10 +66,11 @@ pub enum Backend {
 /// throughput win. Auto-routing falls back to CPU on smaller inputs.
 ///
 /// Empirically chosen — measured GPU init (Metal device + library
-/// + first kernel dispatch) is ~50-100 ms on M-series. To break
-/// even at the projected 5 MB/s GPU vs 0.17 MB/s CPU throughput,
-/// the input has to be large enough that the per-input GPU init
-/// cost amortizes. ~256 KB is the conservative floor.
+/// + first kernel dispatch) is ~50-100 ms on M-series.
+///
+/// To break even at the projected 5 MB/s GPU vs 0.17 MB/s CPU
+/// throughput, the input has to be large enough that the per-input
+/// GPU init cost amortizes. ~256 KB is the conservative floor.
 pub const GPU_AUTO_THRESHOLD_BYTES: usize = 256 * 1024;
 
 impl Backend {
@@ -94,7 +96,11 @@ impl Backend {
 
     /// Parse a backend selector string from the CLI. Returns `None`
     /// for unknown values; the caller should error out.
-    pub fn from_str(s: &str) -> Option<Self> {
+    ///
+    /// Prefer this in internal call sites — it returns `Option` and
+    /// avoids the friction of `FromStr::Err`. The `FromStr` impl
+    /// below wraps this for external `str::parse::<Backend>()` users.
+    pub fn parse_name(s: &str) -> Option<Self> {
         match s {
             "cpu" => Some(Backend::Cpu),
             #[cfg(feature = "metal")]
@@ -113,9 +119,23 @@ impl Backend {
     }
 }
 
-impl Default for Backend {
-    fn default() -> Self {
-        Backend::Cpu
+/// Error returned by `<Backend as FromStr>::from_str` for unrecognized
+/// backend selector strings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseBackendError(pub String);
+
+impl std::fmt::Display for ParseBackendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "unknown backend: {:?}", self.0)
+    }
+}
+
+impl std::error::Error for ParseBackendError {}
+
+impl std::str::FromStr for Backend {
+    type Err = ParseBackendError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse_name(s).ok_or_else(|| ParseBackendError(s.to_string()))
     }
 }
 
@@ -138,8 +158,8 @@ mod tests {
 
     #[test]
     fn cpu_always_parseable() {
-        assert_eq!(Backend::from_str("cpu"), Some(Backend::Cpu));
-        assert_eq!(Backend::from_str("garbage"), None);
+        assert_eq!(Backend::parse_name("cpu"), Some(Backend::Cpu));
+        assert_eq!(Backend::parse_name("garbage"), None);
     }
 
     #[test]

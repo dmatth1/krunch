@@ -54,8 +54,20 @@ pub use backend::{Backend, GPU_AUTO_THRESHOLD_BYTES};
 pub use checkpoint::{Checkpoint, Tensor};
 pub use codec::{
     audit_compress, compress, decode_writer, decompress, decompress_bytes, dump_teacher,
-    encode_reader, profile_compress, AuditStats, ProfileStats, DEFAULT_SEGMENT_BYTES,
+    encode_reader, peek_header, profile_compress, AuditStats, HeaderPeek, ProfileStats,
+    DEFAULT_SEGMENT_BYTES,
 };
 pub use error::{Error, Result};
 pub use rwkv::{Model, Session};
 pub use tokenizer::{EncodedSegment, Tokenizer};
+
+/// Highest specialist-model-bundle format version this binary
+/// understands. Bumped when the on-disk layout or the manifest
+/// schema changes in a way a newer bundle could exercise.
+///
+/// The `install-models` subcommand refuses to install a bundle whose
+/// `bundle_version` exceeds this number, so an old binary won't
+/// silently extract a tarball it can't actually use. See
+/// `l3tc-rust/src/bin/l3tc/install_models.rs` for the manifest
+/// schema.
+pub const MODEL_BUNDLE_VERSION: u32 = 1;

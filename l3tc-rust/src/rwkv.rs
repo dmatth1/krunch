@@ -288,12 +288,7 @@ impl Model {
         })
     }
 
-    fn load_block(
-        ckpt: &mut Checkpoint,
-        li: usize,
-        h: usize,
-        im: usize,
-    ) -> Result<Block> {
+    fn load_block(ckpt: &mut Checkpoint, li: usize, h: usize, im: usize) -> Result<Block> {
         let prefix = format!("blocks.{li}");
 
         let take_1d = |ckpt: &mut Checkpoint, suffix: &str| -> Result<Vec<f32>> {
@@ -498,13 +493,7 @@ impl<'a> Session<'a> {
         let h = self.model.hidden_size;
         let im = self.model.intermediate_size;
         for (li, block) in self.model.blocks.iter().enumerate() {
-            Self::forward_block(
-                block,
-                &mut self.state[li],
-                &mut self.scratch,
-                h,
-                im,
-            );
+            Self::forward_block(block, &mut self.state[li], &mut self.scratch, h, im);
         }
 
         // Final layer norm
@@ -604,9 +593,24 @@ impl<'a> Session<'a> {
         let att = &block.att;
 
         // xk = x * time_mix_k + state_x * (1 - time_mix_k)
-        tensor::time_mix(&scratch.normed, &state.state_x, &att.time_mix_k, &mut scratch.xk);
-        tensor::time_mix(&scratch.normed, &state.state_x, &att.time_mix_v, &mut scratch.xv);
-        tensor::time_mix(&scratch.normed, &state.state_x, &att.time_mix_r, &mut scratch.xr);
+        tensor::time_mix(
+            &scratch.normed,
+            &state.state_x,
+            &att.time_mix_k,
+            &mut scratch.xk,
+        );
+        tensor::time_mix(
+            &scratch.normed,
+            &state.state_x,
+            &att.time_mix_v,
+            &mut scratch.xv,
+        );
+        tensor::time_mix(
+            &scratch.normed,
+            &state.state_x,
+            &att.time_mix_r,
+            &mut scratch.xr,
+        );
 
         // Update state_x for next step
         state.state_x.copy_from_slice(&scratch.normed);
@@ -671,9 +675,19 @@ impl<'a> Session<'a> {
         let ffn = &block.ffn;
 
         // xk = x * time_mix_k + state_ffn * (1 - time_mix_k)
-        tensor::time_mix(&scratch.normed, &state.state_ffn, &ffn.time_mix_k, &mut scratch.xk);
+        tensor::time_mix(
+            &scratch.normed,
+            &state.state_ffn,
+            &ffn.time_mix_k,
+            &mut scratch.xk,
+        );
         // xr = x * time_mix_r + state_ffn * (1 - time_mix_r)
-        tensor::time_mix(&scratch.normed, &state.state_ffn, &ffn.time_mix_r, &mut scratch.xr);
+        tensor::time_mix(
+            &scratch.normed,
+            &state.state_ffn,
+            &ffn.time_mix_r,
+            &mut scratch.xr,
+        );
 
         // state_ffn = x (the pre-mix input)
         state.state_ffn.copy_from_slice(&scratch.normed);

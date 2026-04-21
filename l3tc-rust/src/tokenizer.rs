@@ -75,9 +75,8 @@ pub struct Tokenizer {
 impl Tokenizer {
     /// Load a SentencePiece model file from disk.
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let sp = SentencePieceProcessor::open(path.as_ref()).map_err(|e| {
-            Error::Tokenizer(format!("failed to load SPM model: {e}"))
-        })?;
+        let sp = SentencePieceProcessor::open(path.as_ref())
+            .map_err(|e| Error::Tokenizer(format!("failed to load SPM model: {e}")))?;
         Ok(Self { sp })
     }
 
@@ -310,7 +309,8 @@ impl Tokenizer {
             | '\u{200D}' // ZWJ  — zero-width joiner
             | '\u{200E}' // LRM  — left-to-right mark
             | '\u{200F}' // RLM  — right-to-left mark
-            | '\u{202A}'..='\u{202E}' // bidi formatting marks
+            | '\u{202A}'
+                ..='\u{202E}' // bidi formatting marks
             | '\u{2060}' // WORD JOINER
             | '\u{FEFF}' // BOM / ZWNBSP
             | '\u{00AD}' // soft hyphen
@@ -340,7 +340,7 @@ impl Tokenizer {
             } else {
                 tokens_out.extend_from_slice(&plain.tokens);
             }
-            unks_out.extend(plain.unks.into_iter());
+            unks_out.extend(plain.unks);
             return Ok(true);
         }
 
@@ -368,7 +368,7 @@ impl Tokenizer {
                 } else {
                     tokens_out.extend_from_slice(&prefix.tokens);
                 }
-                unks_out.extend(prefix.unks.into_iter());
+                unks_out.extend(prefix.unks);
                 tokens_out.push(UNK_ID);
                 unks_out.push(text.as_bytes()[bad_start..bad_end].to_vec());
                 return self.extract_recursive(&text[bad_end..], tokens_out, unks_out);
@@ -392,7 +392,7 @@ impl Tokenizer {
         let mut hi = n;
         let mut cached_good: Option<EncodedSegment> = None;
         while lo < hi {
-            let mid = (lo + hi + 1) / 2;
+            let mid = (lo + hi).div_ceil(2);
             let end_byte = if mid >= n { text.len() } else { chars[mid].0 };
             let prefix = &text[..end_byte];
             let p = self.encode_segment(prefix)?;
@@ -432,7 +432,7 @@ impl Tokenizer {
             } else {
                 tokens_out.extend_from_slice(&p.tokens);
             }
-            unks_out.extend(p.unks.into_iter());
+            unks_out.extend(p.unks);
         }
 
         // Splice the bad char as an explicit unk.
@@ -467,8 +467,7 @@ impl Tokenizer {
         let char_bytes: Vec<(usize, char)> = text.char_indices().collect();
 
         for piece in pieces {
-            let (char_begin, char_end) =
-                (piece.span.0 as usize, piece.span.1 as usize);
+            let (char_begin, char_end) = (piece.span.0 as usize, piece.span.1 as usize);
             if char_begin == char_end {
                 continue;
             }
@@ -529,7 +528,11 @@ impl Tokenizer {
     /// contain exactly `n` byte payloads in the same order.
     pub fn decode_segment(&self, tokens: &[u32], unks: &[Vec<u8>]) -> Result<String> {
         // Skip the leading BOS if present
-        let start = if !tokens.is_empty() && tokens[0] == BOS_ID { 1 } else { 0 };
+        let start = if !tokens.is_empty() && tokens[0] == BOS_ID {
+            1
+        } else {
+            0
+        };
         let body = &tokens[start..];
 
         // Walk through the token list, batching non-unk tokens into
@@ -600,11 +603,9 @@ mod tests {
     fn spm_path() -> Option<PathBuf> {
         // The tokenizer sits in vendor/L3TC (from the project root, not
         // the crate root). Probe from the crate manifest dir upward.
-        let candidates = [
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("..")
-                .join("vendor/L3TC/dictionary/vocab_enwik8_bpe_16384_0.999/spm_enwik8_bpe_16384_0.999.model"),
-        ];
+        let candidates = [PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join(
+            "vendor/L3TC/dictionary/vocab_enwik8_bpe_16384_0.999/spm_enwik8_bpe_16384_0.999.model",
+        )];
         candidates.into_iter().find(|p| p.exists())
     }
 
@@ -640,7 +641,9 @@ mod tests {
     #[test]
     #[ignore = "requires SPM model from vendor/L3TC"]
     fn tokenizer_handles_outliers() {
-        let Some(path) = spm_path() else { return; };
+        let Some(path) = spm_path() else {
+            return;
+        };
         let tok = Tokenizer::load(path).expect("load spm");
         // Some Wikipedia text is likely to contain characters in
         // the 0.1% tail. Use a Unicode mix.
@@ -656,7 +659,9 @@ mod tests {
     #[test]
     #[ignore = "requires SPM model from vendor/L3TC"]
     fn tokenizer_segments_file_by_length() {
-        let Some(path) = spm_path() else { return; };
+        let Some(path) = spm_path() else {
+            return;
+        };
         let tok = Tokenizer::load(path).expect("load spm");
         let text = "short line.\n".repeat(300); // many small lines
         let segments = tok.encode_file(&text, 64).expect("encode_file");

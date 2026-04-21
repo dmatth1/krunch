@@ -1,0 +1,22 @@
+{
+  "archive-dev-storage": {
+    "ExportsOutputFnGetAttModelVersionsTable0F04BE75Arn6295817D": "arn:aws:dynamodb:us-east-1:584956668248:table/archive-dev-model-versions",
+    "BucketName": "archive-dev-archive",
+    "ExportsOutputRefModelVersionsTable0F04BE75179AE745": "archive-dev-model-versions",
+    "ExportsOutputRefArchiveBucket9DECBF5D2E4C47F6": "archive-dev-archive",
+    "ExportsOutputFnGetAttArchiveBucket9DECBF5DArn0B88E833": "arn:aws:s3:::archive-dev-archive",
+    "ExportsOutputFnGetAttDatasetsTableF4ECB6D5Arn636FCA4F": "arn:aws:dynamodb:us-east-1:584956668248:table/archive-dev-datasets",
+    "ExportsOutputRefDatasetsTableF4ECB6D52C57FEC9": "archive-dev-datasets",
+    "DatasetsTableName": "archive-dev-datasets",
+    "ModelVersionsTableName": "archive-dev-model-versions"
+  },
+  "archive-dev-queues": {
+    "ExportsOutputRefTrainingSubmitQueue068CCE829058C136": "https://sqs.us-east-1.amazonaws.com/584956668248/archive-dev-training-submit",
+    "TrainingSubmitQueueUrl": "https://sqs.us-east-1.amazonaws.com/584956668248/archive-dev-training-submit",
+    "ExportsOutputFnGetAttCompressionQueue06C99EBEQueueName7E2CB8EE": "archive-dev-compression",
+    "ExportsOutputFnGetAttCompressionQueue06C99EBEArnCD5BD5AE": "arn:aws:sqs:us-east-1:584956668248:archive-dev-compression",
+    "ExportsOutputFnGetAttTrainingSubmitQueue068CCE82ArnFA16C90C": "arn:aws:sqs:us-east-1:584956668248:archive-dev-training-submit",
+    "ExportsOutputRefCompressionQueue06C99EBE66AD3F4D": "https://sqs.us-east-1.amazonaws.com/584956668248/archive-dev-compression",
+    "CompressionQueueUrl": "https://sqs.us-east-1.amazonaws.com/584956668248/archive-dev-compression"
+  }
+}

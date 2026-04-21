@@ -1,0 +1,110 @@
+[
+  {
+    "corpus": "enwik8",
+    "raw_bytes": 100000000,
+    "zstd22_bytes": 25272468,
+    "ratio": 0.25272468
+  },
+  {
+    "corpus": "silesia/dickens",
+    "raw_bytes": 10192446,
+    "zstd22_bytes": 2849064,
+    "ratio": 0.2795270144183251
+  },
+  {
+    "corpus": "silesia/reymont",
+    "raw_bytes": 6627202,
+    "zstd22_bytes": 1348572,
+    "ratio": 0.20349040213350975
+  },
+  {
+    "corpus": "silesia/webster",
+    "raw_bytes": 41458703,
+    "zstd22_bytes": 8430464,
+    "ratio": 0.20334606222486024
+  },
+  {
+    "corpus": "silesia/mr",
+    "raw_bytes": 9970564,
+    "zstd22_bytes": 3102044,
+    "ratio": 0.31112021346034185
+  },
+  {
+    "corpus": "silesia/nci",
+    "raw_bytes": 33553445,
+    "zstd22_bytes": 1578382,
+    "ratio": 0.047040832915964365
+  },
+  {
+    "corpus": "silesia/xml",
+    "raw_bytes": 5345280,
+    "zstd22_bytes": 451540,
+    "ratio": 0.08447452705938698
+  },
+  {
+    "corpus": "silesia/samba",
+    "raw_bytes": 21606400,
+    "zstd22_bytes": 3865315,
+    "ratio": 0.17889676207049762
+  },
+  {
+    "corpus": "silesia/osdb",
+    "raw_bytes": 10085684,
+    "zstd22_bytes": 3099936,
+    "ratio": 0.30736001643517685
+  },
+  {
+    "corpus": "silesia/mozilla",
+    "raw_bytes": 51220480,
+    "zstd22_bytes": 14912709,
+    "ratio": 0.29114738870076967
+  },
+  {
+    "corpus": "silesia/ooffice",
+    "raw_bytes": 6152192,
+    "zstd22_bytes": 2595234,
+    "ratio": 0.42183891530043277
+  },
+  {
+    "corpus": "silesia/sao",
+    "raw_bytes": 7251944,
+    "zstd22_bytes": 5000573,
+    "ratio": 0.6895493125705328
+  },
+  {
+    "corpus": "silesia/x-ray",
+    "raw_bytes": 8474240,
+    "zstd22_bytes": 5129825,
+    "ratio": 0.6053433700249226
+  },
+  {
+    "corpus": "silesia_text (dickens+reymont+webster+mr+nci)",
+    "raw_bytes": 101802360,
+    "zstd22_bytes": 17308526,
+    "ratio": 0.1700208718147595
+  },
+  {
+    "corpus": "silesia_struct (xml+samba+osdb)",
+    "raw_bytes": 37037364,
+    "zstd22_bytes": 7416791,
+    "ratio": 0.20025158917897073
+  },
+  {
+    "corpus": "silesia_binary (mozilla+ooffice+sao+x-ray)",
+    "raw_bytes": 73098856,
+    "zstd22_bytes": 27638341,
+    "ratio": 0.37809539727954156
+  },
+  {
+    "corpus": "silesia_text+struct (l3tc target scope)",
+    "raw_bytes": 138839724,
+    "zstd22_bytes": 24725317,
+    "ratio": 0.17808532232461077
+  },
+  {
+    "corpus": "silesia_full (all 12 files)",
+    "raw_bytes": 211938580,
+    "zstd22_bytes": 52363658,
+    "ratio": 0.2470699671574661
+  }
+]

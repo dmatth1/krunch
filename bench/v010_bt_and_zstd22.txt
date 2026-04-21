@@ -1,0 +1,44 @@
+======================================================================
+cross-domain B/T matrix
+======================================================================
+
+tokenizer        prose       code  structure       logs    tabular     markup   fallback
+----------------------------------------------------------------------------------------
+prose             3.312     1.923     1.832     2.372     1.690     2.159     2.097
+code              2.481     2.121     1.863     2.071     1.774     2.242     2.159
+structured        2.193     1.884     1.877     2.024     1.725     2.149     1.965
+logs              1.753     1.496     1.362     2.431     1.435     1.350     1.497
+tabular           2.011     1.782     1.682     1.839     3.033     1.870     1.868
+markup            2.255     1.918     1.759     1.923     1.607     2.379     1.969
+fallback          3.312     1.923     1.832     2.372     1.690     2.159     2.097
+enwik8            3.312     1.923     1.832     2.372     1.690     2.159     2.097
+
+(B/T = bytes per token; higher = more compact encoding for this domain)
+(diagonal should be the max per column if specialization worked)
+
+per-domain: specialist vs best-other-tokenizer
+----------------------------------------------------------------------
+  prose       specialist= 3.312  best= 3.312 (prose)  rank=1/8  Δ-vs-enwik8=+0.000  ✓
+  code        specialist= 2.121  best= 2.121 (code)  rank=1/8  Δ-vs-enwik8=+0.198  ✓
+  structured  specialist= 1.877  best= 1.877 (structured)  rank=1/8  Δ-vs-enwik8=+0.045  ✓
+  logs        specialist= 2.431  best= 2.431 (logs)  rank=1/8  Δ-vs-enwik8=+0.058  ✓
+  tabular     specialist= 3.033  best= 3.033 (tabular)  rank=1/8  Δ-vs-enwik8=+1.342  ✓
+  markup      specialist= 2.379  best= 2.379 (markup)  rank=1/8  Δ-vs-enwik8=+0.220  ✓
+  fallback    specialist= 2.097  best= 2.159 (code)  rank=3/8  Δ-vs-enwik8=+0.000  ✗ beaten by code
+
+======================================================================
+zstd -22 --long=27 per-domain ratio  (new v0.1.0 baseline)
+======================================================================
+
+domain       files    raw MB   comp MB    ratio
+----------------------------------------------------
+  prose          8     2.750     0.805   0.2926
+  code           8     1.473     0.306   0.2078
+  structured     8     1.704     0.238   0.1394
+  logs           8     1.650     0.133   0.0804
+  tabular        6     4.321     1.034   0.2392
+  markup         7     0.741     0.042   0.0572
+  fallback       6     0.431     0.021   0.0489
+
+  fallback (text-only, excluding random/hex/highentropy): 6 files, ratio 0.0489
+

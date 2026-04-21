@@ -104,11 +104,7 @@ impl<W: Write> ArithmeticEncoder<W> {
     ///
     /// Returns [`Error::ZeroProbability`] if the selected symbol has
     /// zero frequency (i.e. `cum_freqs[symbol + 1] == cum_freqs[symbol]`).
-    pub fn encode_symbol(
-        &mut self,
-        cum_freqs: &[u64],
-        symbol: u32,
-    ) -> Result<()> {
+    pub fn encode_symbol(&mut self, cum_freqs: &[u64], symbol: u32) -> Result<()> {
         let idx = symbol as usize;
         debug_assert!(
             idx + 1 < cum_freqs.len(),
@@ -141,9 +137,7 @@ impl<W: Write> ArithmeticEncoder<W> {
             self.writer.write_bit(bit).map_err(Error::Io)?;
             // Emit any deferred underflow bits as the opposite
             while self.num_underflow > 0 {
-                self.writer
-                    .write_bit(bit ^ 1)
-                    .map_err(Error::Io)?;
+                self.writer.write_bit(bit ^ 1).map_err(Error::Io)?;
                 self.num_underflow -= 1;
             }
             self.low = (self.low << 1) & MASK;
@@ -306,7 +300,9 @@ mod tests {
         }
 
         let mut dec = ArithmeticDecoder::new(&encoded[..]).unwrap();
-        let decoded: Vec<u32> = (0..input.len()).map(|_| dec.decode_symbol(&cum).unwrap()).collect();
+        let decoded: Vec<u32> = (0..input.len())
+            .map(|_| dec.decode_symbol(&cum).unwrap())
+            .collect();
         assert_eq!(decoded, input);
     }
 
@@ -316,9 +312,7 @@ mod tests {
         // With 100 zeros and a few ones, the encoded stream should
         // be much shorter than 100 bits.
         let cum = cumulate(&[95, 5]);
-        let input: Vec<u32> = (0..200)
-            .map(|i| if i % 17 == 0 { 1 } else { 0 })
-            .collect();
+        let input: Vec<u32> = (0..200).map(|i| if i % 17 == 0 { 1 } else { 0 }).collect();
 
         let mut encoded = Vec::new();
         {
@@ -330,10 +324,16 @@ mod tests {
         }
         // Sanity: the encoded stream is smaller than the raw bits.
         // 200 symbols at optimal rate ~0.3 bits each ≈ 60 bits ≈ 8 bytes
-        assert!(encoded.len() < 30, "encoded is {} bytes, expected much smaller", encoded.len());
+        assert!(
+            encoded.len() < 30,
+            "encoded is {} bytes, expected much smaller",
+            encoded.len()
+        );
 
         let mut dec = ArithmeticDecoder::new(&encoded[..]).unwrap();
-        let decoded: Vec<u32> = (0..input.len()).map(|_| dec.decode_symbol(&cum).unwrap()).collect();
+        let decoded: Vec<u32> = (0..input.len())
+            .map(|_| dec.decode_symbol(&cum).unwrap())
+            .collect();
         assert_eq!(decoded, input);
     }
 
@@ -343,12 +343,12 @@ mod tests {
         // This exercises the range-narrowing path harder.
         let mut freqs = vec![1u64; 256];
         // Make some symbols much more common
-        for i in 0..16 {
-            freqs[i] = 100;
+        for f in freqs.iter_mut().take(16) {
+            *f = 100;
         }
         let cum = cumulate(&freqs);
 
-        use rand::{Rng, SeedableRng, rngs::StdRng};
+        use rand::{rngs::StdRng, Rng, SeedableRng};
         let mut rng = StdRng::seed_from_u64(42);
         // Sample symbols proportionally to the frequency table
         let total: u64 = freqs.iter().sum();
@@ -375,7 +375,9 @@ mod tests {
         }
 
         let mut dec = ArithmeticDecoder::new(&encoded[..]).unwrap();
-        let decoded: Vec<u32> = (0..input.len()).map(|_| dec.decode_symbol(&cum).unwrap()).collect();
+        let decoded: Vec<u32> = (0..input.len())
+            .map(|_| dec.decode_symbol(&cum).unwrap())
+            .collect();
         assert_eq!(decoded, input);
     }
 
@@ -416,7 +418,9 @@ mod tests {
         }
 
         let mut dec = ArithmeticDecoder::new(&encoded[..]).unwrap();
-        let decoded: Vec<u32> = (0..input.len()).map(|_| dec.decode_symbol(&cum).unwrap()).collect();
+        let decoded: Vec<u32> = (0..input.len())
+            .map(|_| dec.decode_symbol(&cum).unwrap())
+            .collect();
         assert_eq!(decoded, input);
     }
 }
