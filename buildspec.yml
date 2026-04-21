@@ -55,11 +55,7 @@ phases:
       - docker push ${ECR_URI}:${COMPRESS_TAG}
       - echo "TRAIN_URI=${ECR_URI}:${TRAIN_TAG}"
       - echo "COMPRESS_URI=${ECR_URI}:${COMPRESS_TAG}"
-      - |
-        printf '{"train_uri":"%s","train_tag":"%s","compress_uri":"%s","compress_tag":"%s","sha":"%s"}\n' \
-          "${ECR_URI}:${TRAIN_TAG}" "${TRAIN_TAG}" \
-          "${ECR_URI}:${COMPRESS_TAG}" "${COMPRESS_TAG}" \
-          "${SHORT_SHA}" > image-info.json
+      - printf '{"train_uri":"%s","train_tag":"%s","compress_uri":"%s","compress_tag":"%s","sha":"%s"}\n' "${ECR_URI}:${TRAIN_TAG}" "${TRAIN_TAG}" "${ECR_URI}:${COMPRESS_TAG}" "${COMPRESS_TAG}" "${SHORT_SHA}" > image-info.json
 
 artifacts:
   files:
