@@ -4,149 +4,81 @@
 
 _Internal codename: learned-archive. AWS resources are named `archive-{env}-*`._
 
-> **Status: pre-spike.** No service code yet. The compression
-> technology from the archived `l3tc-prod` project is reusable but the
-> service itself hasn't been validated against real customer data. See
-> `STORAGE_SERVICE.md` for the full product spec and spike plan.
+Managed storage service for text-heavy data. Customer PUTs events via
+an S3-ish API; we train a small RWKV-v4 model on their specific data
+distribution (one model per dataset), compress with that model,
+store on S3. Ratio target: 2-4× better than `zstd -22` on homogeneous
+log-like data, retrieval latency comparable to S3 Standard (not
+Glacier's 12-48 h).
 
-A managed storage service for text-heavy data. Customer PUTs events
-via an S3-compatible API; we train a custom compression model on their
-data distribution, compress, store. GET decompresses and returns in
-seconds. Targets 2-4× better compression than `zstd -22` on
-homogeneous log-like data, at retrieval latency comparable to
-S3 Standard — meaningfully better than Glacier Deep Archive's
-12-48h SLA.
+**Positioning vs. the category:** Datadog Flex Logs, Elastic Frozen
+Tier, Loki, Axiom all ship cheap log archive. All use generic
+compression. The wedge is per-customer learned compression, which is
+3-5× tighter on homogeneous data than anything off-the-shelf. Detailed
+pitch + landscape + API surface + economics in
+[`STORAGE_SERVICE.md`](STORAGE_SERVICE.md).
 
-## The pitch
+## Status (2026-04-21)
 
-Your logs / audit records / transaction streams / document archives
-are costing you too much on S3 Standard + zstd, or too much hassle on
-Glacier with rehydrate + re-index tax, or too much per GB on
-Axiom/Datadog/Elastic. We train a **small model on YOUR data** once,
-then compress everything with that model from then on. Per-customer
-specialization produces ratios that generic compression cannot match,
-so our storage bill is dramatically smaller — and we pass most of the
-savings on.
+Spike 1 in progress. AWS service is deployed end-to-end (6 CDK
+stacks: storage, queues, api, ingest, training, compression); first
+training run on a real customer-shaped dataset (HDFS logs from Loghub,
+1.39 GB NDJSON) is executing. The pass gate is
+`held_out_ratio < 0.98 × zstd_baseline_ratio` — must beat zstd-22 by
+≥2% on held-out data from the same distribution. Running log:
+[`SPIKE_1_LOG.md`](SPIKE_1_LOG.md).
 
-Retrieval is sub-10 seconds for typical ranges, not the 12+ hours that
-Glacier Deep Archive imposes.
+## Docs index
 
-## Why this is the right product shape (vs. the archived CLI)
-
-The previous direction (`l3tc-prod`) tried to be a CLI compressor
-competing with `zstd`. Three structural problems killed it:
-- zstd is 1000× faster and shipped in every OS
-- Per-user model distribution is operationally ugly
-- Ratio win on heterogeneous text is marginal
-
-The service model fixes all three:
-- Compression runs on our infrastructure; customer never waits
-- Model lives with us forever, no distribution concern
-- **Per-customer models on homogeneous data win by 3-5×, not 1.3×**
-
-See `STORAGE_SERVICE.md` for the detailed argument.
-
-## Competitive landscape
-
-Category exists (cheap log / text archive). Differentiator is
-compression tech, not product shape.
-
-| product | compression approach |
+| doc | purpose |
 |---|---|
-| Datadog Flex Logs / Flex Frozen | Generic; rehydrate tax on search |
-| Elastic Frozen Tier (searchable snapshots) | Generic; zstd-class ratios |
-| Grafana Loki | Index-free chunked; generic LZ |
-| Axiom | "95% compression" via hand-tuned data store; generic |
-| Humio / Logscale | Streaming; generic |
-| **this project** | **Per-customer learned models** |
+| [`STORAGE_SERVICE.md`](STORAGE_SERVICE.md) | Product spec: pitch, API, economics, risks, spike plan |
+| [`docs/SERVICE_ARCHITECTURE.md`](docs/SERVICE_ARCHITECTURE.md) | AWS architecture reference: stacks, data flow, DDB schemas |
+| [`TRAINING_FLOW.md`](TRAINING_FLOW.md) | End-to-end walkthrough of one training job: tokenizer → RWKV → ratio → metadata |
+| [`SPIKE_1_LOG.md`](SPIKE_1_LOG.md) | Running log of Spike 1 (HDFS on real service) |
+| [`PRODUCTION_TODO.md`](PRODUCTION_TODO.md) | 10-item gap list between "spike works" and "ready for customers" |
+| [`docs/ARCHIVE_l3tc.md`](docs/ARCHIVE_l3tc.md) | Historical context: what carries over from the archived l3tc-prod CLI project |
+| [`cdk/README.md`](cdk/README.md) | CDK stack inventory + deploy instructions |
+| [`l3tc-rust/README.md`](l3tc-rust/README.md) | Rust inference runtime (used at compression/decompression time) |
+| [`bench/`](bench/) | Historical L3TC CLI benchmarks (pre-pivot; kept as ratio evidence for the pitch) |
 
-Nobody in this category ships per-customer trained compression. That
-is the wedge.
+## Tech stack
 
-## API (planned — not built)
+- **IaC:** AWS CDK v2, TypeScript.
+- **Compute:** Lambda (API + ingest), AWS Batch on EC2 (training), ECS
+  Fargate (compression worker).
+- **Storage:** S3 + DynamoDB on-demand.
+- **Messaging:** SQS (pipeline decoupling), EventBridge (Batch
+  completion).
+- **Training:** per-dataset 16 K-vocab SentencePiece unigram tokenizer
+  + L3TC-200K RWKV-v4 architecture (~200 K params, 2 layers, d=96).
+  bf16 mixed precision on g5.xlarge (A10G) via AWS Batch.
+- **Inference (Spike 2+):** Rust runtime in `l3tc-rust/` reads a `.bin`
+  checkpoint. Spike 1 defers this — storage uses `zstd --long=27 -22`
+  while the model's entropy-bound ratio is measured and recorded in
+  metadata.
+- **Image builds:** AWS CodeBuild (triggered on git push) pushes to
+  ECR over the AWS backbone; `buildspec.yml` at the repo root.
 
-Time-sharded log ingest, following Grafana Loki / Elastic conventions:
+## Quick start
 
+```bash
+# Deploy everything to your own AWS account
+cd cdk
+npm install
+npx cdk bootstrap
+npx cdk deploy --all --context env=dev --require-approval never
+
+# PUT a dataset via API (see STORAGE_SERVICE.md for endpoint shape)
+curl -X PUT \
+  -H "x-api-key: $API_KEY" \
+  -H "Content-Type: application/x-ndjson" \
+  --data-binary @events.ndjson \
+  "$API_ENDPOINT/v1/customers/acme/datasets/my-logs/events"
+
+# Poll pipeline state
+./scripts/spike_status.sh acme my-logs
 ```
-POST   /v1/customers/{cid}/datasets             # create dataset
-DELETE /v1/customers/{cid}/datasets/{dsid}      # delete dataset + data
-
-PUT    /v1/customers/{cid}/datasets/{dsid}/events
-  # body: application/x-ndjson
-  # 202 Accepted + batch-id
-
-GET    /v1/customers/{cid}/datasets/{dsid}/events
-  # ?start_ts=<iso8601>&end_ts=<iso8601>&limit=N&cursor=...
-  # returns decompressed NDJSON
-
-DELETE /v1/customers/{cid}/datasets/{dsid}/events?before_ts=...
-  # compliance / GDPR retention
-
-GET    /v1/customers/{cid}/datasets             # list
-GET    /v1/customers/{cid}/datasets/{dsid}      # metadata + model status
-```
-
-No query language, no content search, no tags, no dashboards.
-Storage, not analytics.
-
-## Ingest flow
-
-```
-PUT /events
-  → stored raw in s3://bucket/{cid}/{dsid}/raw/
-  → if dataset has trained model: compress, delete raw
-  → else: queued; compress when model is ready
-
-First N GB to a new dataset:
-  → accumulate in raw/
-  → kick off training job on GPU
-  → model registered
-  → raw data compressed, raw cleaned up
-  → subsequent PUTs compress inline
-
-Background:
-  drift monitor samples incoming events
-  if ratio degrades > threshold → schedule retrain
-  new model_version_id for new data; old data stays on old model
-```
-
-## Current state
-
-**All compression technology carries over from the archived
-`l3tc-prod` project.** The Rust inference runtime, RWKV-v4 training
-pipeline, `.pth → .bin` converter, Metal backend, Phase 11 spot-fleet
-training infra — all usable as-is for the compression engine.
-
-**None of the service is built.** Planned spike sequence:
-
-1. **Spike 1 (5 days):** validate compression ratio on 3 real log
-   corpora (nginx access, JSON events, syslog). Pass = ≥2× `zstd -22`
-   on at least 2 of 3.
-2. **Spike 2 (3 days):** corpus-size ablation (how much data does a
-   customer need to upload before their model asymptotes).
-3. **Spike 3 (1 week):** end-to-end retrieval latency. Single EC2 +
-   S3 + pre-trained model. Pass = 10 MB decompressed in ≤5 seconds.
-4. **Spike 4 (1 day):** unit economics with measured numbers.
-
-Full plan: `STORAGE_SERVICE.md`.
-
-## Target customer
-
-- Multi-TB to multi-PB text-heavy data
-- 5-30 year retention (compliance, audit, regulatory)
-- Rare retrieval (<5% per year)
-- OK with sub-10s retrieval latency (not ms-sensitive)
-- Homogeneous data within a dataset (one format per bucket)
-
-Verticals:
-- Finance / fintech transaction archives
-- Healthcare / pharma trial data
-- Legal / e-discovery document archives
-- SaaS platform log retention (7+ year compliance)
-
-## Install / use
-
-Not yet. Pre-spike. See `STORAGE_SERVICE.md` for the plan.
 
 ## License
 
@@ -157,5 +89,8 @@ Compression technology derives from L3TC (AAAI 2025) and RWKV-LM
 
 ## History
 
-Forked from `l3tc-prod` on 2026-04-21. See
-`docs/ARCHIVE_l3tc.md` (pending) for l3tc history.
+Forked from `l3tc-prod` on 2026-04-21. The CLI compressor direction
+was archived when it couldn't beat `zstd` on the dimensions that
+matter (speed, distribution, heterogeneous-text ratio). The
+compression tech carries over; see
+[`docs/ARCHIVE_l3tc.md`](docs/ARCHIVE_l3tc.md) for what's load-bearing.

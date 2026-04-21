@@ -196,6 +196,29 @@ metadata.json shape:
 }
 ```
 
+## Model at inference time
+
+Training is Python; inference (compression) is Rust. `l3tc-rust/` is
+the production inference runtime — a Rust port of the same
+L3TC-200K RWKV-v4 architecture, with its own arithmetic coder,
+checkpoint loader, and codec path. It reads a `.bin` checkpoint
+(converted from the Python `.pth` via
+`l3tc-rust/scripts/convert_checkpoint.py`) and runs compress /
+decompress end-to-end.
+
+**Spike 1 skips the Rust side deliberately** — the training job does
+not produce a `.bin`, and the Fargate compression worker runs
+`zstd --long=27 --ultra -22` regardless of what the model predicts.
+The model ratio recorded in `metadata.json` is the Python-side
+entropy bound; a real Rust arithmetic coder on the same model would
+land within ~1% of that number.
+
+Spike 2 (contingent on Spike 1 passing) is where the Rust runtime
+gets wired in: training job emits `.pth` + `.bin` + tokenizer, the
+Fargate worker image adds the Rust binary, and the worker picks
+codec based on `metadata.codec == "l3tc"`. The GET endpoint gains a
+streaming decode path through the same binary.
+
 ## 7. Post-training (handled outside the job)
 
 - Batch exits 0 → EventBridge fires `Batch Job State Change`.
