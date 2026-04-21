@@ -42,14 +42,15 @@ phases:
     commands:
       - echo "=== build ==="
       - docker build -f ${DOCKERFILE} --platform linux/amd64 -t ${ECR_URI}:${IMAGE_TAG} .
-      # Also push as "latest-train" for easy shell-out.
-      - docker tag ${ECR_URI}:${IMAGE_TAG} ${ECR_URI}:latest-train
 
   post_build:
     commands:
       - echo "=== post_build ==="
+      # The CDK-managed ECR repo has tag immutability. Only push the
+      # git-SHA tag (unique per commit). The previous "latest-train"
+      # moving tag was a convenience that tripped the immutability
+      # check on the second build.
       - docker push ${ECR_URI}:${IMAGE_TAG}
-      - docker push ${ECR_URI}:latest-train
       - echo "IMAGE_TAG=${IMAGE_TAG}"
       - echo "IMAGE_URI=${ECR_URI}:${IMAGE_TAG}"
       - printf '{"image_uri":"%s","tag":"%s","sha":"%s"}\n' "${ECR_URI}:${IMAGE_TAG}" "${IMAGE_TAG}" "${SHORT_SHA}" > image-info.json
