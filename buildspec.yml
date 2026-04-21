@@ -48,7 +48,7 @@ phases:
 
   post_build:
     commands:
-      - echo "=== post_build: push both images ==="
+      - echo "=== post_build push both images ==="
       # The CDK-managed ECR repo has tag immutability. Git-SHA tags
       # are unique per commit, so no moving tags.
       - docker push ${ECR_URI}:${TRAIN_TAG}
