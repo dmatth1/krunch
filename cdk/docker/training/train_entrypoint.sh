@@ -100,16 +100,33 @@ python - <<PYEOF
 import sentencepiece as spm
 sp = spm.SentencePieceProcessor()
 sp.load("${MODEL_DIR}/spm.model")
+# Stream the file in reasonably-sized text chunks so we never hold
+# more than a few MB of Python string + SPM buffers at once. Loading
+# the whole 1 GB train corpus into a single string blew the 16 GB
+# g6.xlarge heap with std::bad_alloc in the first attempt.
+CHUNK_BYTES = 2 * 1024 * 1024  # 2 MB per encode call
 for src, dst in [("${MODEL_DIR}/train.txt", "${MODEL_DIR}/train.tok.txt"),
                  ("${MODEL_DIR}/val.txt",   "${MODEL_DIR}/val.tok.txt")]:
+    total = 0
     with open(src, "r", encoding="utf-8", errors="replace") as fin, \
          open(dst, "w") as fout:
-        text = fin.read()
-        ids = sp.encode_as_ids(text)
         fout.write("2\n")  # BOS
-        for tid in ids:
-            fout.write(f"{tid}\n")
-    print(f"  {src} -> {dst} ({len(ids):,} tokens)")
+        buf = []
+        buf_len = 0
+        for line in fin:
+            buf.append(line)
+            buf_len += len(line)
+            if buf_len >= CHUNK_BYTES:
+                ids = sp.encode_as_ids("".join(buf))
+                fout.write("\n".join(str(i) for i in ids) + "\n")
+                total += len(ids)
+                buf = []
+                buf_len = 0
+        if buf:
+            ids = sp.encode_as_ids("".join(buf))
+            fout.write("\n".join(str(i) for i in ids) + "\n")
+            total += len(ids)
+    print(f"  {src} -> {dst} ({total:,} tokens)")
 PYEOF
 rc=$?
 if [ "$rc" -ne 0 ]; then
