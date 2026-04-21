@@ -103,21 +103,25 @@ order within each bucket.
 - Recommend (2) before first customer, (3) after Spike 2.
 
 ### 10. CI/CD for Docker image builds
-- Today: image builds + ECR pushes happen on the dev laptop.
-  PyTorch CUDA devel image = ~5 GB. Home upload ~5 Mbps = 90 min
-  cold push. Competed with the HDFS upload on 2026-04-21 — I had
-  to kill the data upload to let Docker push finish.
-- Fix:
-  - **AWS CodeBuild**: GitHub push → CodeBuild runs
-    `docker build` + `docker push`. Runs inside AWS → ECR push
-    over AWS backbone (~1 GB/s, vs ~5 Mbps laptop). 30-min push
-    becomes ~3 min.
-  - CDK replaces `DockerImageAsset` (local build) with
-    `ContainerImage.fromEcrRepository(repo, sha)` — laptop only
-    touches CFN, never builds images.
-  - ECR pull-through cache for Docker Hub so the PyTorch base
-    layer stays inside our account.
-- Cost: CodeBuild <$0.01/build.
+
+**Partially done 2026-04-21.** CodeBuild project
+`krunch-image-build` is live. First build confirmed: 141 s BUILD
+phase (vs. 30+ min laptop push). Iteration loop + commands are in
+[`cdk/README.md`](cdk/README.md).
+
+Still open:
+- CDK's `DockerImageAsset` still does a local build when someone runs
+  `cdk deploy`. Swap for `ContainerImage.fromEcrRepository(repo, sha)`
+  so the laptop only touches CFN, never builds images.
+- Integrate CodeBuild with CDK so the Batch JobDefinition's
+  `container.image` auto-updates to the CodeBuild-produced tag on
+  each successful build, instead of the current manual
+  `register-job-definition` dance.
+- ECR pull-through cache for Docker Hub so the PyTorch base layer
+  stays inside our account (eliminates the Docker-Hub-to-CodeBuild
+  download on cold builds).
+- GitHub webhook trigger so a push to `main` fires CodeBuild
+  automatically instead of needing `aws codebuild start-build`.
 
 ## Faster iteration (operational, not customer-facing)
 

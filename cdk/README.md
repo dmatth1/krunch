@@ -3,6 +3,47 @@
 AWS CDK app that provisions the service architecture described in
 [`../docs/SERVICE_ARCHITECTURE.md`](../docs/SERVICE_ARCHITECTURE.md).
 
+## Docker images are built by CodeBuild, not by `cdk deploy`
+
+Training + compression images are built by **AWS CodeBuild** (project
+`krunch-image-build`, `buildspec.yml` at the repo root), not by
+the laptop during `cdk deploy`. A cold push of the 5 GB PyTorch CUDA
+devel image from home takes 30-90 min; CodeBuild runs in AWS and
+pushes over the AWS backbone in ~3 min. Cost is ~$0.01 per build.
+
+Iteration loop:
+
+```bash
+# 1. Edit Dockerfile / entrypoint / requirements / scripts / vendor patch
+# 2. (Optional but recommended) shake down locally — catches import bugs
+#    in 20 s instead of 10 min of Batch-submit roundtrip
+docker buildx build --platform linux/amd64 -f cdk/docker/training/Dockerfile \
+    --load -t krunch-train-check .
+docker run --rm --entrypoint python krunch-train-check -c \
+    "import sys; sys.path[:0]=['/app','/app/vendor/L3TC']; \
+     from scripts.train_l3tc_phase11 import build_model; print('ok')"
+# 3. Commit + push — CodeBuild clones from GitHub
+git push origin main
+# 4. Trigger CodeBuild; BUILD ~140 s cold, ~30 s warm cache
+aws codebuild start-build --project-name krunch-image-build --region us-east-1
+# 5. Watch phases
+aws codebuild batch-get-builds --ids <build-id> --region us-east-1 \
+    --query 'builds[0].{S:buildStatus,P:currentPhase}' --output table
+# 6. Grab the image URI from the artifact
+aws s3 cp s3://krunch-codebuild-artifacts-584956668248/builds/image-info.zip /tmp/ \
+    && unzip -p /tmp/image-info.zip image-info.json
+# 7a. Fast path: register a new Batch JobDefinition revision pointing
+#     at the new tag + submit a one-off job (bypasses CDK entirely):
+aws batch register-job-definition --cli-input-json file://jobdef-new.json \
+    --region us-east-1
+aws batch submit-job --job-queue archive-dev-training-queue \
+    --job-definition archive-dev-training-jobdef:<NEW_REV> \
+    --job-name manual-run-$(date +%s) --region us-east-1
+# 7b. Proper path: `cdk deploy` (still does a local build today —
+#     PRODUCTION_TODO item 10 tracks swapping the DockerImageAsset
+#     for ContainerImage.fromEcrRepository so cdk only touches CFN).
+```
+
 ## Stack inventory
 
 | stack | contains |
@@ -18,7 +59,8 @@ AWS CDK app that provisions the service architecture described in
 
 - AWS CLI configured (`aws sts get-caller-identity` returns your account)
 - Node 20+ and npm
-- Docker running locally (CDK builds training + compression images)
+- Docker Desktop running locally — only needed for the shake-down
+  import check (see above). The real image build runs in CodeBuild.
 - Your AWS account bootstrapped for CDK in the target region (one-time):
   ```bash
   npx cdk bootstrap aws://<ACCOUNT_ID>/us-east-1
@@ -118,17 +160,8 @@ for the full state machine.
 
 ## Current status
 
-Pre-spike scaffold. The stacks synthesize clean (`cdk synth` passes)
-and are deployable. No production hardening yet. No tests yet.
+Spike 1 in flight. All 6 stacks deployed. `measure_held_out_ratio.py`
+implemented. CodeBuild project (`krunch-image-build`) operational.
 
-## TODO (post-Spike 1)
-
-- Implement `scripts/measure_held_out_ratio.py` (used by training
-  entrypoint to decide `codec=l3tc` vs `codec=zstd_fallback`).
-- Implement GET range retrieval (currently stub that returns metadata).
-- Wire DELETE endpoints + lifecycle policies.
-- Add CloudWatch dashboards (queue depth, training duration, ratios).
-- Add integration tests using LocalStack + jest.
-- Switch S3 bucket lifecycle rule from tag-based to prefix-based (the
-  current `tagFilters: {lifecycle: raw}` is correct but requires the
-  PUT Lambda to tag on upload; verify that's happening).
+See [`../PRODUCTION_TODO.md`](../PRODUCTION_TODO.md) for the gap list
+between "spike works" and "ready for customers".
