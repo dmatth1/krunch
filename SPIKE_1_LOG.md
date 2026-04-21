@@ -144,19 +144,103 @@ Marginal: 0.5-0.98× — real but small win, wouldn't carry service economics.
 Fail: `held_out_ratio ≥ zstd_baseline_ratio` — model didn't learn
 enough to beat generic compression; thesis needs revisiting.
 
-## Final results
+## Final results (2026-04-21 18:39 UTC)
 
-_(Filled in after spike runs to completion.)_
+### The numbers
 
 | metric | value |
 |---|---|
-| held_out_ratio | — |
-| zstd_baseline_ratio | — |
-| ratio improvement | — |
-| training wall time | — |
-| training cost | — |
-| PASS / FAIL | — |
+| corpus | HDFS_v1 from Loghub 2.0 Zenodo 8196385 |
+| raw NDJSON | 1,386,685,235 B (1.39 GB) |
+| train split | 1,109,348,188 B (80%) — tokenized to **345,040,742** tokens |
+| val split | 277,337,047 B (20%) — tokenized to **91,852,755** tokens |
+| SPM vocab | 16,384 unigram + byte_fallback |
+| bytes/token (val) | 3.019 |
+| final eval `avg_ce_nats` | 2.3511 (epoch 9, 409,600-token slice) |
+| **final eval `bits/token`** | **3.3920** |
+| **entropy-bound ratio = (3.3920 / 8) / 3.019** | **0.1405 (14.05%)** |
+| **`zstd --long=27 --ultra -22` ratio** | **0.0466 (4.66%)** |
+| model vs. zstd | **~3.01× worse** |
+| training wall time | ~67 min (10 epochs × 1562 steps × 3.88 it/s, g6.xlarge) |
+| training cost | ~$0.80 + ~$0.80 × several retries ≈ $2-3 compute total for the day |
+| **PASS / FAIL** | **FAIL** (gate was `ours < 0.98 × zstd` → needed 0.0457 or better, got 0.1405) |
 
-## Next actions (filled in based on outcome)
+### Caveats on the measurement
 
-_(Post-spike writeup.)_
+- The entrypoint's dedicated `measure_held_out_ratio.py` step landed
+  `held_out_ratio=1.0` in the metadata JSON — a sentinel. Root cause:
+  the shell captured `rc=$?` **after** a `cd /app` that followed the
+  python call, silently masking any Python failure. Fixed in the
+  entrypoint (`rc=$?` now runs before the `cd /app`), but this spike's
+  v1 metadata still has the sentinel.
+- The authoritative number above (3.3920 bits/token) comes from
+  `train_l3tc_phase11.py`'s own eval step at epoch 9, which iterates
+  the validation DataLoader directly (in-process, no shell capture
+  bug). That eval used a 409,600-token slice of the 91.8M-token val
+  set. A full-val entropy measurement would be within ~1% of this
+  number.
+- zstd baseline is on the *full* 277.3 MB val file, not a slice.
+
+### Why HDFS lost
+
+HDFS log lines are templates with swap-in block IDs and timestamps:
+
+```
+081109 203518 143 INFO dfs.DataNode$DataXceiver: Receiving block blk_-1608999687919862906 src: /10.250.19.102:54106 dest: /10.250.19.102:50010
+```
+
+The template repeats millions of times. zstd's 27-bit window (128 MB)
+captures the whole template plus all the swap-in IDs it has ever seen
+and encodes each new line as a tiny reference + the varying fields.
+A 200 K-param RWKV-v4 (2 layers × 96 hidden × 16 K vocab) cannot
+memorize that much template material — it has to model each token
+from short-range context. At ~3.4 bits/token it's correctly modelling
+the per-token distribution, but zstd is essentially getting each
+entire line for ~1 byte of dictionary reference.
+
+This is a good fail in the sense that it correctly falsifies a
+too-simple version of the thesis: "small neural model beats generic
+compression on homogeneous data" is not universally true. On corpora
+where LZ's repeat-dictionary is near-optimal (heavily templated
+structured logs), a 200 K model can't win.
+
+### What the spike still proved
+
+The service *infrastructure* runs end-to-end. Confirmed today:
+
+- PUT → pre-signed S3 URL → S3 raw object → EventBridge → ingest
+  Lambda → DDB atomic slot claim → SQS training-submit.
+- Batch job launcher → g6.xlarge on-demand → container pull → model
+  training → checkpoint save → S3 model upload (v1.pth,
+  v1.tokenizer.model, v1.metadata.json).
+- training-complete Lambda → DDB `status=fallback_zstd`,
+  `current_model_version=1`. *(Deliberately chose zstd_fallback
+  codec in the metadata because the model lost.)*
+- CodeBuild cuts iteration latency from ~30 min laptop pushes to
+  ~3 min AWS-backbone pushes. Shake-down importing the container
+  locally catches import bugs in 20 s.
+
+## Next actions
+
+1. **Re-run Spike 1 on a different corpus.** HDFS is an edge case
+   (pathologically templated). Candidates:
+   - JSON API event logs (more variable payloads, less template-y)
+   - Stripe-style audit trails with mixed-length fields
+   - Application logs with free-text error messages
+   The thesis targets corpora where *content* varies within a
+   structure — not pure template data. Need a pass on at least one
+   "real" non-HDFS corpus before concluding the service is
+   non-viable.
+2. **Verify the rc=$? fix actually emits a real ratio number.** The
+   next run should produce a non-sentinel `held_out_ratio` in the
+   v{N}.metadata.json. If that number matches the in-process eval's
+   entropy bound to within ~1%, ship the fix as the canonical
+   measurement path.
+3. **Think about model capacity vs. corpus structure.** 200 K params
+   may just be too small for anything that isn't pure prose. Spike
+   1.5 candidates: 1M-param and 5M-param runs on the same HDFS corpus
+   to see if capacity moves the needle. If even a 5M-param model
+   can't beat zstd on HDFS, that's a clear answer.
+4. **Close the compression worker loop.** The training-complete
+   Lambda's compression-sweep fired — check that the raw object was
+   compressed + deleted + DDB byte counters updated (tasks #16).

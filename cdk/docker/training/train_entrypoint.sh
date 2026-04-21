@@ -178,14 +178,17 @@ echo "[train] measuring held-out ratio (entropy bound)..."
 # Same cwd constraint as training: the WKV JIT extension needs
 # relative paths resolvable.
 cd /app/vendor/L3TC
+# Capture rc of the python call specifically — not the cd that
+# follows. Previous version captured $? AFTER the cd which silently
+# masked every Python failure as rc=0.
 held_out_ratio=$(python /app/scripts/measure_held_out_ratio.py \
     --val-file "$MODEL_DIR/val.txt" \
     --checkpoint "$CHECKPOINT" \
     --tokenizer "$MODEL_DIR/spm.model" \
     --num-layers 2 \
     --vocab-size 16384 2>/tmp/measure.stderr)
-cd /app
 rc=$?
+cd /app
 if [ "$rc" -ne 0 ] || [ -z "$held_out_ratio" ]; then
   echo "[train] WARN: ratio measurement failed (rc=$rc) — using sentinel 1.0"
   cat /tmp/measure.stderr 2>/dev/null | tail -20

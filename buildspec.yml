@@ -18,8 +18,10 @@ env:
   variables:
     AWS_REGION: us-east-1
     ECR_REPO: cdk-hnb659fds-container-assets-584956668248-us-east-1
-    DOCKERFILE: cdk/docker/training/Dockerfile
-    IMAGE_NAME: krunch-train
+    TRAIN_DOCKERFILE: cdk/docker/training/Dockerfile
+    COMPRESS_DOCKERFILE: cdk/docker/compression/Dockerfile
+    TRAIN_IMAGE_NAME: krunch-train
+    COMPRESS_IMAGE_NAME: krunch-compress
 
 phases:
   pre_build:
@@ -29,31 +31,35 @@ phases:
       - ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}"
       - aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin "${ECR_URI}"
       - SHORT_SHA=$(git rev-parse --short=12 HEAD)
-      - IMAGE_TAG="${IMAGE_NAME}-${SHORT_SHA}"
-      - echo "building ${ECR_URI}:${IMAGE_TAG}"
+      - TRAIN_TAG="${TRAIN_IMAGE_NAME}-${SHORT_SHA}"
+      - COMPRESS_TAG="${COMPRESS_IMAGE_NAME}-${SHORT_SHA}"
       # vendor/L3TC is gitignored in this repo — clone it fresh from
-      # upstream so the Dockerfile's COPY vendor/L3TC finds it. Pin to
-      # the main branch SHA for now; TODO: replace with a fork SHA (see
-      # PRODUCTION_TODO item 9).
+      # upstream so the training Dockerfile's COPY vendor/L3TC finds
+      # it. Pin strategy tracked in PRODUCTION_TODO item 9.
       - git clone --depth 1 https://github.com/alipay/L3TC-leveraging-rwkv-for-learned-lossless-low-complexity-text-compression.git vendor/L3TC
       - echo "L3TC cloned at $(git -C vendor/L3TC rev-parse HEAD)"
 
   build:
     commands:
-      - echo "=== build ==="
-      - docker build -f ${DOCKERFILE} --platform linux/amd64 -t ${ECR_URI}:${IMAGE_TAG} .
+      - echo "=== build training image ==="
+      - docker build -f ${TRAIN_DOCKERFILE} --platform linux/amd64 -t ${ECR_URI}:${TRAIN_TAG} .
+      - echo "=== build compression image ==="
+      - docker build -f ${COMPRESS_DOCKERFILE} --platform linux/amd64 -t ${ECR_URI}:${COMPRESS_TAG} .
 
   post_build:
     commands:
-      - echo "=== post_build ==="
-      # The CDK-managed ECR repo has tag immutability. Only push the
-      # git-SHA tag (unique per commit). The previous "latest-train"
-      # moving tag was a convenience that tripped the immutability
-      # check on the second build.
-      - docker push ${ECR_URI}:${IMAGE_TAG}
-      - echo "IMAGE_TAG=${IMAGE_TAG}"
-      - echo "IMAGE_URI=${ECR_URI}:${IMAGE_TAG}"
-      - printf '{"image_uri":"%s","tag":"%s","sha":"%s"}\n' "${ECR_URI}:${IMAGE_TAG}" "${IMAGE_TAG}" "${SHORT_SHA}" > image-info.json
+      - echo "=== post_build: push both images ==="
+      # The CDK-managed ECR repo has tag immutability. Git-SHA tags
+      # are unique per commit, so no moving tags.
+      - docker push ${ECR_URI}:${TRAIN_TAG}
+      - docker push ${ECR_URI}:${COMPRESS_TAG}
+      - echo "TRAIN_URI=${ECR_URI}:${TRAIN_TAG}"
+      - echo "COMPRESS_URI=${ECR_URI}:${COMPRESS_TAG}"
+      - |
+        printf '{"train_uri":"%s","train_tag":"%s","compress_uri":"%s","compress_tag":"%s","sha":"%s"}\n' \
+          "${ECR_URI}:${TRAIN_TAG}" "${TRAIN_TAG}" \
+          "${ECR_URI}:${COMPRESS_TAG}" "${COMPRESS_TAG}" \
+          "${SHORT_SHA}" > image-info.json
 
 artifacts:
   files:

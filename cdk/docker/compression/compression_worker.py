@@ -122,13 +122,16 @@ def process_message(body: dict) -> None:
 
 
 def get_queue_url() -> str:
-    """Find the compression queue URL via several env-var conventions."""
-    for name in ("QUEUE_URL", "COMPRESSION_QUEUE_URL", "SQS_QUEUE_URL"):
-        if os.environ.get(name):
-            return os.environ[name]
-    # Fallback: QueueProcessingFargateService injects it under a
-    # construct-generated name. Look up by queue name in our AWS.
-    q_name = f"archive-{os.environ.get('ENV', 'dev')}-compression"
+    """Find the compression queue URL via several env-var conventions.
+
+    CDK's QueueProcessingFargateService injects QUEUE_NAME (not
+    QUEUE_URL), so the primary path is name -> url via SQS API.
+    """
+    for url_var in ("QUEUE_URL", "COMPRESSION_QUEUE_URL", "SQS_QUEUE_URL"):
+        if os.environ.get(url_var):
+            return os.environ[url_var]
+    q_name = os.environ.get("QUEUE_NAME") \
+             or f"archive-{os.environ.get('ENV', 'dev')}-compression"
     resp = sqs.get_queue_url(QueueName=q_name)
     return resp["QueueUrl"]
 
