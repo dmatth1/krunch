@@ -90,6 +90,33 @@ if [ "$rc" -ne 0 ]; then
   exit 20
 fi
 
+# ------- Tokenize corpus (raw text -> int-per-line) -------
+# train_l3tc_phase11.py's L3TCTokenDataset reads one int per line
+# (tokenized), not raw text. Use the just-trained SPM to encode
+# train.txt + val.txt into the expected format. Mirrors
+# phase11_tokenize_corpus in phase11_bootstrap_helpers.sh.
+echo "[train] tokenizing corpus with trained SPM..."
+python - <<PYEOF
+import sentencepiece as spm
+sp = spm.SentencePieceProcessor()
+sp.load("${MODEL_DIR}/spm.model")
+for src, dst in [("${MODEL_DIR}/train.txt", "${MODEL_DIR}/train.tok.txt"),
+                 ("${MODEL_DIR}/val.txt",   "${MODEL_DIR}/val.tok.txt")]:
+    with open(src, "r", encoding="utf-8", errors="replace") as fin, \
+         open(dst, "w") as fout:
+        text = fin.read()
+        ids = sp.encode_as_ids(text)
+        fout.write("2\n")  # BOS
+        for tid in ids:
+            fout.write(f"{tid}\n")
+    print(f"  {src} -> {dst} ({len(ids):,} tokens)")
+PYEOF
+rc=$?
+if [ "$rc" -ne 0 ]; then
+  echo "[train] FATAL: corpus tokenization failed (rc=$rc)"
+  exit 21
+fi
+
 # ------- Train RWKV -------
 echo "[train] training RWKV-v4 model on GPU..."
 nvidia-smi 2>&1 | head -5 || echo "[train] WARN: nvidia-smi not available in container"
@@ -102,8 +129,8 @@ mkdir -p "$MODEL_DIR/train_out"
 # This mirrors phase11_bootstrap_helpers.sh's "cd vendor/L3TC" step.
 cd /app/vendor/L3TC
 python /app/scripts/train_l3tc_phase11.py \
-    --train-file "$MODEL_DIR/train.txt" \
-    --val-file "$MODEL_DIR/val.txt" \
+    --train-file "$MODEL_DIR/train.tok.txt" \
+    --val-file "$MODEL_DIR/val.tok.txt" \
     --output-dir "$MODEL_DIR/train_out" \
     --epochs 10 \
     --epoch-length 50000 \
