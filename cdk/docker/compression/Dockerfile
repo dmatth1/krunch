@@ -2,7 +2,10 @@
 # In a later spike we'll multi-stage-build the l3tc Rust binary in here
 # to serve codec=l3tc datasets.
 
-FROM python:3.11-slim
+# Use Amazon's ECR mirror instead of Docker Hub to sidestep the
+# unauthenticated pull rate limit that bit CodeBuild on 2026-04-21
+# (429 Too Many Requests). Same upstream image, mirrored by AWS.
+FROM public.ecr.aws/docker/library/python:3.11-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     zstd ca-certificates \
