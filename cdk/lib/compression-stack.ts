@@ -150,6 +150,26 @@ export class CompressionStack extends cdk.Stack {
     );
     props.modelVersionsTable.grantReadData(this.service.taskDefinition.taskRole);
 
+    // Task scale-in protection (set/cleared by the worker around
+    // each SQS message). The ECS agent proxies these calls but still
+    // requires the task's own IAM role to carry the two permissions;
+    // without them the agent returns HTTP 400 and the worker can't
+    // protect in-flight work from auto-scaler-driven termination.
+    this.service.taskDefinition.taskRole.addToPrincipalPolicy(
+      new iam.PolicyStatement({
+        actions: [
+          "ecs:UpdateTaskProtection",
+          "ecs:GetTaskProtection",
+        ],
+        // Scope to the compression cluster's tasks only. We use the
+        // cluster's ARN substring since the task ARN isn't knowable
+        // at synth time.
+        resources: [
+          `arn:aws:ecs:${cdk.Stack.of(this).region}:${cdk.Stack.of(this).account}:task/${cluster.clusterName}/*`,
+        ],
+      }),
+    );
+
     new cdk.CfnOutput(this, "CompressionServiceArn", {
       value: this.service.service.serviceArn,
     });
