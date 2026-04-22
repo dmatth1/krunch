@@ -38,6 +38,7 @@ ARG BZIP3_VERSION=1.5.3
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential cmake git pkg-config \
         libsentencepiece-dev \
+        libclang-dev \
  && rm -rf /var/lib/apt/lists/*
 
 RUN git clone --depth 1 --branch ${BZIP3_VERSION} \
