@@ -1,5 +1,35 @@
 # Hybrid codec design — neural-primary dispatcher
 
+## Status (2026-04-22)
+
+**Tier 1 shipped end-to-end and validated in production.** A 5 MB
+enwik8 pilot through the deployed AWS service produced **ratio 0.1876
+(+39.4% vs per-chunk zstd, neural wins all 5 chunks)** with EMF
+metrics landing under `Krunch/Hybrid` and the CloudWatch dashboard
+rendering them. See `RUST_DISPATCHER_BENCH.md` for the bench numbers
+and `PRODUCTION_TODO.md` item 7 for the deploy log.
+
+What's live (per the engineering plan further down):
+- Detector: magic-byte prescreen + probe-encode + length-check safety net
+- Codecs in the menu: passthrough, lz4, zstd, zstd-dict, bzip3, neural
+- Blob format (`L3H\0` magic, versioned, per-chunk tagged)
+- Per-dataset zstd dictionary training in the Batch training job
+- `convert_checkpoint.py` wired into the training entrypoint → emits the Rust `.bin`
+- Compression Fargate (Graviton ARM64) downloads model + tokenizer + dict, invokes `l3tc hybrid-compress`, emits EMF for hybrid AND zstd-fallback paths
+- ECS task scale-in protection + min=0 (no idle cost; no mid-job kills)
+- CloudWatch Dashboard with Ratio / Savings / Throughput / per-codec stacked bytes / queue + task widgets
+
+Deferred (Tier 1+):
+- **CLP**: `ClpStub` placeholder reserves the codec slot; full IR port is 3-5 days. Required for templated-log parity vs YScope.
+- **Brotli shared-dictionary** (RFC 9842): for near-duplicate document archives. Codec slot reserved (tag 0x5).
+- **DDB `lifetime_*` columns**: dashboard pulls fleet metrics from CloudWatch; per-dataset durable aggregates (lifetime_codec_bytes etc.) not yet added.
+- **Alarms** on `SafetyNetSubstitutionRate`, ratio regression, P95 duration: not wired.
+- **Cross-architecture decode**: blobs encoded on Graviton can't be decoded on Apple M-series due to FP-arithmetic divergence in the AC path. Production is single-arch (decompression service will run on the same Graviton cluster) so it's fine; local debugging of prod blobs requires a Graviton instance. Future hardening: stamp the blob with the encoder's CPU model + library versions.
+
+Original design notes (pre-implementation) follow.
+
+---
+
 Status: design decided, pre-implementation. Revised 2026-04-22 after
 Spike 2 findings + research on cmix/paq8 detection primitives + user
 review of detector + within-file hybrid options.
