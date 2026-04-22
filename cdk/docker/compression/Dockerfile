@@ -7,6 +7,13 @@
 # (429 Too Many Requests). Same upstream image, mirrored by AWS.
 FROM public.ecr.aws/docker/library/python:3.11-slim
 
+# Flush stdout on every line so CloudWatch sees progress live. Without
+# this, Python buffers stdout when the FD is a pipe (CloudWatch log
+# driver is a pipe), and our "[worker] processing ..." lines never
+# land until the process exits — which masked the Spike 1 scale-in
+# issue for 15 min.
+ENV PYTHONUNBUFFERED=1
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     zstd ca-certificates \
  && rm -rf /var/lib/apt/lists/*

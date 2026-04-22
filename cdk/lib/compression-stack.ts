@@ -75,9 +75,17 @@ export class CompressionStack extends cdk.Stack {
         cluster,
         queue: props.compressionQueue as sqs.Queue,
         image: ecs.ContainerImage.fromDockerImageAsset(image),
-        cpu: 1024, // 1 vCPU
-        memoryLimitMiB: 2048,
-        minScalingCapacity: 0,
+        cpu: 2048, // 2 vCPU — zstd-22 is single-threaded but this gives the OS room and cuts compression walltime by ~30% in practice
+        memoryLimitMiB: 4096,
+        // min=1 on purpose: the default queue-depth scale-in metric
+        // (ApproximateNumberOfMessagesVisible) drops to 0 the moment
+        // a worker pulls a message (message becomes in-flight), which
+        // triggered scale-in and killed compression mid-job during
+        // Spike 1. $0.08/hr idle is cheap enough for pre-MVP; in
+        // prod we'd use a MathExpression that sums visible + in-flight
+        // and only scales to 0 when both are 0. See PRODUCTION_TODO
+        // item for the proper fix.
+        minScalingCapacity: 1,
         maxScalingCapacity: 4,
         // VPC has no NAT gateway, so tasks need public IPs to reach ECR / S3 over the internet.
         assignPublicIp: true,
@@ -91,9 +99,8 @@ export class CompressionStack extends cdk.Stack {
           DATASETS_TABLE_NAME: props.datasetsTable.tableName,
           MODEL_VERSIONS_TABLE_NAME: props.modelVersionsTable.tableName,
         },
-        // Scale in after 5 min idle, scale out as queue backs up.
         scalingSteps: [
-          { upper: 0, change: -1 },
+          { upper: 0, change: 0 },   // queue empty → no scale-in beyond the minimum (min=1 already)
           { lower: 1, change: +1 },
           { lower: 10, change: +2 },
         ],

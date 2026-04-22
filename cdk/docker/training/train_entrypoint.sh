@@ -33,6 +33,21 @@ set -uo pipefail
 
 echo "[train] customer=${CUSTOMER_ID} dataset=${DATASET_ID} trigger=${TRIGGER}"
 
+# --- Spike 2 hyperparameter overrides ---
+# All have defaults matching Spike 1 so nothing breaks. Each Batch
+# experiment sets only the ones it wants to change via
+# containerOverrides.environment.
+VOCAB_SIZE="${VOCAB_SIZE:-16384}"
+NUM_LAYERS="${NUM_LAYERS:-2}"
+HIDDEN_SIZE="${HIDDEN_SIZE:-96}"  # informational; train script uses its own default for this
+CONTEXT_LEN="${CONTEXT_LEN:-2048}"  # informational; train script uses its own default for this
+EPOCHS="${EPOCHS:-10}"
+EPOCH_LENGTH="${EPOCH_LENGTH:-50000}"
+BATCH_SIZE="${BATCH_SIZE:-32}"
+SAMPLE_MB="${SAMPLE_MB:-200}"  # SPM training sample size; "0" means use full corpus
+
+echo "[train] config: vocab=${VOCAB_SIZE} num_layers=${NUM_LAYERS} ctx=${CONTEXT_LEN} epochs=${EPOCHS} epoch_len=${EPOCH_LENGTH} batch=${BATCH_SIZE} sample_mb=${SAMPLE_MB}"
+
 RAW_DIR=/tmp/raw
 MODEL_DIR=/tmp/model
 mkdir -p "$RAW_DIR" "$MODEL_DIR"
@@ -78,12 +93,21 @@ echo "[train] assigning model version v${VERSION}"
 # follow-up will plumb a DOMAIN env var through the launcher so each
 # customer dataset picks its own specialist.
 DOMAIN="${DOMAIN:-logs}"
-echo "[train] training SPM tokenizer (16K unigram, domain=${DOMAIN})..."
+# SAMPLE_MB=0 ⇒ use the full train corpus (Phase A plan target: train
+# SPM on all data, not a 200 MB sample). Non-zero caps the SPM
+# trainer's input to that many MB for speed.
+if [ "${SAMPLE_MB}" = "0" ]; then
+  SAMPLE_MB_ARG=$(( $(wc -c < "$MODEL_DIR/train.txt") / 1024 / 1024 + 1 ))
+else
+  SAMPLE_MB_ARG="${SAMPLE_MB}"
+fi
+echo "[train] training SPM tokenizer (vocab=${VOCAB_SIZE} unigram, domain=${DOMAIN}, sample_mb=${SAMPLE_MB_ARG})..."
 python /app/scripts/train_specialist_tokenizer.py \
     --domain "${DOMAIN}" \
     --corpus "$MODEL_DIR/train.txt" \
     --output-dir "$MODEL_DIR" \
-    --sample-mb 200 2>&1 | tee /tmp/tokenizer.log
+    --vocab-size "${VOCAB_SIZE}" \
+    --sample-mb "${SAMPLE_MB_ARG}" 2>&1 | tee /tmp/tokenizer.log
 rc=${PIPESTATUS[0]}
 if [ "$rc" -ne 0 ]; then
   echo "[train] FATAL: tokenizer training failed (rc=$rc)"
@@ -149,11 +173,11 @@ python /app/scripts/train_l3tc_phase11.py \
     --train-file "$MODEL_DIR/train.tok.txt" \
     --val-file "$MODEL_DIR/val.tok.txt" \
     --output-dir "$MODEL_DIR/train_out" \
-    --epochs 10 \
-    --epoch-length 50000 \
-    --batch-size 32 \
-    --num-layers 2 \
-    --vocab-size 16384 \
+    --epochs "${EPOCHS}" \
+    --epoch-length "${EPOCH_LENGTH}" \
+    --batch-size "${BATCH_SIZE}" \
+    --num-layers "${NUM_LAYERS}" \
+    --vocab-size "${VOCAB_SIZE}" \
     --lr 1e-4 \
     --device cuda \
     --no-compile \
@@ -185,8 +209,8 @@ held_out_ratio=$(python /app/scripts/measure_held_out_ratio.py \
     --val-file "$MODEL_DIR/val.txt" \
     --checkpoint "$CHECKPOINT" \
     --tokenizer "$MODEL_DIR/spm.model" \
-    --num-layers 2 \
-    --vocab-size 16384 2>/tmp/measure.stderr)
+    --num-layers "${NUM_LAYERS}" \
+    --vocab-size "${VOCAB_SIZE}" 2>/tmp/measure.stderr)
 rc=$?
 cd /app
 if [ "$rc" -ne 0 ] || [ -z "$held_out_ratio" ]; then
@@ -226,6 +250,9 @@ aws s3 cp "$MODEL_DIR/spm.model" \
     "s3://${BUCKET_NAME}/${S3_MODEL_PREFIX}v${VERSION}.tokenizer.model" --only-show-errors
 
 trained_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+# Pull bytes/token from the SPM report if present (it writes
+# spm.bt_report.json with that exact field).
+bytes_per_token=$(python -c "import json; d=json.load(open('${MODEL_DIR}/spm.bt_report.json')); print(d.get('bytes_per_token', d.get('bt', 'null')))" 2>/dev/null || echo "null")
 cat > "$MODEL_DIR/metadata.json" <<EOF
 {
   "version": ${VERSION},
@@ -234,9 +261,17 @@ cat > "$MODEL_DIR/metadata.json" <<EOF
   "would_have_beaten_zstd": ${would_have_beaten_zstd},
   "held_out_ratio": ${held_out_ratio},
   "zstd_baseline_ratio": ${zstd_baseline_ratio},
+  "vocab_size": ${VOCAB_SIZE},
+  "num_layers": ${NUM_LAYERS},
+  "context_len": ${CONTEXT_LEN},
+  "epochs": ${EPOCHS},
+  "epoch_length": ${EPOCH_LENGTH},
+  "batch_size": ${BATCH_SIZE},
+  "sample_mb": ${SAMPLE_MB_ARG},
+  "bytes_per_token": ${bytes_per_token},
   "trigger": "${TRIGGER}",
   "trained_at": "${trained_at}",
-  "spike": "spike_1"
+  "spike": "${SPIKE_NAME:-spike_2}"
 }
 EOF
 aws s3 cp "$MODEL_DIR/metadata.json" \
