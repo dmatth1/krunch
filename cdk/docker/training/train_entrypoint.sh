@@ -33,6 +33,14 @@ set -uo pipefail
 
 echo "[train] customer=${CUSTOMER_ID} dataset=${DATASET_ID} trigger=${TRIGGER}"
 
+# Warm-instance /tmp cleanup. Batch reuses the same EC2 instance
+# across sequential jobs when scale-down cooldown hasn't kicked in;
+# the previous job's /tmp/raw + /tmp/model can easily fill the
+# default 30 GB disk with checkpoints + tokenized corpora and cause
+# s3 sync to fail with "No space left on device".
+rm -rf /tmp/raw /tmp/model /tmp/train.log /tmp/tokenizer.log /tmp/measure.stderr
+df -h /tmp | head -2
+
 # --- Spike 2 hyperparameter overrides ---
 # All have defaults matching Spike 1 so nothing breaks. Each Batch
 # experiment sets only the ones it wants to change via

@@ -72,6 +72,38 @@ Fix directions, in order of engineering cost:
   BEFORE SPM. Templates stabilize; SPM learns the real structure.
   Rust runtime will need the same preprocessing + postprocessing.
 
+| hdfs-c2/v1 | C2 (64K vocab + max_piece=256) | 65 536 | 2 | 2048 | 1058 | 3 | 4 | **0.1013** | 0.0466 | 0.0457 | ~80 min | ~$1.07 | FAIL | 4× the vocab of C1; essentially no change in ratio. Confirmed vocab scaling is saturated on HDFS. |
+| hdfs-c4b2/v1 | C4b2 (normalized SPM + 16K…1024) | 1 024 | 2 | 2048 | 1058 | 5 | 32 | **0.0816** (bits/token 1.22 / val bytes/token 1.87) | 0.0466 | 0.0457 | ~26 min | ~$0.35 | FAIL — but big improvement | Train SPM on normalized corpus, tokenize + train RWKV on ORIGINAL corpus. SPM learned only 1116 unique pieces on the normalized 2K-skeleton space. At encode time on original text, SPM falls back to byte-level for variable fields → val bytes/token drops to 1.87. **Bits/token drops dramatically (3.39 → 1.22, -64%)** because the model only needs to predict next byte/short-token given current context. Net ratio 0.0816 — 43% better than baseline, 1.75× worse than zstd. |
+
+### Phase C verdict (so far)
+
+Pattern across A/B/C: the bottleneck is **variable-field bytes**
+(block IDs, IPs, timestamps). No amount of vocab or model capacity
+makes a small learned model match zstd's 128 MB hash-dictionary on
+a highly-repetitive templated corpus, because zstd's LZ references
+are near-optimal for this data shape.
+
+C4b2 got us closer than anything else (**ratio 0.0816 vs zstd
+0.0466 = 1.75×** worse) by effectively byte-predicting with
+normalized-template context. The remaining gap is variable-field
+entropy — block IDs and timestamps the model can't predict without
+explicit retrieval.
+
+**To actually beat zstd on HDFS requires either:**
+1. A **proper hybrid codec** with dictionary-lookup for
+   high-repetition substrings + model for residual bytes. Weeks of
+   engineering. Essentially reimplementing zstd's win on top of
+   our model.
+2. A **much larger long-context model** (100 M+, ctx 16 K+) that
+   can retrieve previous block IDs from within its own context.
+   Blows the inference envelope.
+3. Switching corpora to one where LZ isn't near-optimal (JSON
+   events, prose) — the user has explicitly ruled this out.
+
+Running **C5 (1 M-param model, 10 epochs, same normalized setup)**
+as the last budgeted within-envelope attempt before concluding
+the spike and presenting options to the user.
+
 ## Infra fixes folded in for Spike 2
 
 - Compression Dockerfile: `PYTHONUNBUFFERED=1` so the worker's
