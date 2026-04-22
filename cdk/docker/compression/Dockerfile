@@ -73,7 +73,7 @@ RUN cd l3tc-rust \
 RUN mkdir -p /runtime-libs \
  && ldd /l3tc | awk '/=>/ {print $3}' \
     | grep -E 'bz|bzip3' \
-    | xargs -I{} cp -av {} /runtime-libs/ \
+    | xargs -I{} cp -avL {} /runtime-libs/ \
  && ls -la /runtime-libs/
 
 # -----------------------------------------------------------------------------
