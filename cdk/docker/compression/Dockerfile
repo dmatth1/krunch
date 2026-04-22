@@ -19,7 +19,11 @@
 # -----------------------------------------------------------------------------
 # Stage 1: Rust builder
 # -----------------------------------------------------------------------------
-FROM rust:1.82-bookworm AS rust-builder
+# Pull the Rust image via AWS's Docker Hub mirror on public.ecr.aws to
+# dodge the anonymous Docker Hub rate limit (429 Too Many Requests)
+# that killed the compression-image build on 2026-04-22. Same upstream
+# image, mirrored by AWS — zero functional difference.
+FROM public.ecr.aws/docker/library/rust:1.82-bookworm AS rust-builder
 
 # bzip3 headers aren't in Debian Bookworm yet; build from upstream.
 # Pin to a specific tag so CodeBuild reruns are reproducible.
