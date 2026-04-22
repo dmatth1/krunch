@@ -83,8 +83,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && rm -rf /var/lib/apt/lists/*
 
 # The l3tc binary + bzip3 shared library both come from stage 1.
+# bzip3 1.5.3 installs `libbzip3.so.*` (earlier versions used
+# `libbz3.so.*`); glob both so we survive future renames. ldconfig
+# rebuilds the linker cache so the newly-placed libs are visible
+# without having to drop LD_LIBRARY_PATH on the PID.
 COPY --from=rust-builder /l3tc /usr/local/bin/l3tc
-COPY --from=rust-builder /usr/lib/libbz3.so* /usr/lib/
+COPY --from=rust-builder /usr/lib/libbz* /usr/lib/
+RUN ldconfig
 
 WORKDIR /app
 
