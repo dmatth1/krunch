@@ -4,6 +4,7 @@ import * as ecs from "aws-cdk-lib/aws-ecs";
 import * as ecs_patterns from "aws-cdk-lib/aws-ecs-patterns";
 import * as ecr from "aws-cdk-lib/aws-ecr";
 import * as ecr_assets from "aws-cdk-lib/aws-ecr-assets";
+import * as cloudwatch from "aws-cdk-lib/aws-cloudwatch";
 import * as logs from "aws-cdk-lib/aws-logs";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as s3 from "aws-cdk-lib/aws-s3";
@@ -57,6 +58,12 @@ export class CompressionStack extends cdk.Stack {
     const cluster = new ecs.Cluster(this, "CompressionCluster", {
       clusterName: named(props.envName, "compression-cluster"),
       vpc,
+      // Container Insights publishes RunningTaskCount +
+      // CpuUtilization + MemoryUtilization under
+      // ECS/ContainerInsights. The dashboard below consumes the
+      // task-count metric. ~$0.01/hr per task monitored, negligible
+      // at current scale.
+      containerInsightsV2: ecs.ContainerInsights.ENABLED,
     });
 
     // -----------------------------------------------------------------
@@ -145,6 +152,186 @@ export class CompressionStack extends cdk.Stack {
 
     new cdk.CfnOutput(this, "CompressionServiceArn", {
       value: this.service.service.serviceArn,
+    });
+
+    // -----------------------------------------------------------------
+    // CloudWatch dashboard
+    //
+    // The worker emits EMF records to stdout per-run (see
+    // emit_compression_metrics in compression_worker.py). Amazon
+    // CloudWatch Logs auto-parses the embedded metric blocks into
+    // Metric data under namespace `Krunch/Hybrid` with
+    // dimensions [CustomerId, DatasetId, Env] (main record) and
+    // [CustomerId, DatasetId, Env, Codec] (per-codec record). Both
+    // hybrid and zstd-fallback runs populate this — fallback shows
+    // up as Codec="zstd_fallback" with SavingsVsZstdPct=0.
+    //
+    // Widgets are aggregated (Average / Sum) across all customers;
+    // drill-down per customer is done from the "Metrics" explorer
+    // by filtering on the CustomerId dimension.
+    // -----------------------------------------------------------------
+    const NS = "Krunch/Hybrid";
+    const periodMin = cdk.Duration.minutes(1);
+
+    const mainDims: cloudwatch.DimensionsMap = {}; // aggregate across all
+    const mkMetric = (name: string, statistic: string): cloudwatch.Metric =>
+      new cloudwatch.Metric({
+        namespace: NS,
+        metricName: name,
+        statistic,
+        period: periodMin,
+        dimensionsMap: mainDims,
+      });
+
+    const ratio = mkMetric("Ratio", cloudwatch.Stats.AVERAGE);
+    const savings = mkMetric("SavingsVsZstdPct", cloudwatch.Stats.AVERAGE);
+    const throughput = mkMetric("ThroughputMBps", cloudwatch.Stats.AVERAGE);
+    const safetyNet = mkMetric(
+      "SafetyNetSubstitutions",
+      cloudwatch.Stats.SUM,
+    );
+    const bytesIn = mkMetric("BytesIn", cloudwatch.Stats.SUM);
+    const bytesOut = mkMetric("BytesOut", cloudwatch.Stats.SUM);
+
+    // Per-codec stacked bytes: one series per known codec. We hardcode
+    // the tag set here to keep the dashboard schema stable when a
+    // codec produces zero chunks for a period (otherwise the series
+    // would disappear from the chart mid-session and the user would
+    // assume the codec is "broken").
+    const KNOWN_CODECS = [
+      "neural",
+      "bzip3",
+      "zstd",
+      "zstd_dict",
+      "lz4",
+      "passthrough",
+      "brotli_dict",
+      "clp",
+      "zstd_fallback",
+    ];
+    const bytesByCodecSeries = KNOWN_CODECS.map(
+      (c) =>
+        new cloudwatch.Metric({
+          namespace: NS,
+          metricName: "BytesByCodec",
+          statistic: cloudwatch.Stats.SUM,
+          period: periodMin,
+          dimensionsMap: { Codec: c },
+          label: c,
+        }),
+    );
+    const chunksByCodecSeries = KNOWN_CODECS.map(
+      (c) =>
+        new cloudwatch.Metric({
+          namespace: NS,
+          metricName: "ChunksByCodec",
+          statistic: cloudwatch.Stats.SUM,
+          period: periodMin,
+          dimensionsMap: { Codec: c },
+          label: c,
+        }),
+    );
+
+    // Operational metrics: queue depth + running task count. Living
+    // in the same dashboard means the oncall can see "0 tasks running
+    // + 5 visible messages = scale-up hasn't fired yet" in one glance.
+    const queueVisible = new cloudwatch.Metric({
+      namespace: "AWS/SQS",
+      metricName: "ApproximateNumberOfMessagesVisible",
+      statistic: cloudwatch.Stats.AVERAGE,
+      period: periodMin,
+      dimensionsMap: { QueueName: (props.compressionQueue as sqs.Queue).queueName },
+      label: "visible",
+    });
+    const queueInFlight = new cloudwatch.Metric({
+      namespace: "AWS/SQS",
+      metricName: "ApproximateNumberOfMessagesNotVisible",
+      statistic: cloudwatch.Stats.AVERAGE,
+      period: periodMin,
+      dimensionsMap: { QueueName: (props.compressionQueue as sqs.Queue).queueName },
+      label: "in-flight",
+    });
+    const runningTasks = new cloudwatch.Metric({
+      namespace: "ECS/ContainerInsights",
+      metricName: "RunningTaskCount",
+      statistic: cloudwatch.Stats.AVERAGE,
+      period: periodMin,
+      dimensionsMap: {
+        ClusterName: cluster.clusterName,
+        ServiceName: this.service.service.serviceName,
+      },
+      label: "running tasks",
+    });
+
+    const dashboard = new cloudwatch.Dashboard(this, "CompressionDashboard", {
+      dashboardName: named(props.envName, "compression"),
+      defaultInterval: cdk.Duration.hours(3),
+    });
+
+    dashboard.addWidgets(
+      new cloudwatch.GraphWidget({
+        title: "Compression ratio (lower = better)",
+        left: [ratio],
+        leftYAxis: { min: 0, max: 1 },
+        width: 12,
+        height: 6,
+      }),
+      new cloudwatch.GraphWidget({
+        title: "Savings vs zstd-22 per-chunk shadow (%)",
+        left: [savings],
+        leftYAxis: { label: "percent" },
+        width: 12,
+        height: 6,
+      }),
+    );
+    dashboard.addWidgets(
+      new cloudwatch.GraphWidget({
+        title: "Compression throughput (MB/s, per-task)",
+        left: [throughput],
+        width: 12,
+        height: 6,
+      }),
+      new cloudwatch.SingleValueWidget({
+        title: "Safety-net substitutions (sum)",
+        metrics: [safetyNet],
+        width: 12,
+        height: 6,
+      }),
+    );
+    dashboard.addWidgets(
+      new cloudwatch.GraphWidget({
+        title: "Bytes out by codec (stacked)",
+        left: bytesByCodecSeries,
+        stacked: true,
+        width: 12,
+        height: 6,
+      }),
+      new cloudwatch.GraphWidget({
+        title: "Chunks by codec (stacked)",
+        left: chunksByCodecSeries,
+        stacked: true,
+        width: 12,
+        height: 6,
+      }),
+    );
+    dashboard.addWidgets(
+      new cloudwatch.GraphWidget({
+        title: "Total traffic (BytesIn vs BytesOut)",
+        left: [bytesIn, bytesOut],
+        width: 12,
+        height: 6,
+      }),
+      new cloudwatch.GraphWidget({
+        title: "Queue depth + running tasks",
+        left: [queueVisible, queueInFlight],
+        right: [runningTasks],
+        width: 12,
+        height: 6,
+      }),
+    );
+
+    new cdk.CfnOutput(this, "DashboardUrl", {
+      value: `https://${cdk.Stack.of(this).region}.console.aws.amazon.com/cloudwatch/home?region=${cdk.Stack.of(this).region}#dashboards:name=${dashboard.dashboardName}`,
     });
   }
 }

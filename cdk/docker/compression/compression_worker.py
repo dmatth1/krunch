@@ -145,23 +145,62 @@ def compress_hybrid(
         return json.load(f)
 
 
-def emit_hybrid_metrics(
-    cid: str, dsid: str, version: int, stats: dict
+def emit_compression_metrics(
+    cid: str,
+    dsid: str,
+    version: int,
+    codec_used: str,
+    raw_bytes: int,
+    compressed_bytes: int,
+    elapsed_seconds: float,
+    hybrid_stats: dict | None,
 ) -> None:
-    """Write CloudWatch EMF records capturing the dispatcher's per-run
-    behavior. EMF is cheaper than PutMetricData for high-cardinality
-    dimensions and lets us query per-customer / per-codec breakdowns
-    without a separate metrics pipeline.
+    """Write CloudWatch EMF records capturing every compression run —
+    hybrid OR zstd-fallback. EMF is cheaper than PutMetricData for
+    high-cardinality dimensions and lets us query per-customer /
+    per-codec breakdowns without a separate metrics pipeline.
 
-    Schema: one EMF payload per stats invocation, with
-    Dimensions = [CustomerId, DatasetId, Env].
-    Metrics = ratio, savings_vs_zstd_pct, throughput_mb_per_sec,
-    safety_net_substitutions, chunks_total, and one counter per
-    codec tag that appeared. Downstream dashboards aggregate across
-    customers for trend views and drill in per-customer for support.
+    Schema:
+      namespace = Krunch/Hybrid (kept for continuity; covers
+                  all compression runs, not just successful hybrid)
+      main record:
+        dimensions = [CustomerId, DatasetId, Env]
+        metrics    = Ratio, SavingsVsZstdPct, ThroughputMBps,
+                     SafetyNetSubstitutions, ChunksTotal,
+                     BytesIn, BytesOut
+      per-codec record (one per codec tag that appeared):
+        dimensions = [CustomerId, DatasetId, Env, Codec]
+        metrics    = BytesByCodec, ChunksByCodec
+
+    Fallback-path runs still land here so the dashboard shows total
+    traffic per customer even when the hybrid path disables itself.
+    In that case Codec=zstd_fallback, SavingsVsZstdPct=0, and the
+    hybrid-specific fields (SafetyNetSubstitutions) report 0.
     """
-    per_codec_bytes = stats.get("per_codec_bytes", {}) or {}
-    per_codec_chunks = stats.get("per_codec_chunks", {}) or {}
+    if hybrid_stats is not None:
+        # Hybrid path populated every field; use it verbatim.
+        per_codec_bytes = hybrid_stats.get("per_codec_bytes", {}) or {}
+        per_codec_chunks = hybrid_stats.get("per_codec_chunks", {}) or {}
+        stats = hybrid_stats
+    else:
+        # Fallback path: synthesize a stats dict that looks like a
+        # single-codec hybrid run so downstream widgets render the
+        # same way for both paths.
+        ratio = compressed_bytes / max(1, raw_bytes)
+        tput = (raw_bytes / 1_048_576.0) / max(elapsed_seconds, 1e-6)
+        stats = {
+            "ratio": ratio,
+            "zstd_shadow_ratio": ratio,  # we ARE zstd in this path
+            "savings_vs_zstd_pct": 0.0,
+            "throughput_mb_per_sec": tput,
+            "safety_net_substitutions": 0,
+            "chunks_total": 1,
+            "bytes_in": raw_bytes,
+            "bytes_out": compressed_bytes,
+            "encode_seconds": elapsed_seconds,
+        }
+        per_codec_bytes = {codec_used: compressed_bytes}
+        per_codec_chunks = {codec_used: 1}
 
     # Metric definitions the dashboard will look for. We emit every
     # metric unconditionally so the absence of a codec still shows as
@@ -281,17 +320,22 @@ def process_message(body: dict) -> None:
     raw_bytes = raw_local.stat().st_size
 
     hybrid_stats: dict | None = None
-    if codec == "hybrid":
+    codec_used = codec  # actual codec the output ended up using
+    compress_started_at = time.time()
+    if codec in ("hybrid", "l3tc"):
+        if codec == "l3tc":
+            print("[worker] codec=l3tc is legacy; routing to hybrid")
         # Tier 1 hybrid path. Binary may be absent in older compression
         # images — fall back to zstd with a loud warning so we never
         # silently skip compression.
         if not shutil.which(L3TC_BIN) and not Path(L3TC_BIN).exists():
             print(
-                f"[worker] WARN: codec=hybrid but {L3TC_BIN} not present; "
+                f"[worker] WARN: codec={codec} but {L3TC_BIN} not present; "
                 f"falling back to zstd. Rebuild the compression image with "
                 f"the Rust multi-stage build to enable hybrid."
             )
             compress_zstd(raw_local, compressed_local)
+            codec_used = "zstd_fallback"
         else:
             try:
                 hybrid_stats = compress_hybrid(
@@ -303,33 +347,39 @@ def process_message(body: dict) -> None:
                     work,
                     chunk_size_bytes,
                 )
+                codec_used = "hybrid"
             except subprocess.CalledProcessError as e:
                 print(
                     f"[worker] hybrid-compress failed (rc={e.returncode}); "
                     f"falling back to zstd"
                 )
                 compress_zstd(raw_local, compressed_local)
-    elif codec == "l3tc":
-        # Legacy metadata. Route to hybrid (with neural if present).
-        print("[worker] codec=l3tc is legacy; routing to hybrid")
-        try:
-            hybrid_stats = compress_hybrid(
-                raw_local, compressed_local, cid, dsid, model_version, work
-            )
-        except (subprocess.CalledProcessError, FileNotFoundError) as e:
-            print(f"[worker] legacy l3tc -> hybrid failed ({e}); falling back to zstd")
-            compress_zstd(raw_local, compressed_local)
+                codec_used = "zstd_fallback"
     else:
         # zstd_fallback — the Spike 1 / pre-hybrid path.
         compress_zstd(raw_local, compressed_local)
+        codec_used = "zstd_fallback"
 
     compressed_bytes = compressed_local.stat().st_size
+    elapsed_seconds = time.time() - compress_started_at
 
-    if hybrid_stats is not None:
-        try:
-            emit_hybrid_metrics(cid, dsid, model_version, hybrid_stats)
-        except Exception as e:
-            print(f"[worker] WARN: EMF emission failed: {e}")
+    # Always emit metrics — hybrid and zstd-fallback runs both land in
+    # the same namespace keyed by Codec dimension, so the dashboard
+    # can show per-customer traffic and the codec mix even when the
+    # hybrid path isn't wired yet or fell back.
+    try:
+        emit_compression_metrics(
+            cid,
+            dsid,
+            model_version,
+            codec_used,
+            raw_bytes,
+            compressed_bytes,
+            elapsed_seconds,
+            hybrid_stats,
+        )
+    except Exception as e:
+        print(f"[worker] WARN: EMF emission failed: {e}")
 
     # Time-bucket the compressed blob by upload time.
     now = datetime.now(timezone.utc)
