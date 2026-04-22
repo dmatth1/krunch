@@ -42,9 +42,13 @@ phases:
       # linux/arm64` works from this x86 CodeBuild host. The
       # compression image targets ARM64 Fargate Graviton; the training
       # image stays x86_64 (PyTorch CUDA wheels are x86-only).
-      # tonistiigi/binfmt installs the handlers once per build and the
-      # kernel registers them for the lifetime of the container.
-      - docker run --privileged --rm tonistiigi/binfmt --install arm64
+      #
+      # Pulling from public.ecr.aws/eks-distro-build-tooling instead
+      # of Docker Hub's tonistiigi/binfmt — anonymous Docker Hub
+      # rate-limited the latter on 2026-04-22. AWS-mirrored image is
+      # the same upstream binfmt installer (EKS-distro fork) and
+      # accepts the same --install arm64 invocation.
+      - docker run --privileged --rm public.ecr.aws/eks-distro-build-tooling/binfmt-misc:qemu-v9.2.2 --install arm64
 
   build:
     commands:
