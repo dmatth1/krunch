@@ -166,11 +166,129 @@ shipping.
 | Round-trip tests on HDFS + enwik8 + 1 JSON + 1 code corpus | 2 d | Must be bit-exact per chunk |
 | Benchmark + codec-distribution histogram in metadata | 1 d | Per-dataset stats for ops visibility |
 | Service wiring: Fargate worker downloads dict + model per dataset | 1 d | Update compression_worker.py |
+| Metrics: emit EMF-format CloudWatch logs per compression job | 1 d | `aws-embedded-metrics` library; per-codec bytes + chunks, ratio, zstd shadow, throughput |
+| Metrics: DDB lifetime counter updates | 0.5 d | `ADD` clauses on `datasets` table; piggybacks on existing write |
+| Metrics: CloudWatch dashboard JSON | 0.5 d | Three panels (savings-vs-zstd, codec distribution, SLO) |
+| Metrics: alarm definitions | 0.5 d | Safety-net-rate, ratio regression, duration p95 |
 
 **Total Tier 1: ~2 weeks, 1 engineer.**
 
 **Tier 2 (later): ~1–2 weeks, 1 engineer** after measuring where
 Tier 1 falls short on real customer data.
+
+## Metrics + observability
+
+Every compression run emits structured stats to both **CloudWatch**
+(for fleet monitoring + alarms) and **DynamoDB** (for durable
+per-dataset aggregates + customer-facing savings dashboard). Same
+shape for decompression jobs once the GET endpoint ships.
+
+### What gets recorded per compression job
+
+For each raw → compressed job, the Fargate worker computes:
+
+| metric | why |
+|---|---|
+| `bytes_in` | raw NDJSON size |
+| `bytes_out` | final compressed blob size (after all 8 codec paths + tag overhead) |
+| `ratio` | `bytes_out / bytes_in` — the number that proves the product |
+| `throughput_mb_per_sec` | compression wall-time throughput for SLO tracking |
+| `zstd_shadow_bytes` | **what zstd -22 --long=27 alone would have produced** — computed on the same chunks as part of the dispatcher's safety-net probe; free to record since we already run zstd per chunk |
+| `zstd_shadow_ratio` | `zstd_shadow_bytes / bytes_in` |
+| `savings_vs_zstd_bytes` | `zstd_shadow_bytes - bytes_out` (negative if we lost) |
+| `savings_vs_zstd_pct` | `(zstd_shadow_bytes - bytes_out) / zstd_shadow_bytes` |
+| `per_codec_bytes` | `{passthrough: N, lz4: N, zstd: N, zstd_dict: N, bzip3: N, brotli_dict: N, clp: N, neural: N}` — emitted bytes attributed to each codec tag |
+| `per_codec_chunks` | chunk-count histogram across the same 8 codecs |
+| `chunks_total` | total chunk count |
+| `safety_net_substitutions` | count of chunks where the picked codec was replaced by zstd-dict because it exceeded the 1.01× threshold |
+| `decoder_version` | blob format version, for future migration tracking |
+
+### Where the metrics go
+
+**CloudWatch Metrics (namespace: `Krunch/Compression`):**
+
+Low-cardinality fleet metrics with `Environment` + `Codec` dimensions
+(skip `CustomerId`/`DatasetId` as metric dimensions to control cost —
+CloudWatch charges per unique dimension combo). Emit per-job:
+
+- `BytesIn`, `BytesOut` — total volume flowing through the pipeline
+- `Ratio` — fleet average compression ratio (use StatisticSet for percentiles)
+- `ZstdShadowRatio` — shadow comparison
+- `SavingsVsZstdPct` — headline savings figure
+- `CompressThroughputMBps` — fleet SLO metric
+- `CodecBytesOut` — dimensioned by `Codec`; lets us see fleet-wide codec distribution
+- `CodecChunkShare` — same, normalized to percentages
+- `SafetyNetSubstitutionRate` — percentage of chunks where Stage 3 kicked in; regressions here indicate detector drift
+- `CompressionDurationSec` — per-job wall time
+
+**CloudWatch Embedded Metric Format (EMF) JSON logs** to
+`/aws/krunch/compression-worker` log group. Each log event carries
+the full per-job record including `customer_id`, `dataset_id`,
+`dataset_version` — CloudWatch extracts the metrics we declare and we
+query the rest via CloudWatch Logs Insights. This keeps per-customer
+visibility at log-data prices, not metric prices.
+
+**DynamoDB `datasets` table — per-dataset lifetime aggregates**:
+
+```
+compressed_bytes              # already exists
+raw_bytes_held                # already exists
+lifetime_bytes_in             # NEW: cumulative raw input across all jobs
+lifetime_bytes_out            # NEW: cumulative compressed output
+lifetime_zstd_shadow_bytes    # NEW: cumulative zstd-shadow; for savings calc
+lifetime_codec_bytes          # NEW: {passthrough: N, lz4: N, zstd: N, ...}
+lifetime_codec_chunks         # NEW: same but chunk counts
+last_job_ratio                # NEW: most recent job's ratio
+last_job_savings_vs_zstd_pct  # NEW: most recent headline savings number
+```
+
+All updated atomically per job via `UpdateItem` with `ADD` clauses
+so concurrent worker instances don't stomp each other.
+
+### Dashboard (built after Tier 1 ships)
+
+Primary CloudWatch dashboard, three panels:
+
+1. **Savings vs zstd** — headline chart. X-axis: time. Y-axis:
+   rolling-7-day `SavingsVsZstdPct` fleet average. The marketing
+   graph.
+2. **Codec distribution** — stacked area chart of `CodecBytesOut`
+   over time, segmented by codec tag. Shows the mix of neural vs
+   zstd vs CLP etc. across the fleet. Operational signal — if
+   neural suddenly drops to 0% one day, something broke.
+3. **SLO dashboard** — throughput + safety-net-substitution rate +
+   compression duration P50/P95. Alarms wired off the right tail.
+
+Per-customer view (queried from DDB at GET-dataset time, not from
+CloudWatch): the customer-facing savings dashboard. "You've stored
+X GB raw, Y GB after compression, saved Z% vs zstd alone."
+
+### Alarms
+
+- `SafetyNetSubstitutionRate > 5%` sustained for 1 hour → classifier
+  drift; page ops.
+- `Ratio > 0.9 × ZstdShadowRatio` sustained for 1 hour → neural isn't
+  helping; likely a model load failure or a stale checkpoint.
+- `CompressionDurationSec` P95 > envelope → throughput regression.
+- Any Batch FAILED event from training (already tracked) + any
+  Fargate task crash during compression.
+
+### Implementation notes for engineering
+
+- Emit EMF logs with the `aws-embedded-metrics` Python library
+  (pip install, ~200 KB). The compression worker adds a single
+  logger call per job.
+- Metric cardinality: at fleet scale (say 1000 customers, 10
+  datasets each, 4 metrics), raw CloudWatch metrics with
+  customer/dataset dims would cost ~$12K/month. EMF pattern with
+  low-cardinality metrics + high-cardinality log fields is ~1/20th
+  the cost.
+- DDB updates piggyback on the existing `addCompressedBytes` flow in
+  the Fargate worker — adding the lifetime counters is a one-line
+  expansion of the existing `UpdateExpression`.
+- The `zstd_shadow_bytes` value comes for free because Stage 2 of
+  the dispatcher already runs zstd on every chunk as a candidate.
+  We just need to sum those up and record the total.
 
 ## Guarantees this buys
 
@@ -184,6 +302,39 @@ Tier 1 falls short on real customer data.
 - We are not beating theoretical entropy bounds. NNCP / cmix remain the theoretical references; we trade 30–50% of their ratio for 1000× more throughput.
 - We are not claiming our neural model wins on every chunk. The dispatcher is explicit about when classical wins.
 - We are not eliminating zstd as a dependency — we are doubling down on it as the universal safety net.
+
+## Validation before Spike 3
+
+Before kicking off Spike 3 (the multi-corpus neural-validation pass),
+we want to measure the **dispatcher's expected ratio** on data we
+already have — HDFS (where neural loses and the dispatcher should
+route to classical) and enwik8 (where neural wins per our
+`bench/results/enwik8-l3tc.md` measurement of 0.2166 vs zstd-22's
+0.2527). This tells us the dispatcher's theoretical performance
+envelope *before* we commit engineering time to the Rust runtime
+implementation.
+
+Approach (Python simulator, not full Rust implementation):
+- Chunk the val corpus at 64 KB boundaries.
+- For each chunk, run each candidate codec (zstd -22 --long=27,
+  bzip3 -16, lz4, and our neural model via its entropy-bound ratio
+  from Spike 2 measurements) to get per-chunk output lengths.
+- Apply the dispatcher's pick-smallest rule; record which codec wins
+  each chunk.
+- Aggregate: total dispatcher size vs individual codec sizes, codec
+  distribution histogram, and ratio improvement over zstd-22.
+
+If the simulator shows:
+- HDFS: dispatcher ≈ zstd-22 (or slightly better via bzip3 chunks),
+  confirming the safety-net path works as expected.
+- enwik8: dispatcher beats zstd-22 by ~14% (matching our prose
+  measurement), confirming the neural path wins on text.
+
+Then we proceed to the Rust implementation with confidence. If the
+simulator shows unexpected results (e.g., dispatcher loses to zstd
+on either corpus), we debug the policy before building.
+
+Implementation: `scripts/simulate_dispatcher.py`.
 
 ## Open items
 
