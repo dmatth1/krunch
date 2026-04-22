@@ -2,6 +2,7 @@ import * as cdk from "aws-cdk-lib";
 import * as ec2 from "aws-cdk-lib/aws-ec2";
 import * as ecs from "aws-cdk-lib/aws-ecs";
 import * as ecs_patterns from "aws-cdk-lib/aws-ecs-patterns";
+import * as ecr from "aws-cdk-lib/aws-ecr";
 import * as ecr_assets from "aws-cdk-lib/aws-ecr-assets";
 import * as logs from "aws-cdk-lib/aws-logs";
 import * as iam from "aws-cdk-lib/aws-iam";
@@ -60,12 +61,37 @@ export class CompressionStack extends cdk.Stack {
 
     // -----------------------------------------------------------------
     // Compression container image — wraps the l3tc-rust binary.
+    //
+    // Two modes:
+    //   - `cdk deploy --context compressImageTag=<tag>` references a
+    //     pre-built image pushed to the CDK assets ECR repo by
+    //     CodeBuild (see buildspec.yml). Preferred for prod because
+    //     CI is a clean, validated linux/amd64 build environment.
+    //   - Without the context value, CDK rebuilds the Dockerfile
+    //     locally (slow on M-series via buildx cross-compile, but
+    //     useful for iterating on the Dockerfile without going
+    //     through CodeBuild).
     // -----------------------------------------------------------------
-    const image = new ecr_assets.DockerImageAsset(this, "CompressionImage", {
-      directory: "../", // repo root
-      file: "cdk/docker/compression/Dockerfile",
-      platform: ecr_assets.Platform.LINUX_AMD64,
-    });
+    const compressImageTag = this.node.tryGetContext(
+      "compressImageTag",
+    ) as string | undefined;
+    let image: ecs.ContainerImage;
+    if (compressImageTag) {
+      const repoName = `cdk-hnb659fds-container-assets-${cdk.Stack.of(this).account}-${cdk.Stack.of(this).region}`;
+      const repo = ecr.Repository.fromRepositoryName(
+        this,
+        "CompressionRepo",
+        repoName,
+      );
+      image = ecs.ContainerImage.fromEcrRepository(repo, compressImageTag);
+    } else {
+      const asset = new ecr_assets.DockerImageAsset(this, "CompressionImage", {
+        directory: "../", // repo root
+        file: "cdk/docker/compression/Dockerfile",
+        platform: ecr_assets.Platform.LINUX_AMD64,
+      });
+      image = ecs.ContainerImage.fromDockerImageAsset(asset);
+    }
 
     this.service = new ecs_patterns.QueueProcessingFargateService(
       this,
@@ -74,7 +100,7 @@ export class CompressionStack extends cdk.Stack {
         serviceName: named(props.envName, "compression-service"),
         cluster,
         queue: props.compressionQueue as sqs.Queue,
-        image: ecs.ContainerImage.fromDockerImageAsset(image),
+        image,
         cpu: 2048, // 2 vCPU — zstd-22 is single-threaded but this gives the OS room and cuts compression walltime by ~30% in practice
         memoryLimitMiB: 4096,
         // min=1 on purpose: the default queue-depth scale-in metric
