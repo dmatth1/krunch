@@ -53,15 +53,19 @@ ENV BZIP3_INCLUDE_DIR=/usr/include \
 
 WORKDIR /src
 COPY l3tc-rust /src/l3tc-rust
-# Build the release binary tuned for the target CPU. Without
-# RUSTFLAGS the Rust toolchain emits generic armv8-a code; on
-# Graviton3 (which is what Fargate ARM = neoverse-v1) that leaves
-# 3-5x performance on the table for matrixmultiply's NEON kernel.
-# Specifying target-cpu=neoverse-v1 unlocks the chip-specific SIMD
-# intrinsics path. Verified 2026-04-22 after a 5 MB enwik8 hybrid run
-# came in at 15 KB/s on Fargate vs ~150 KB/s on M-series — most of
-# the gap was generic vs tuned codegen.
-ENV RUSTFLAGS="-C target-cpu=neoverse-v1"
+# Target Graviton2 (neoverse-n1). Fargate ARM placement is NOT
+# guaranteed to be Graviton3 — observed 2026-04-22 when switching to
+# Fargate Spot: the Spot-placed task SIGILL'd because the binary had
+# been compiled with `-C target-cpu=neoverse-v1` and the container
+# landed on Graviton2 hardware that doesn't implement all the
+# neoverse-v1-specific instructions (SVE, BF16). Targeting n1 gives
+# us LLVM codegen that runs on BOTH Graviton2 and Graviton3 (v1 is
+# a superset of n1) while still getting most of the NEON tuning —
+# our hand-written 96×96 NEON kernel in `tensor.rs` is unchanged.
+# Measured impact: classical codecs run at full speed; neural forward
+# pass still uses the matrixmultiply crate's NEON kernel on any
+# aarch64 with NEON.
+ENV RUSTFLAGS="-C target-cpu=neoverse-n1"
 RUN cd l3tc-rust \
  && cargo build --release --bin l3tc \
  && strip target/release/l3tc \

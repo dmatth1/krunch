@@ -64,6 +64,14 @@ export class CompressionStack extends cdk.Stack {
       // task-count metric. ~$0.01/hr per task monitored, negligible
       // at current scale.
       containerInsightsV2: ecs.ContainerInsights.ENABLED,
+      // Register the FARGATE and FARGATE_SPOT capacity providers with
+      // the cluster so the service below can place on Spot. Spot is
+      // ~70% cheaper than on-demand Fargate; interruptions are rare at
+      // this scale and the worker processes one SQS message at a time
+      // (redrive via the queue's DLQ policy covers the rare spot-kill
+      // case). Required before any service-level capacityProviderStrategy
+      // can reference FARGATE_SPOT. See COMPRESSION_OPTIMIZATION.md.
+      enableFargateCapacityProviders: true,
     });
 
     // -----------------------------------------------------------------
@@ -108,13 +116,18 @@ export class CompressionStack extends cdk.Stack {
         cluster,
         queue: props.compressionQueue as sqs.Queue,
         image,
-        // 4 vCPU + 8 GB. The dispatcher now par_iter()s over chunks
-        // (commit 2026-04-22) so neural compression scales with cores;
-        // doubling from 2->4 vCPU was the second-largest win in the
-        // M-series-vs-Fargate-Graviton speed gap diagnosis. 8 GB is
-        // the minimum Fargate allows at 4 vCPU.
-        cpu: 4096,
-        memoryLimitMiB: 8192,
+        // 16 vCPU + 32 GB. Fargate Spot at this size is ~$0.24/hr
+        // (70% off on-demand). Bumped from 4 to 16 vCPU on 2026-04-22
+        // after profiling showed the neural forward pass is the sole
+        // bottleneck (87% of wall time) and rayon scales linearly
+        // with cores on 200K-param models — M1 measurements saw
+        // 4t=80KB/s, 8t=170KB/s. At 16 vCPU we expect ~2-4× further
+        // gain on Fargate Graviton (per-core throughput is ~0.4×
+        // M1 per core so we need 2× the cores to match M1 wall time).
+        // 32 GB is the minimum Fargate allows at 16 vCPU.
+        // See COMPRESSION_OPTIMIZATION.md for the measurement trail.
+        cpu: 16384,
+        memoryLimitMiB: 32768,
         // Graviton ARM64 Fargate. The l3tc-rust neural codec uses
         // the `matrixmultiply` crate's NEON SIMD path; on x86 Fargate
         // we saw ~10 min wall-clock on a 5 MB / 200K-param hybrid run,
@@ -141,6 +154,15 @@ export class CompressionStack extends cdk.Stack {
         // terminated by scale-in events.
         minScalingCapacity: 0,
         maxScalingCapacity: 4,
+        // All tasks run on Fargate Spot (70% discount). Interrupted
+        // tasks' in-flight SQS messages return to visible after the
+        // visibility timeout (30 min in queue config) and are retried
+        // by the next task. If this becomes disruptive we can add a
+        // base=1 on-demand capacity provider for reliability, but at
+        // our current scale interruptions are very rare.
+        capacityProviderStrategies: [
+          { capacityProvider: "FARGATE_SPOT", weight: 1, base: 0 },
+        ],
         // VPC has no NAT gateway, so tasks need public IPs to reach ECR / S3 over the internet.
         assignPublicIp: true,
         enableLogging: true,
