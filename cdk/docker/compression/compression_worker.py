@@ -91,6 +91,7 @@ def compress_hybrid(
     dsid: str,
     version: int,
     work: Path,
+    chunk_size_bytes: int,
 ) -> dict:
     """Invoke `l3tc hybrid-compress` with whichever optional assets
     (zstd dict, RWKV model + tokenizer) the training job uploaded.
@@ -127,6 +128,8 @@ def compress_hybrid(
         str(out_path),
         "--stats",
         str(stats_path),
+        "--chunk-size",
+        str(chunk_size_bytes),
     ]
     if has_dict:
         cmd += ["--zstd-dict", str(dict_path)]
@@ -266,6 +269,11 @@ def process_message(body: dict) -> None:
         print(f"[worker] WARN: could not read model metadata ({e}); assuming zstd_fallback")
         metadata = {"codec": "zstd_fallback"}
     codec = metadata.get("codec", "zstd_fallback")
+    # 1 MB default matches RUST_DISPATCHER_BENCH.md's sweet spot
+    # (+7.9% on prose, +20% on logs vs whole-file zstd-22). Datasets
+    # with unusual distributions can override by writing a different
+    # chunk_size_bytes into their metadata.
+    chunk_size_bytes = int(metadata.get("chunk_size_bytes", 1048576))
 
     s3.download_file(BUCKET, raw_key, str(raw_local))
     raw_bytes = raw_local.stat().st_size
@@ -285,7 +293,13 @@ def process_message(body: dict) -> None:
         else:
             try:
                 hybrid_stats = compress_hybrid(
-                    raw_local, compressed_local, cid, dsid, model_version, work
+                    raw_local,
+                    compressed_local,
+                    cid,
+                    dsid,
+                    model_version,
+                    work,
+                    chunk_size_bytes,
                 )
             except subprocess.CalledProcessError as e:
                 print(

@@ -280,9 +280,57 @@ if awk -v ours="$held_out_ratio" -v zstd="$zstd_baseline_ratio" \
      'BEGIN { exit !(ours > 0 && ours < zstd * 0.98) }'; then
   would_have_beaten_zstd="true"
 fi
-codec="zstd_fallback"  # Spike 1: always use zstd in the worker
-echo "[train] codec (storage): ${codec}"
+# Codec selection. Default to hybrid when the dispatcher's
+# pre-requisites (zstd dict + .bin) are both present — the dispatcher's
+# safety net guarantees per-chunk output <= zstd×SAFETY_NET_THRESHOLD,
+# so hybrid is strictly >= zstd-22 at the 1 MB chunk size the worker
+# passes. Set ENABLE_HYBRID_CODEC=0 to force the legacy zstd_fallback
+# path (useful while rolling back a bad model).
+ENABLE_HYBRID_CODEC="${ENABLE_HYBRID_CODEC:-1}"
+if [ "${ENABLE_HYBRID_CODEC}" = "1" ] && [ -n "$DICT_PATH" ] && [ -f "$DICT_PATH" ]; then
+  codec="hybrid"
+else
+  codec="zstd_fallback"
+fi
+# Chunk size passed to `l3tc hybrid-compress` at storage time. 1 MB
+# matches the real-data benchmark in RUST_DISPATCHER_BENCH.md where
+# dispatcher beat whole-file zstd by 7.9% on prose and 20.1% on logs.
+# 64 KB (the Rust default) is too small — windowed codecs fragment.
+CHUNK_SIZE_BYTES="${CHUNK_SIZE_BYTES:-1048576}"
+echo "[train] codec (storage): ${codec}  (chunk_size_bytes=${CHUNK_SIZE_BYTES})"
 echo "[train] would_have_beaten_zstd: ${would_have_beaten_zstd}"
+
+# ------- Convert .pth -> Rust .bin (Tier 1 neural codec input) -------
+# The compression worker's hybrid path loads the Rust `.bin` at
+# runtime to run the neural codec per chunk. convert_checkpoint.py
+# applies HiRA merge, reshapes time_mix, and writes the flat Rust
+# binary format.
+#
+# Non-fatal: a conversion failure leaves the .bin absent, the
+# compression_worker skips neural and runs classical-only hybrid.
+# Logged loudly so operators can investigate.
+BIN_PATH="$MODEL_DIR/v${VERSION}.bin"
+# convert_checkpoint.py takes a --config .py file but only reads it
+# for diagnostic prints. Emit a stub from the training env vars so
+# the script runs unchanged.
+CONFIG_STUB="$MODEL_DIR/convert_config_stub.py"
+cat > "$CONFIG_STUB" <<PYEOF
+# Auto-generated stub for convert_checkpoint.py diagnostics.
+num_hidden_layer = ${NUM_LAYERS}
+hidden_size = ${HIDDEN_SIZE}
+intermediate_size = $(( HIDDEN_SIZE * 4 ))
+rwkv_rank = 0
+PYEOF
+if python /app/scripts/convert_checkpoint.py \
+    --input "$CHECKPOINT" \
+    --config "$CONFIG_STUB" \
+    --output "$BIN_PATH" 2>&1 | tee /tmp/convert.log; then
+  echo "[train] Rust .bin written: $(wc -c < "$BIN_PATH") B"
+else
+  echo "[train] WARN: convert_checkpoint.py failed; no .bin artifact"
+  tail -5 /tmp/convert.log 2>/dev/null | sed 's/^/  /'
+  BIN_PATH=""
+fi
 
 # ------- Zstd dictionary training (Tier 1 hybrid codec input) -------
 # Train a per-dataset zstd dictionary on the same train corpus. The
@@ -318,6 +366,10 @@ if [ -n "$DICT_PATH" ] && [ -f "$DICT_PATH" ]; then
   aws s3 cp "$DICT_PATH" \
       "s3://${BUCKET_NAME}/${S3_MODEL_PREFIX}v${VERSION}.zstd_dict" --only-show-errors
 fi
+if [ -n "$BIN_PATH" ] && [ -f "$BIN_PATH" ]; then
+  aws s3 cp "$BIN_PATH" \
+      "s3://${BUCKET_NAME}/${S3_MODEL_PREFIX}v${VERSION}.bin" --only-show-errors
+fi
 
 trained_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 # Pull bytes/token from the SPM report if present (it writes
@@ -343,6 +395,8 @@ cat > "$MODEL_DIR/metadata.json" <<EOF
   "sample_mb": ${SAMPLE_MB_ARG},
   "bytes_per_token": ${bytes_per_token},
   "has_zstd_dict": $([ -n "$DICT_PATH" ] && [ -f "$DICT_PATH" ] && echo "true" || echo "false"),
+  "has_bin": $([ -n "$BIN_PATH" ] && [ -f "$BIN_PATH" ] && echo "true" || echo "false"),
+  "chunk_size_bytes": ${CHUNK_SIZE_BYTES},
   "trigger": "${TRIGGER}",
   "trained_at": "${trained_at}",
   "spike": "${SPIKE_NAME:-spike_2}"
