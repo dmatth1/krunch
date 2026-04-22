@@ -107,6 +107,13 @@ def main() -> None:
         intermediate_size=args.intermediate_size, rwkv_rank=args.rwkv_rank,
     )
     model = model.to(args.device)
+    # eval() disables dropout; we still call the model with train=True
+    # because the vendor RWKV_TC_HIRA.forward() routes train=False to
+    # forward_test() which has a 4-arg signature (input_token,
+    # output_token, output_types, criterion) that expects a different
+    # input shape. Under no_grad + eval, train=True gives us the same
+    # logits with no dropout noise and no gradient tracking.
+    model.eval()
 
     total_neg_log2 = 0.0
     total_positions = 0
@@ -117,15 +124,16 @@ def main() -> None:
             tgt = torch.tensor(seg[1:], dtype=torch.long, device=args.device).unsqueeze(0)
 
             # Forward pass: expected output shape (1, seq, vocab).
-            # Vendor L3TC's `RWKV_TC_HIRA.forward(input_token,
-            # input_types, train=...)` changed upstream to require the
-            # `input_types` positional arg. Our measurement pass has
-            # no per-token type info, so pass zeros — the trainer
-            # builds per-token types from the SPM piece class but for
-            # held-out entropy measurement the approximation is
-            # inconsequential. train=False runs the pure logits path.
+            # Mirror the trainer's call exactly — model(input_token,
+            # input_types, train=True). Setting train=False routes to
+            # forward_test() which has a different 4-arg signature
+            # (input_token, output_token, output_types, criterion) and
+            # expects a 3-D input tensor; passing our 2-D tensor
+            # crashes with "Dimension out of range" at flatten(1, 2).
+            # train=True keeps us on the forward_train path whose
+            # shape expectations match what we're feeding it.
             input_types = torch.zeros_like(inp)
-            out = model(inp, input_types, train=False)
+            out = model(inp, input_types, train=True)
             if isinstance(out, (tuple, list)):
                 out = out[0]
             logits = out  # (1, seq, vocab)

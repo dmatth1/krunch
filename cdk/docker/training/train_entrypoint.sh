@@ -332,13 +332,28 @@ fi
 DICT_PATH="$MODEL_DIR/v${VERSION}.zstd_dict"
 # Maxdict 112KB matches zstd's default target (128 KB - header).
 # Larger dicts don't consistently help; smaller ones undertrain.
-if zstd --train "$MODEL_DIR/train.txt" -o "$DICT_PATH" --maxdict=112640 -q 2>/tmp/dict.stderr; then
+#
+# zstd --train requires MANY sample files; it errors with
+# "Error 14: nb of samples too low" when given a single file (seen
+# on the first spike-3 run 2026-04-22). Split the corpus into 64 KB
+# chunks first so zstd sees enough samples to learn the pattern
+# distribution. 64 KB is small enough to get thousands of samples
+# from any realistic corpus and big enough to capture multi-token
+# patterns.
+ZSTD_SAMPLES_DIR="$MODEL_DIR/zstd_samples"
+mkdir -p "$ZSTD_SAMPLES_DIR"
+split -b 64K -a 5 "$MODEL_DIR/train.txt" "$ZSTD_SAMPLES_DIR/s_" 2>/dev/null
+sample_count=$(ls "$ZSTD_SAMPLES_DIR" | wc -l)
+echo "[train] zstd dict: $sample_count samples from train.txt"
+if zstd --train "$ZSTD_SAMPLES_DIR"/s_* -o "$DICT_PATH" --maxdict=112640 -q 2>/tmp/dict.stderr; then
   echo "[train] zstd dict trained: $(wc -c < "$DICT_PATH") B"
 else
   echo "[train] WARN: zstd dict training failed; continuing without"
   cat /tmp/dict.stderr 2>/dev/null | tail -5 | sed 's/^/  /'
   DICT_PATH=""
 fi
+# Clean up split samples so they don't eat disk space.
+rm -rf "$ZSTD_SAMPLES_DIR"
 
 # ------- Codec selection -------
 # Default to hybrid when the dispatcher's pre-requisites (zstd dict)
