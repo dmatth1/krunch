@@ -103,15 +103,20 @@ export class CompressionStack extends cdk.Stack {
         image,
         cpu: 2048, // 2 vCPU — zstd-22 is single-threaded but this gives the OS room and cuts compression walltime by ~30% in practice
         memoryLimitMiB: 4096,
-        // min=1 on purpose: the default queue-depth scale-in metric
-        // (ApproximateNumberOfMessagesVisible) drops to 0 the moment
-        // a worker pulls a message (message becomes in-flight), which
-        // triggered scale-in and killed compression mid-job during
-        // Spike 1. $0.08/hr idle is cheap enough for pre-MVP; in
-        // prod we'd use a MathExpression that sums visible + in-flight
-        // and only scales to 0 when both are 0. See PRODUCTION_TODO
-        // item for the proper fix.
-        minScalingCapacity: 1,
+        // min=0 is now safe: the worker calls the ECS task-protection
+        // endpoint (PUT $ECS_AGENT_URI/task-protection/v1/state) with
+        // ProtectionEnabled=true for the lifetime of each SQS message,
+        // and clears it on completion. ECS refuses scale-in on
+        // protected tasks regardless of what the auto-scaler decides,
+        // so the old Visible-drops-to-0-mid-job bug can't kill work
+        // in flight any more. The scaler goes back to the simple
+        // "Visible > 0 → scale up; Visible = 0 → scale toward min"
+        // pattern, but with the protection flag gating actual
+        // termination. $0 idle, no custom metric.
+        //
+        // See AWS docs: Protect your Amazon ECS tasks from being
+        // terminated by scale-in events.
+        minScalingCapacity: 0,
         maxScalingCapacity: 4,
         // VPC has no NAT gateway, so tasks need public IPs to reach ECR / S3 over the internet.
         assignPublicIp: true,
@@ -126,7 +131,6 @@ export class CompressionStack extends cdk.Stack {
           MODEL_VERSIONS_TABLE_NAME: props.modelVersionsTable.tableName,
         },
         scalingSteps: [
-          { upper: 0, change: 0 },   // queue empty → no scale-in beyond the minimum (min=1 already)
           { lower: 1, change: +1 },
           { lower: 10, change: +2 },
         ],

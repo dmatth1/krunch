@@ -25,6 +25,8 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -362,6 +364,44 @@ def process_message(body: dict) -> None:
     work.rmdir()
 
 
+def set_task_protection(enabled: bool, expires_minutes: int = 60) -> None:
+    """Tell the ECS agent whether this task is currently processing.
+
+    When enabled, ECS refuses scale-in requests against this task
+    regardless of what the auto-scaler says. That lets us run the
+    compression service at min=0 / max=N without the SQS scale-in-
+    based-on-Visible race killing tasks mid-job (see
+    cdk/lib/compression-stack.ts comment for the background).
+
+    Works via the agent endpoint at $ECS_AGENT_URI; Fargate platform
+    1.4.0+ injects the env var automatically. Outside Fargate (local
+    testing) the env var is absent and this is a no-op.
+
+    Failures are logged and swallowed: if protection can't be set we'd
+    rather finish the message than drop it, and a scale-in during
+    processing is recoverable via the SQS redrive-policy.
+    """
+    agent_uri = os.environ.get("ECS_AGENT_URI")
+    if not agent_uri:
+        return
+    body: dict = {"ProtectionEnabled": enabled}
+    if enabled:
+        body["ExpiresInMinutes"] = expires_minutes
+    url = f"{agent_uri}/task-protection/v1/state"
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="PUT",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            payload = resp.read().decode("utf-8", errors="replace")
+            print(f"[worker] task-protection={enabled}: {payload}")
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        print(f"[worker] WARN: task-protection={enabled} request failed: {e}")
+
+
 def get_queue_url() -> str:
     """Find the compression queue URL via several env-var conventions.
 
@@ -392,6 +432,13 @@ def main() -> None:
             continue
 
         for msg in msgs:
+            # Mark the task protected for the lifetime of this
+            # message. ECS honors the flag by refusing scale-in on
+            # this task even when the auto-scaler wants to drop
+            # desired=0 because Visible=0 in the queue. 60 min is a
+            # dead-man's-switch: if we crash between setting
+            # protection and clearing it, the flag expires naturally.
+            set_task_protection(True, expires_minutes=60)
             try:
                 body = json.loads(msg["Body"])
                 process_message(body)
@@ -403,6 +450,10 @@ def main() -> None:
                 import traceback
                 traceback.print_exc()
                 time.sleep(5)
+            finally:
+                # Clear protection so the auto-scaler can scale to 0
+                # once the queue drains.
+                set_task_protection(False)
 
 
 if __name__ == "__main__":
