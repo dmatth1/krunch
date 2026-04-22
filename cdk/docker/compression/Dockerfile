@@ -53,9 +53,15 @@ ENV BZIP3_INCLUDE_DIR=/usr/include \
 
 WORKDIR /src
 COPY l3tc-rust /src/l3tc-rust
-# Build the release binary. `--no-default-features` drops the
-# install-models machinery (ureq/tar/sha2) which the server-side
-# worker doesn't need, shaving ~3 MB off the binary.
+# Build the release binary tuned for the target CPU. Without
+# RUSTFLAGS the Rust toolchain emits generic armv8-a code; on
+# Graviton3 (which is what Fargate ARM = neoverse-v1) that leaves
+# 3-5x performance on the table for matrixmultiply's NEON kernel.
+# Specifying target-cpu=neoverse-v1 unlocks the chip-specific SIMD
+# intrinsics path. Verified 2026-04-22 after a 5 MB enwik8 hybrid run
+# came in at 15 KB/s on Fargate vs ~150 KB/s on M-series — most of
+# the gap was generic vs tuned codegen.
+ENV RUSTFLAGS="-C target-cpu=neoverse-v1"
 RUN cd l3tc-rust \
  && cargo build --release --bin l3tc \
  && strip target/release/l3tc \

@@ -108,8 +108,13 @@ export class CompressionStack extends cdk.Stack {
         cluster,
         queue: props.compressionQueue as sqs.Queue,
         image,
-        cpu: 2048, // 2 vCPU — zstd-22 is single-threaded but this gives the OS room and cuts compression walltime by ~30% in practice
-        memoryLimitMiB: 4096,
+        // 4 vCPU + 8 GB. The dispatcher now par_iter()s over chunks
+        // (commit 2026-04-22) so neural compression scales with cores;
+        // doubling from 2->4 vCPU was the second-largest win in the
+        // M-series-vs-Fargate-Graviton speed gap diagnosis. 8 GB is
+        // the minimum Fargate allows at 4 vCPU.
+        cpu: 4096,
+        memoryLimitMiB: 8192,
         // Graviton ARM64 Fargate. The l3tc-rust neural codec uses
         // the `matrixmultiply` crate's NEON SIMD path; on x86 Fargate
         // we saw ~10 min wall-clock on a 5 MB / 200K-param hybrid run,

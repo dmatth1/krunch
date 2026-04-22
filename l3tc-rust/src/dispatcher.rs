@@ -633,6 +633,8 @@ pub fn encode_blob(
     );
     assert!(chunk_size > 0 && chunk_size <= u32::MAX as usize);
 
+    use rayon::prelude::*;
+
     let start = Instant::now();
     let mut out = Vec::with_capacity(input.len() / 4);
     let mut stats = DispatchStats::default();
@@ -645,11 +647,29 @@ pub fn encode_blob(
     let chunk_count_pos = out.len();
     out.write_u32::<BigEndian>(0)?; // placeholder
 
-    // Walk chunks.
-    let mut chunk_ct: u32 = 0;
-    for chunk in input.chunks(chunk_size) {
-        let outcome = dispatch_chunk(chunk, codecs)?;
+    // Run dispatch_chunk in parallel across chunks. The neural codec
+    // is the dominant per-chunk cost (multi-second on a 1 MB chunk
+    // even with NEON SIMD), and the chunks are independent — perfect
+    // rayon target. par_chunks preserves input order so the BLOB
+    // is bit-identical to a sequential walk; tests cover this.
+    //
+    // Note: dispatch_chunk itself is also internally parallel for
+    // some codecs (codec.rs's `compress` uses par_iter over
+    // segments), so we have two layers of rayon. Rayon's work-
+    // stealing handles nesting fine in practice; on a 4 vCPU
+    // Fargate task with 5 chunks this lights up all 4 cores at
+    // chunk-level + spills to the next chunk when one finishes.
+    let chunks_vec: Vec<&[u8]> = input.chunks(chunk_size).collect();
+    let outcomes: Result<Vec<ChunkOutcome>> = chunks_vec
+        .par_iter()
+        .map(|chunk| dispatch_chunk(chunk, codecs))
+        .collect();
+    let outcomes = outcomes?;
 
+    // Sequential framing + stats. Cheap relative to the parallel
+    // encode work above.
+    let mut chunk_ct: u32 = 0;
+    for (chunk, outcome) in chunks_vec.iter().zip(outcomes.iter()) {
         out.write_u8(outcome.tag as u8)?;
         out.write_u32::<BigEndian>(outcome.bytes.len() as u32)?;
         out.write_all(&outcome.bytes)?;
