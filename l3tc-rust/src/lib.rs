@@ -52,8 +52,9 @@ pub mod tensor;
 pub mod tokenizer;
 
 pub use dispatcher::{
-    decode_blob as hybrid_decode, encode_blob as hybrid_encode, Bzip3Codec, Codec, CodecTag,
-    DispatchStats, Lz4Codec, PassthroughCodec, Zstd22Codec, ZstdDictCodec, DEFAULT_CHUNK_SIZE,
+    decode_blob as hybrid_decode, encode_blob as hybrid_encode, Bzip3Codec, ClpStub, Codec,
+    CodecTag, DispatchStats, Lz4Codec, NeuralCodec, PassthroughCodec, Zstd22Codec, ZstdDictCodec,
+    DEFAULT_CHUNK_SIZE,
 };
 
 pub use backend::{Backend, GPU_AUTO_THRESHOLD_BYTES};

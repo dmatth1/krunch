@@ -25,9 +25,12 @@
 
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{self, Cursor, Read, Write};
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::error::{Error, Result};
+use crate::rwkv::Model;
+use crate::tokenizer::Tokenizer;
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -315,6 +318,120 @@ impl Codec for Lz4Codec {
             message: e.to_string(),
         })?;
         Ok(out)
+    }
+}
+
+// --- CLP stub (Tier 1+ placeholder) ------------------------------------------
+
+/// Placeholder CLP codec. Reserves the `Clp` tag and the codec-menu
+/// slot so we can ship a dispatcher build that's forward-compatible
+/// with templated-log blobs written by a future binary, but `encode`
+/// intentionally fails with `NotImplemented` so the dispatcher's
+/// shortest-pick will never actually select it.
+///
+/// Replace with a real CLP IR + per-column zstd port (estimated
+/// 3-5 days) before claiming log-archive parity vs YScope CLP Cloud.
+pub struct ClpStub;
+
+impl Codec for ClpStub {
+    fn tag(&self) -> CodecTag {
+        CodecTag::Clp
+    }
+
+    fn encode(&self, _input: &[u8]) -> Result<Vec<u8>> {
+        // Return a well-formed byte string longer than any input so
+        // the dispatcher's shortest-pick won't choose us. We can't
+        // return an error without either (a) adding per-codec error
+        // tolerance to `dispatch_chunk` or (b) aborting the whole
+        // blob. The inflated-output escape is the same trick the
+        // neural adapter uses for non-UTF-8 input.
+        Ok(vec![0u8; _input.len().saturating_add(64)])
+    }
+
+    fn decode(&self, _input: &[u8]) -> Result<Vec<u8>> {
+        // We _do_ want decode to surface a clear error — a real CLP-
+        // encoded chunk from a future binary must not silently fall
+        // through. Callers get a readable "not yet implemented"
+        // message rather than corrupted output.
+        Err(Error::NotImplemented(
+            "CLP decode not implemented; upgrade the binary",
+        ))
+    }
+}
+
+// --- Neural (RWKV + SPM + arithmetic coding) ---------------------------------
+
+/// Neural codec backed by the existing single-file pipeline in
+/// `crate::codec`. The neural path compresses UTF-8 text; chunks that
+/// aren't valid UTF-8 get an inflated output so the dispatcher's
+/// shortest-pick rule naturally skips them (no dispatcher-level
+/// error handling needed).
+///
+/// Round-trip correctness is covered by the existing `codec.rs`
+/// tests plus the CLI-level hybrid round-trip (see
+/// `src/bin/l3tc/main.rs`). This adapter adds no new logic beyond
+/// wiring the Codec trait to `compress` / `decompress_bytes`.
+pub struct NeuralCodec {
+    tokenizer: Arc<Tokenizer>,
+    model: Arc<Model>,
+    /// Model-ID byte written into the inner-codec header. Per-dataset
+    /// models use `0` since there's only one model per archive.
+    model_id: u8,
+    /// Segment size passed down to `codec::compress`. Kept small so
+    /// the model state reset cost doesn't dominate on our 64 KB
+    /// dispatcher chunks.
+    segment_bytes: usize,
+}
+
+impl NeuralCodec {
+    /// Build a neural codec from a loaded tokenizer + model. Both are
+    /// held by `Arc` so the codec is cheap to clone into the
+    /// dispatcher's `Box<dyn Codec>` list.
+    pub fn new(tokenizer: Arc<Tokenizer>, model: Arc<Model>) -> Self {
+        Self {
+            tokenizer,
+            model,
+            model_id: 0,
+            segment_bytes: crate::codec::DEFAULT_SEGMENT_BYTES,
+        }
+    }
+
+    /// Override the default segment size. Useful when the dispatcher's
+    /// chunk size is unusually small and the default 4 KB segments
+    /// fragment the chunk too aggressively.
+    pub fn with_segment_bytes(mut self, n: usize) -> Self {
+        self.segment_bytes = n;
+        self
+    }
+}
+
+impl Codec for NeuralCodec {
+    fn tag(&self) -> CodecTag {
+        CodecTag::Neural
+    }
+
+    fn encode(&self, input: &[u8]) -> Result<Vec<u8>> {
+        // Neural path is UTF-8-only. If a non-UTF-8 chunk gets here
+        // (e.g. a mixed-content chunk that slipped past the
+        // magic-byte prescreen), emit an output larger than the
+        // input so `dispatch_chunk` picks something else. Cheaper
+        // and simpler than wiring per-codec error tolerance through
+        // the dispatcher.
+        let text = match std::str::from_utf8(input) {
+            Ok(s) => s,
+            Err(_) => return Ok(vec![0u8; input.len().saturating_add(64)]),
+        };
+        crate::codec::compress(
+            text,
+            &self.tokenizer,
+            &self.model,
+            self.segment_bytes,
+            self.model_id,
+        )
+    }
+
+    fn decode(&self, input: &[u8]) -> Result<Vec<u8>> {
+        crate::codec::decompress_bytes(input, &self.tokenizer, &self.model)
     }
 }
 

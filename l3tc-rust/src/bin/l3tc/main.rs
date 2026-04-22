@@ -32,11 +32,15 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use l3tc::{
-    audit_compress, decode_writer, decompress_bytes, dump_teacher, encode_reader, profile_compress,
-    AuditStats, Checkpoint, Model, ProfileStats, Tokenizer, DEFAULT_SEGMENT_BYTES,
+    audit_compress, decode_writer, decompress_bytes, dump_teacher, encode_reader, hybrid_decode,
+    hybrid_encode, profile_compress, AuditStats, Bzip3Codec, Checkpoint, ClpStub, Codec,
+    DispatchStats, Lz4Codec, Model, NeuralCodec, PassthroughCodec, ProfileStats, Tokenizer,
+    Zstd22Codec, ZstdDictCodec, DEFAULT_CHUNK_SIZE, DEFAULT_SEGMENT_BYTES,
 };
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Instant;
 
 // Phase 14 modules: live next to the CLI because their semantics
@@ -153,6 +157,82 @@ enum Command {
         #[arg(long, default_value = "auto")]
         backend: String,
     },
+    /// Compress a file with the hybrid codec dispatcher.
+    ///
+    /// Splits the input into fixed-size chunks, probes every enabled
+    /// codec on each, and writes a tagged blob with per-chunk codec
+    /// selection. Reads `--model` + `--tokenizer` if supplied (neural
+    /// path); reads `--zstd-dict` if supplied (dictionary-backed zstd
+    /// path). With neither, runs classical-only (zstd, bzip3, lz4,
+    /// passthrough).
+    ///
+    /// Prints per-run stats (bytes in/out, per-codec breakdown,
+    /// savings vs zstd shadow, throughput, safety-net count) to
+    /// stderr on completion. With `--stats <path>`, also writes the
+    /// same stats as JSON to that path — consumed by the service-
+    /// side compression_worker.py to emit CloudWatch EMF metrics.
+    HybridCompress {
+        /// Input file to compress.
+        input: PathBuf,
+        /// Output path for the hybrid blob. Defaults to `<input>.l3h`.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Optional path to a per-dataset RWKV model binary. Pair
+        /// with `--tokenizer`. When supplied the dispatcher includes
+        /// the neural codec in the probe menu.
+        #[arg(long)]
+        model: Option<PathBuf>,
+        /// Optional path to the SentencePiece tokenizer that matches
+        /// `--model`. Must be supplied iff `--model` is.
+        #[arg(long)]
+        tokenizer: Option<PathBuf>,
+        /// Optional path to a zstd dictionary trained on the target
+        /// dataset (e.g. the `.zstd_dict` artifact emitted by the
+        /// training job). Enables the `ZstdDict` codec in the probe
+        /// menu.
+        #[arg(long)]
+        zstd_dict: Option<PathBuf>,
+        /// Uncompressed bytes per chunk. Smaller = finer-grained
+        /// per-chunk codec selection; larger = more room for zstd's
+        /// sliding window. Default matches `DEFAULT_CHUNK_SIZE`.
+        #[arg(long, default_value_t = DEFAULT_CHUNK_SIZE)]
+        chunk_size: usize,
+        /// Write per-run stats as JSON to this path. When omitted,
+        /// stats are printed to stderr only (still available via
+        /// tee / redirect).
+        #[arg(long)]
+        stats: Option<PathBuf>,
+    },
+
+    /// Decompress a hybrid blob produced by `hybrid-compress`.
+    ///
+    /// The blob carries a codec tag per chunk; the decoder dispatches
+    /// each chunk to its tag's codec. `--model` / `--tokenizer` /
+    /// `--zstd-dict` must be supplied iff the blob used that codec
+    /// (e.g. skip `--model` on a classical-only blob). Decoding a
+    /// chunk whose codec isn't in the registry returns a clear
+    /// error rather than silently producing bad output.
+    HybridDecompress {
+        /// Input hybrid blob.
+        input: PathBuf,
+        /// Output path. Defaults to `<input>` with `.l3h` stripped.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Optional path to the RWKV model used during
+        /// hybrid-compress. Required if the blob includes any
+        /// neural-tagged chunks.
+        #[arg(long)]
+        model: Option<PathBuf>,
+        /// Optional path to the tokenizer paired with `--model`.
+        #[arg(long)]
+        tokenizer: Option<PathBuf>,
+        /// Optional path to the zstd dictionary used during
+        /// hybrid-compress. Required if the blob includes any
+        /// `ZstdDict`-tagged chunks.
+        #[arg(long)]
+        zstd_dict: Option<PathBuf>,
+    },
+
     /// Phase 4a debug: dump per-token logits to a binary file for
     /// numerical diff against the Python L3TC reference. Reads the
     /// first `--max-tokens` of `--input` (after tokenizing the
@@ -495,6 +575,36 @@ fn main() -> ExitCode {
             verbose,
             time,
             &backend,
+        ),
+        Command::HybridCompress {
+            input,
+            output,
+            model,
+            tokenizer,
+            zstd_dict,
+            chunk_size,
+            stats,
+        } => run_hybrid_compress(
+            &input,
+            output.as_deref(),
+            model.as_deref(),
+            tokenizer.as_deref(),
+            zstd_dict.as_deref(),
+            chunk_size,
+            stats.as_deref(),
+        ),
+        Command::HybridDecompress {
+            input,
+            output,
+            model,
+            tokenizer,
+            zstd_dict,
+        } => run_hybrid_decompress(
+            &input,
+            output.as_deref(),
+            model.as_deref(),
+            tokenizer.as_deref(),
+            zstd_dict.as_deref(),
         ),
         Command::DumpLogits {
             input,
@@ -1459,6 +1569,218 @@ fn load_model(path: &Path) -> Result<Model> {
     let mut ckpt =
         Checkpoint::load(path).with_context(|| format!("loading checkpoint {path:?}"))?;
     Model::from_checkpoint(&mut ckpt).with_context(|| "building model from checkpoint")
+}
+
+/// Assemble the dispatcher codec menu based on which optional assets
+/// the caller supplied. `Zstd22` is unconditional (it's the
+/// safety-net reference). Neural joins the menu iff both model and
+/// tokenizer loaded; `ZstdDict` joins iff a dictionary was loaded;
+/// `Clp` is always present as the stub (it can never actually win
+/// the shortest-pick race — see `ClpStub` docs).
+fn build_hybrid_codecs(
+    model: Option<Arc<Model>>,
+    tokenizer: Option<Arc<Tokenizer>>,
+    zstd_dict: Option<Vec<u8>>,
+) -> Vec<Box<dyn Codec>> {
+    let mut codecs: Vec<Box<dyn Codec>> = vec![
+        Box::new(PassthroughCodec),
+        Box::new(Lz4Codec),
+        Box::new(Zstd22Codec),
+        Box::new(Bzip3Codec),
+        Box::new(ClpStub),
+    ];
+    if let Some(dict) = zstd_dict {
+        codecs.push(Box::new(ZstdDictCodec::new(dict)));
+    }
+    if let (Some(m), Some(t)) = (model, tokenizer) {
+        codecs.push(Box::new(NeuralCodec::new(t, m)));
+    }
+    codecs
+}
+
+/// Load `model_path` + `tokenizer_path` into Arc-wrapped references
+/// so multiple Codec instances can share them. Both paths are
+/// validated together — supplying one without the other is an
+/// argument error.
+fn load_hybrid_neural(
+    model_path: Option<&Path>,
+    tokenizer_path: Option<&Path>,
+) -> Result<(Option<Arc<Model>>, Option<Arc<Tokenizer>>)> {
+    match (model_path, tokenizer_path) {
+        (None, None) => Ok((None, None)),
+        (Some(m), Some(t)) => {
+            let model = load_model(m)?;
+            let tok = Tokenizer::load(t)
+                .with_context(|| format!("loading tokenizer {t:?}"))?;
+            Ok((Some(Arc::new(model)), Some(Arc::new(tok))))
+        }
+        _ => Err(anyhow::anyhow!(
+            "--model and --tokenizer must be supplied together"
+        )),
+    }
+}
+
+/// Serialize `DispatchStats` to the JSON shape the service-side
+/// `compression_worker.py` expects when emitting CloudWatch EMF
+/// metrics. Kept hand-rolled (no serde) since the crate already
+/// avoids serde in the library path for binary-size reasons, and
+/// the shape is small + stable.
+fn dispatch_stats_json(stats: &DispatchStats) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(512);
+    s.push_str("{\n");
+    writeln!(s, "  \"bytes_in\": {},", stats.bytes_in).unwrap();
+    writeln!(s, "  \"bytes_out\": {},", stats.bytes_out).unwrap();
+    writeln!(s, "  \"chunks_total\": {},", stats.chunks_total).unwrap();
+    writeln!(s, "  \"zstd_shadow_bytes\": {},", stats.zstd_shadow_bytes).unwrap();
+    writeln!(s, "  \"ratio\": {:.6},", stats.ratio()).unwrap();
+    writeln!(
+        s,
+        "  \"zstd_shadow_ratio\": {:.6},",
+        stats.zstd_shadow_ratio()
+    )
+    .unwrap();
+    writeln!(
+        s,
+        "  \"savings_vs_zstd_pct\": {:.4},",
+        stats.savings_vs_zstd_pct()
+    )
+    .unwrap();
+    writeln!(
+        s,
+        "  \"throughput_mb_per_sec\": {:.4},",
+        stats.throughput_mb_per_sec()
+    )
+    .unwrap();
+    writeln!(
+        s,
+        "  \"safety_net_substitutions\": {},",
+        stats.safety_net_substitutions
+    )
+    .unwrap();
+    writeln!(s, "  \"encode_seconds\": {:.6},", stats.encode_seconds).unwrap();
+    // Per-codec byte counts. Emit as a nested object keyed by codec
+    // name. We sort keys so the emitted JSON is deterministic between
+    // runs — makes EMF dimension values stable for the metric query.
+    let mut tags: Vec<&&'static str> = stats.per_codec_bytes.keys().collect();
+    tags.sort();
+    s.push_str("  \"per_codec_bytes\": {");
+    for (i, tag) in tags.iter().enumerate() {
+        if i > 0 {
+            s.push_str(", ");
+        }
+        write!(s, "\"{}\": {}", tag, stats.per_codec_bytes[*tag]).unwrap();
+    }
+    s.push_str("},\n");
+    let mut ctags: Vec<&&'static str> = stats.per_codec_chunks.keys().collect();
+    ctags.sort();
+    s.push_str("  \"per_codec_chunks\": {");
+    for (i, tag) in ctags.iter().enumerate() {
+        if i > 0 {
+            s.push_str(", ");
+        }
+        write!(s, "\"{}\": {}", tag, stats.per_codec_chunks[*tag]).unwrap();
+    }
+    s.push_str("}\n");
+    s.push('}');
+    s
+}
+
+fn run_hybrid_compress(
+    input: &Path,
+    output: Option<&Path>,
+    model_path: Option<&Path>,
+    tokenizer_path: Option<&Path>,
+    zstd_dict_path: Option<&Path>,
+    chunk_size: usize,
+    stats_path: Option<&Path>,
+) -> Result<()> {
+    let input_bytes = fs::read(input)
+        .with_context(|| format!("reading input {input:?}"))?;
+
+    let (model, tokenizer) = load_hybrid_neural(model_path, tokenizer_path)?;
+    let dict_bytes: Option<Vec<u8>> = match zstd_dict_path {
+        Some(p) => Some(fs::read(p).with_context(|| format!("reading zstd dict {p:?}"))?),
+        None => None,
+    };
+
+    let codecs = build_hybrid_codecs(model, tokenizer, dict_bytes);
+
+    let (blob, stats) = hybrid_encode(&input_bytes, &codecs, chunk_size)
+        .with_context(|| "hybrid_encode failed")?;
+
+    let out_path = output
+        .map(PathBuf::from)
+        .unwrap_or_else(|| input.with_extension("l3h"));
+    fs::write(&out_path, &blob)
+        .with_context(|| format!("writing output {out_path:?}"))?;
+
+    // Human-readable stats on stderr so stdout stays clean for pipe-
+    // friendly machine consumption if we ever add it.
+    eprintln!(
+        "hybrid-compress: {} B in -> {} B out (ratio {:.4}, zstd-shadow {:.4}, \
+         savings vs zstd {:+.2}%, {} chunks, safety-net x{}, {:.2} MB/s)",
+        stats.bytes_in,
+        stats.bytes_out,
+        stats.ratio(),
+        stats.zstd_shadow_ratio(),
+        stats.savings_vs_zstd_pct(),
+        stats.chunks_total,
+        stats.safety_net_substitutions,
+        stats.throughput_mb_per_sec(),
+    );
+    let mut per_codec: Vec<(&&'static str, &u64)> = stats.per_codec_chunks.iter().collect();
+    per_codec.sort_by_key(|(k, _)| *k);
+    for (k, v) in per_codec {
+        let bytes = stats.per_codec_bytes.get(*k).copied().unwrap_or(0);
+        eprintln!("  codec {k:<12} chunks={v:>5}  bytes={bytes}");
+    }
+
+    if let Some(p) = stats_path {
+        fs::write(p, dispatch_stats_json(&stats))
+            .with_context(|| format!("writing stats json {p:?}"))?;
+    }
+
+    Ok(())
+}
+
+fn run_hybrid_decompress(
+    input: &Path,
+    output: Option<&Path>,
+    model_path: Option<&Path>,
+    tokenizer_path: Option<&Path>,
+    zstd_dict_path: Option<&Path>,
+) -> Result<()> {
+    let blob = fs::read(input).with_context(|| format!("reading input {input:?}"))?;
+
+    let (model, tokenizer) = load_hybrid_neural(model_path, tokenizer_path)?;
+    let dict_bytes: Option<Vec<u8>> = match zstd_dict_path {
+        Some(p) => Some(fs::read(p).with_context(|| format!("reading zstd dict {p:?}"))?),
+        None => None,
+    };
+
+    let codecs = build_hybrid_codecs(model, tokenizer, dict_bytes);
+
+    let decoded = hybrid_decode(&blob, &codecs).with_context(|| "hybrid_decode failed")?;
+
+    let out_path = output.map(PathBuf::from).unwrap_or_else(|| {
+        // Strip `.l3h` suffix if present; else append `.out`.
+        let s = input.to_string_lossy();
+        if let Some(stripped) = s.strip_suffix(".l3h") {
+            PathBuf::from(stripped)
+        } else {
+            input.with_extension("out")
+        }
+    });
+    fs::write(&out_path, &decoded)
+        .with_context(|| format!("writing output {out_path:?}"))?;
+    eprintln!(
+        "hybrid-decompress: {} B -> {} B written to {:?}",
+        blob.len(),
+        decoded.len(),
+        out_path,
+    );
+    Ok(())
 }
 
 /// Compress-side asset resolution.

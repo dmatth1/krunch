@@ -284,12 +284,40 @@ codec="zstd_fallback"  # Spike 1: always use zstd in the worker
 echo "[train] codec (storage): ${codec}"
 echo "[train] would_have_beaten_zstd: ${would_have_beaten_zstd}"
 
+# ------- Zstd dictionary training (Tier 1 hybrid codec input) -------
+# Train a per-dataset zstd dictionary on the same train corpus. The
+# dispatcher's `ZstdDict` codec uses this at compression time and
+# typically beats plain zstd on repetitive structured data (JSON,
+# logs with templates, near-duplicate documents).
+#
+# We emit it unconditionally alongside the model. The compression
+# worker downloads it iff the dataset's metadata.codec is "hybrid";
+# otherwise it sits in S3 unused and costs ~100 KB of storage.
+#
+# Failure here is non-fatal: if dict training errors out, we log and
+# continue — the dispatcher still works with the classical +
+# (eventually) neural codecs.
+DICT_PATH="$MODEL_DIR/v${VERSION}.zstd_dict"
+# Maxdict 112KB matches zstd's default target (128 KB - header).
+# Larger dicts don't consistently help; smaller ones undertrain.
+if zstd --train "$MODEL_DIR/train.txt" -o "$DICT_PATH" --maxdict=112640 -q 2>/tmp/dict.stderr; then
+  echo "[train] zstd dict trained: $(wc -c < "$DICT_PATH") B"
+else
+  echo "[train] WARN: zstd dict training failed; continuing without"
+  cat /tmp/dict.stderr 2>/dev/null | tail -5 | sed 's/^/  /'
+  DICT_PATH=""
+fi
+
 # ------- Upload artifacts -------
 echo "[train] uploading artifacts to s3://${BUCKET_NAME}/${S3_MODEL_PREFIX}..."
 aws s3 cp "$CHECKPOINT" \
     "s3://${BUCKET_NAME}/${S3_MODEL_PREFIX}v${VERSION}.pth" --only-show-errors
 aws s3 cp "$MODEL_DIR/spm.model" \
     "s3://${BUCKET_NAME}/${S3_MODEL_PREFIX}v${VERSION}.tokenizer.model" --only-show-errors
+if [ -n "$DICT_PATH" ] && [ -f "$DICT_PATH" ]; then
+  aws s3 cp "$DICT_PATH" \
+      "s3://${BUCKET_NAME}/${S3_MODEL_PREFIX}v${VERSION}.zstd_dict" --only-show-errors
+fi
 
 trained_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 # Pull bytes/token from the SPM report if present (it writes
@@ -314,6 +342,7 @@ cat > "$MODEL_DIR/metadata.json" <<EOF
   "batch_size": ${BATCH_SIZE},
   "sample_mb": ${SAMPLE_MB_ARG},
   "bytes_per_token": ${bytes_per_token},
+  "has_zstd_dict": $([ -n "$DICT_PATH" ] && [ -f "$DICT_PATH" ] && echo "true" || echo "false"),
   "trigger": "${TRIGGER}",
   "trained_at": "${trained_at}",
   "spike": "${SPIKE_NAME:-spike_2}"
