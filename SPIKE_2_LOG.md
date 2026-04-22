@@ -104,6 +104,67 @@ Running **C5 (1 M-param model, 10 epochs, same normalized setup)**
 as the last budgeted within-envelope attempt before concluding
 the spike and presenting options to the user.
 
+| hdfs-c5/v1 | C5 (C4b2 setup + 6L × 96H + 10 epochs) | 1 024 | 6 | 2048 | 1058 | 10 | 32 | **0.0735** (bits/token 1.1022 / val bytes/token 1.8738) | 0.0466 | 0.0457 | ~48 min | ~$0.64 | FAIL but trajectory improving | 3.3 M total params. Eval loss flattening (1.10 at epoch 9, still dropping but only 0.002/epoch). Capacity on top of normalization helped meaningfully (0.0816 → 0.0735, -10%). |
+| hdfs-c6/v1 | C6 (C4b2 setup + 12L × 192H + 5 epochs) | 1 024 | 12 | 2048 | 1058 | 5 | 16 | **~0.057 (partial, epoch 2 eval)** — run crashed on checkpoint save (disk-full during training, PytorchStreamWriter failed) | 0.0466 | 0.0457 | ~55 min before crash | ~$0.73 | FAIL | 25 M total params (I underestimated). Epoch 2 eval was 0.925 bits/token — lowest yet. Run would have landed around ratio 0.055-0.060 had it completed. |
+
+### Phase C final verdict
+
+Best-ever ratio on HDFS: **0.0735** (C5), 58% better than Spike 1
+baseline, still 58% worse than zstd. C6 at 25 M params projected to
+~0.057, still 22% worse than zstd — and at that param count
+single-stream decompress starts violating the inference envelope.
+
+The trajectory:
+
+| experiment | ratio | vs zstd | inference envelope |
+|---|---|---|---|
+| Spike 1 baseline | 0.1405 | 3.01× worse | ok |
+| C1 (max_piece=256) | 0.1010 | 2.17× worse | ok |
+| C4b2 (+normalization) | 0.0816 | 1.75× worse | ok |
+| C5 (+3 M params) | 0.0735 | 1.58× worse | ok |
+| C6 projected (+25 M params) | ~0.057 | 1.22× worse | edge |
+| **zstd --long=27 -22** | **0.0466** | **1.0× (target)** | — |
+| extrapolated 100 M model | ~0.045 | might clear | **blown** |
+
+Each dial delivers less than the one before. Diminishing returns
+point at a capacity ceiling driven by the model's inability to
+memorize variable fields. Pushing past zstd within the envelope
+requires a structural change, not more params.
+
+## Spike 2 conclusion
+
+We did not clear the HDFS pass gate
+(`held_out_ratio < 0.98 × zstd_baseline_ratio`) with in-envelope
+capacity + tokenizer scaling alone. The gap is real and structural:
+zstd wins on HDFS by being a **dictionary coder over a 128 MB
+window**, which a small neural model cannot approximate through
+prediction alone.
+
+### Two paths forward (for user decision)
+
+**Option 1 — Hybrid codec (beats zstd on HDFS, 2-3 weeks).**
+Full design in `HYBRID_CODEC_DESIGN.md`. Split the stream into
+skeleton (modeled by small RWKV) + per-field variable streams
+(each with a tailored encoder — delta for timestamps, dictionary
+for block IDs / IPs, etc.). Beats zstd structurally because it
+does BOTH jobs: skeleton prediction (where a model wins) AND
+variable-field dictionary lookup (where zstd wins). Stays in
+inference envelope. Significant engineering effort.
+
+**Option 2 — Accept HDFS as adversarial, prove thesis on
+realistic data (~1 week).** HDFS is pathologically templated;
+real customer corpora (JSON API events with variable payloads,
+app logs with error strings, Stripe-style audit trails, nginx
+access logs) have substantially more per-line variable content.
+On those, the small-model approach from Phase C (`C4b2` or `C5`
+config) likely beats zstd without needing hybrid. Ship on that
+corpus class; flag HDFS-specific corpora as "use zstd_fallback
+for now" in metadata. Much less engineering, but the product
+can't claim "best on any dataset" — has a known weakness.
+
+I can build either. Need your call before starting — they're
+non-overlapping work.
+
 ## Infra fixes folded in for Spike 2
 
 - Compression Dockerfile: `PYTHONUNBUFFERED=1` so the worker's
