@@ -78,24 +78,30 @@ head -c "$train_bytes" "$MODEL_DIR/corpus.txt" > "$MODEL_DIR/train.txt"
 tail -c +$(( train_bytes + 1 )) "$MODEL_DIR/corpus.txt" > "$MODEL_DIR/val.txt"
 echo "[train] train=$(wc -c < "$MODEL_DIR/train.txt")B val=$(wc -c < "$MODEL_DIR/val.txt")B"
 
-# Phase C4: variable-field normalization BEFORE SPM + RWKV training.
-# Replaces timestamps, block IDs, IPs, task/job IDs with fixed
-# placeholders so the SPM trainer sees a train-vs-val-invariant
-# skeleton. Both ratio measurement and zstd baseline use the
-# *normalized* val so the comparison is apples-to-apples; the side
-# channel cost (encoding the captured values) is an open question
-# addressed at the service level later.
+# Phase C4b: variable-field normalization — split approach.
+#
+# Train SPM on NORMALIZED corpus so it learns the template skeleton
+# as (relatively few) stable pieces, plus the placeholder tokens
+# <TS>/<BLKID>/<IP>/etc. Then tokenize + train the RWKV model on
+# the ORIGINAL (non-normalized) corpus. Variable values fall back
+# to byte-fallback or short-piece tokens; skeleton matches cleanly.
+#
+# This is close to how zstd works (template gets a short reference,
+# variable bytes are literals) but with a learned model that can
+# better predict the structure around variable values.
 if [ "${NORMALIZE_VARIABLE_FIELDS}" = "1" ]; then
-  echo "[train] normalizing variable fields (Phase C4)…"
-  mv "$MODEL_DIR/train.txt" "$MODEL_DIR/train.raw.txt"
-  mv "$MODEL_DIR/val.txt"   "$MODEL_DIR/val.raw.txt"
+  echo "[train] normalizing variable fields for SPM training (C4b)…"
   python /app/scripts/normalize_variable_fields.py \
-      --corpus "$MODEL_DIR/train.raw.txt" \
-      --out    "$MODEL_DIR/train.txt"
+      --corpus "$MODEL_DIR/train.txt" \
+      --out    "$MODEL_DIR/train.norm.txt"
   python /app/scripts/normalize_variable_fields.py \
-      --corpus "$MODEL_DIR/val.raw.txt" \
-      --out    "$MODEL_DIR/val.txt"
-  echo "[train] after normalize: train=$(wc -c < "$MODEL_DIR/train.txt")B val=$(wc -c < "$MODEL_DIR/val.txt")B"
+      --corpus "$MODEL_DIR/val.txt" \
+      --out    "$MODEL_DIR/val.norm.txt"
+  echo "[train] normalized: train=$(wc -c < "$MODEL_DIR/train.norm.txt")B val=$(wc -c < "$MODEL_DIR/val.norm.txt")B"
+  # SPM trains on normalized; RWKV trains on original.
+  SPM_TRAIN_CORPUS="$MODEL_DIR/train.norm.txt"
+else
+  SPM_TRAIN_CORPUS="$MODEL_DIR/train.txt"
 fi
 
 # Determine next model version by listing existing models in S3.
@@ -123,10 +129,10 @@ if [ "${SAMPLE_MB}" = "0" ]; then
 else
   SAMPLE_MB_ARG="${SAMPLE_MB}"
 fi
-echo "[train] training SPM tokenizer (vocab=${VOCAB_SIZE} unigram, domain=${DOMAIN}, sample_mb=${SAMPLE_MB_ARG}, max_piece_length=${MAX_PIECE_LENGTH})..."
+echo "[train] training SPM tokenizer (vocab=${VOCAB_SIZE} unigram, domain=${DOMAIN}, sample_mb=${SAMPLE_MB_ARG}, max_piece_length=${MAX_PIECE_LENGTH}, spm_corpus=${SPM_TRAIN_CORPUS})..."
 python /app/scripts/train_specialist_tokenizer.py \
     --domain "${DOMAIN}" \
-    --corpus "$MODEL_DIR/train.txt" \
+    --corpus "$SPM_TRAIN_CORPUS" \
     --output-dir "$MODEL_DIR" \
     --vocab-size "${VOCAB_SIZE}" \
     --max-piece-length "${MAX_PIECE_LENGTH}" \
