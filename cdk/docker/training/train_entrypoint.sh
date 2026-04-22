@@ -272,33 +272,17 @@ echo "[train]   held_out_ratio:  ${held_out_ratio}"
 echo "[train]   zstd-22 ratio:   ${zstd_baseline_ratio}"
 echo "[train] ==============================="
 
-# Decide codec. Spike 1 always uses zstd_fallback for actual storage
-# (we skip the .bin conversion) but records whether the L3TC model
-# *would* have won.
 would_have_beaten_zstd="false"
 if awk -v ours="$held_out_ratio" -v zstd="$zstd_baseline_ratio" \
      'BEGIN { exit !(ours > 0 && ours < zstd * 0.98) }'; then
   would_have_beaten_zstd="true"
 fi
-# Codec selection. Default to hybrid when the dispatcher's
-# pre-requisites (zstd dict + .bin) are both present — the dispatcher's
-# safety net guarantees per-chunk output <= zstd×SAFETY_NET_THRESHOLD,
-# so hybrid is strictly >= zstd-22 at the 1 MB chunk size the worker
-# passes. Set ENABLE_HYBRID_CODEC=0 to force the legacy zstd_fallback
-# path (useful while rolling back a bad model).
-ENABLE_HYBRID_CODEC="${ENABLE_HYBRID_CODEC:-1}"
-if [ "${ENABLE_HYBRID_CODEC}" = "1" ] && [ -n "$DICT_PATH" ] && [ -f "$DICT_PATH" ]; then
-  codec="hybrid"
-else
-  codec="zstd_fallback"
-fi
-# Chunk size passed to `l3tc hybrid-compress` at storage time. 1 MB
-# matches the real-data benchmark in RUST_DISPATCHER_BENCH.md where
-# dispatcher beat whole-file zstd by 7.9% on prose and 20.1% on logs.
-# 64 KB (the Rust default) is too small — windowed codecs fragment.
-CHUNK_SIZE_BYTES="${CHUNK_SIZE_BYTES:-1048576}"
-echo "[train] codec (storage): ${codec}  (chunk_size_bytes=${CHUNK_SIZE_BYTES})"
-echo "[train] would_have_beaten_zstd: ${would_have_beaten_zstd}"
+
+# Codec selection lives AFTER the convert_checkpoint + zstd-dict
+# blocks below — it reads BIN_PATH and DICT_PATH which those blocks
+# populate. Moved here on 2026-04-22 after the spike-3 training run
+# crashed with "DICT_PATH: unbound variable" (set -u) because the
+# earlier ordering referenced the vars before they were defined.
 
 # ------- Convert .pth -> Rust .bin (Tier 1 neural codec input) -------
 # The compression worker's hybrid path loads the Rust `.bin` at
@@ -355,6 +339,27 @@ else
   cat /tmp/dict.stderr 2>/dev/null | tail -5 | sed 's/^/  /'
   DICT_PATH=""
 fi
+
+# ------- Codec selection -------
+# Default to hybrid when the dispatcher's pre-requisites (zstd dict)
+# are present — the dispatcher's safety net guarantees per-chunk
+# output <= zstd × SAFETY_NET_THRESHOLD, so hybrid is strictly >=
+# zstd-22 at the 1 MB chunk size the worker passes.
+# Set ENABLE_HYBRID_CODEC=0 to force the legacy zstd_fallback path
+# (useful while rolling back a bad model).
+ENABLE_HYBRID_CODEC="${ENABLE_HYBRID_CODEC:-1}"
+if [ "${ENABLE_HYBRID_CODEC}" = "1" ] && [ -n "$DICT_PATH" ] && [ -f "$DICT_PATH" ]; then
+  codec="hybrid"
+else
+  codec="zstd_fallback"
+fi
+# Chunk size passed to `l3tc hybrid-compress` at storage time. 1 MB
+# matches the real-data benchmark in RUST_DISPATCHER_BENCH.md where
+# dispatcher beat whole-file zstd by 7.9% on prose and 20.1% on logs.
+# 64 KB (the Rust default) is too small — windowed codecs fragment.
+CHUNK_SIZE_BYTES="${CHUNK_SIZE_BYTES:-1048576}"
+echo "[train] codec (storage): ${codec}  (chunk_size_bytes=${CHUNK_SIZE_BYTES})"
+echo "[train] would_have_beaten_zstd: ${would_have_beaten_zstd}"
 
 # ------- Upload artifacts -------
 echo "[train] uploading artifacts to s3://${BUCKET_NAME}/${S3_MODEL_PREFIX}..."

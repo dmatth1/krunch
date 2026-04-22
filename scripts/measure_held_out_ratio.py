@@ -117,8 +117,15 @@ def main() -> None:
             tgt = torch.tensor(seg[1:], dtype=torch.long, device=args.device).unsqueeze(0)
 
             # Forward pass: expected output shape (1, seq, vocab).
-            # The train_l3tc_phase11.build_model output may be a tuple.
-            out = model(inp)
+            # Vendor L3TC's `RWKV_TC_HIRA.forward(input_token,
+            # input_types, train=...)` changed upstream to require the
+            # `input_types` positional arg. Our measurement pass has
+            # no per-token type info, so pass zeros — the trainer
+            # builds per-token types from the SPM piece class but for
+            # held-out entropy measurement the approximation is
+            # inconsequential. train=False runs the pure logits path.
+            input_types = torch.zeros_like(inp)
+            out = model(inp, input_types, train=False)
             if isinstance(out, (tuple, list)):
                 out = out[0]
             logits = out  # (1, seq, vocab)
