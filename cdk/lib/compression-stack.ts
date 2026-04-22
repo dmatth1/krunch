@@ -204,64 +204,70 @@ export class CompressionStack extends cdk.Stack {
     const NS = "Krunch/Hybrid";
     const periodMin = cdk.Duration.minutes(1);
 
-    const mainDims: cloudwatch.DimensionsMap = {}; // aggregate across all
-    const mkMetric = (name: string, statistic: string): cloudwatch.Metric =>
-      new cloudwatch.Metric({
-        namespace: NS,
-        metricName: name,
-        statistic,
+    // Metrics Insights queries. The worker emits each metric with
+    // dimensions [CustomerId, DatasetId, Env] (and additionally
+    // [Codec] for the per-codec bytes/chunks). CloudWatch does NOT
+    // auto-aggregate across dimension values — querying with empty
+    // dimensions returns nothing — so the only way to get a fleet
+    // aggregate widget is via SELECT/SCHEMA queries that GROUP BY
+    // the schema's instances. This was the bug the first dashboard
+    // hit on 2026-04-22.
+    const mainSchema = `SCHEMA("${NS}", CustomerId, DatasetId, Env)`;
+    const codecSchema = `SCHEMA("${NS}", CustomerId, DatasetId, Env, Codec)`;
+    const mkInsight = (
+      stat: string,
+      metric: string,
+      schema: string,
+      label: string,
+    ): cloudwatch.IMetric =>
+      new cloudwatch.MathExpression({
+        expression: `SELECT ${stat}(${metric}) FROM ${schema}`,
         period: periodMin,
-        dimensionsMap: mainDims,
+        label,
+        searchAccount: cdk.Stack.of(this).account,
+        searchRegion: cdk.Stack.of(this).region,
       });
 
-    const ratio = mkMetric("Ratio", cloudwatch.Stats.AVERAGE);
-    const savings = mkMetric("SavingsVsZstdPct", cloudwatch.Stats.AVERAGE);
-    const throughput = mkMetric("ThroughputMBps", cloudwatch.Stats.AVERAGE);
-    const safetyNet = mkMetric(
+    const ratio = mkInsight("AVG", "Ratio", mainSchema, "ratio (avg)");
+    const savings = mkInsight(
+      "AVG",
+      "SavingsVsZstdPct",
+      mainSchema,
+      "savings (%)",
+    );
+    const throughput = mkInsight(
+      "AVG",
+      "ThroughputMBps",
+      mainSchema,
+      "throughput (MB/s)",
+    );
+    const safetyNet = mkInsight(
+      "SUM",
       "SafetyNetSubstitutions",
-      cloudwatch.Stats.SUM,
+      mainSchema,
+      "safety-net subs",
     );
-    const bytesIn = mkMetric("BytesIn", cloudwatch.Stats.SUM);
-    const bytesOut = mkMetric("BytesOut", cloudwatch.Stats.SUM);
+    const bytesIn = mkInsight("SUM", "BytesIn", mainSchema, "bytes in");
+    const bytesOut = mkInsight("SUM", "BytesOut", mainSchema, "bytes out");
 
-    // Per-codec stacked bytes: one series per known codec. We hardcode
-    // the tag set here to keep the dashboard schema stable when a
-    // codec produces zero chunks for a period (otherwise the series
-    // would disappear from the chart mid-session and the user would
-    // assume the codec is "broken").
-    const KNOWN_CODECS = [
-      "neural",
-      "bzip3",
-      "zstd",
-      "zstd_dict",
-      "lz4",
-      "passthrough",
-      "brotli_dict",
-      "clp",
-      "zstd_fallback",
-    ];
-    const bytesByCodecSeries = KNOWN_CODECS.map(
-      (c) =>
-        new cloudwatch.Metric({
-          namespace: NS,
-          metricName: "BytesByCodec",
-          statistic: cloudwatch.Stats.SUM,
-          period: periodMin,
-          dimensionsMap: { Codec: c },
-          label: c,
-        }),
-    );
-    const chunksByCodecSeries = KNOWN_CODECS.map(
-      (c) =>
-        new cloudwatch.Metric({
-          namespace: NS,
-          metricName: "ChunksByCodec",
-          statistic: cloudwatch.Stats.SUM,
-          period: periodMin,
-          dimensionsMap: { Codec: c },
-          label: c,
-        }),
-    );
+    // Per-codec stacked: GROUP BY Codec produces one series per codec
+    // value seen in the time range. No need to hardcode the codec
+    // list — CloudWatch infers them from the data and a codec that
+    // never produces a chunk in the period simply doesn't appear.
+    const bytesByCodec = new cloudwatch.MathExpression({
+      expression: `SELECT SUM(BytesByCodec) FROM ${codecSchema} GROUP BY Codec`,
+      period: periodMin,
+      label: "bytes by codec",
+      searchAccount: cdk.Stack.of(this).account,
+      searchRegion: cdk.Stack.of(this).region,
+    });
+    const chunksByCodec = new cloudwatch.MathExpression({
+      expression: `SELECT SUM(ChunksByCodec) FROM ${codecSchema} GROUP BY Codec`,
+      period: periodMin,
+      label: "chunks by codec",
+      searchAccount: cdk.Stack.of(this).account,
+      searchRegion: cdk.Stack.of(this).region,
+    });
 
     // Operational metrics: queue depth + running task count. Living
     // in the same dashboard means the oncall can see "0 tasks running
@@ -332,14 +338,14 @@ export class CompressionStack extends cdk.Stack {
     dashboard.addWidgets(
       new cloudwatch.GraphWidget({
         title: "Bytes out by codec (stacked)",
-        left: bytesByCodecSeries,
+        left: [bytesByCodec],
         stacked: true,
         width: 12,
         height: 6,
       }),
       new cloudwatch.GraphWidget({
         title: "Chunks by codec (stacked)",
-        left: chunksByCodecSeries,
+        left: [chunksByCodec],
         stacked: true,
         width: 12,
         height: 6,
