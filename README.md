@@ -4,19 +4,35 @@
 
 _Internal codename: learned-archive. AWS resources are named `archive-{env}-*`._
 
-Managed storage service for text-heavy data. Customer PUTs events via
-an S3-ish API; we train a small RWKV-v4 model on their specific data
-distribution (one model per dataset), compress with that model,
-store on S3. Ratio target: 2-4× better than `zstd -22` on homogeneous
-log-like data, retrieval latency comparable to S3 Standard (not
-Glacier's 12-48 h).
+## Thesis
 
-**Positioning vs. the category:** Datadog Flex Logs, Elastic Frozen
-Tier, Loki, Axiom all ship cheap log archive. All use generic
-compression. The wedge is per-customer learned compression, which is
-3-5× tighter on homogeneous data than anything off-the-shelf. Detailed
-pitch + landscape + API surface + economics in
-[`STORAGE_SERVICE.md`](STORAGE_SERVICE.md).
+**We store your data cheaper than raw on S3 — and cheaper than the
+best classical compression (zstd) on S3. We do this by learning a
+compression model on *your specific data* and applying it
+automatically. You PUT data to our API; we handle model training,
+per-chunk codec selection, and storage. You GET it back decompressed
+on demand.**
+
+The core bet: the same AI techniques that let large language models
+predict the next word can be used, at small scale, to predict the
+next byte of *your* data. A compression model trained on one
+customer's logs / documents / records knows that customer's
+vocabulary, structure, and style in ways no off-the-shelf codec
+ever could. That knowledge shows up as bytes saved every month for
+the life of the archive.
+
+In practice it's a **hybrid dispatcher**: a small neural model for
+text-like content (prose, code, JSON with free-text fields, chat,
+medical / legal / audit records — where it beats zstd by 15–40%),
+with classical codecs (zstd with a trained dictionary, bzip3, CLP
+for templated logs, brotli for near-duplicate documents) dispatched
+per-chunk for the content types where classical still wins.
+
+See the full product positioning in
+[`STORAGE_SERVICE.md`](STORAGE_SERVICE.md), the evidence behind the
+ratio claims in [`CUSTOMER_PROFILE.md`](CUSTOMER_PROFILE.md), and the
+hybrid dispatcher design in
+[`HYBRID_CODEC_DESIGN.md`](HYBRID_CODEC_DESIGN.md).
 
 ## Status (2026-04-21)
 
@@ -33,6 +49,9 @@ training run on a real customer-shaped dataset (HDFS logs from Loghub,
 | doc | purpose |
 |---|---|
 | [`STORAGE_SERVICE.md`](STORAGE_SERVICE.md) | Product spec: pitch, API, economics, risks, spike plan |
+| [`CUSTOMER_PROFILE.md`](CUSTOMER_PROFILE.md) | What realistic customer data looks like per vertical, why the codec design is shaped around it |
+| [`HYBRID_CODEC_DESIGN.md`](HYBRID_CODEC_DESIGN.md) | Dispatcher architecture: neural + classical codec menu, detector, metrics |
+| [`COMPETITIVE_LANDSCAPE.md`](COMPETITIVE_LANDSCAPE.md) | Who sells cheap compressed storage today, who claims AI-powered compression, where the defensible moat is |
 | [`docs/SERVICE_ARCHITECTURE.md`](docs/SERVICE_ARCHITECTURE.md) | AWS architecture reference: stacks, data flow, DDB schemas |
 | [`TRAINING_FLOW.md`](TRAINING_FLOW.md) | End-to-end walkthrough of one training job: tokenizer → RWKV → ratio → metadata |
 | [`SPIKE_1_LOG.md`](SPIKE_1_LOG.md) | Running log of Spike 1 (HDFS on real service) |
