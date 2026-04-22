@@ -61,6 +61,28 @@ pub enum Error {
     /// builds during Phase 1 can fail gracefully with clear messages.
     #[error("not yet implemented: {0}")]
     NotImplemented(&'static str),
+
+    /// A hybrid-dispatcher blob had an unrecognised codec tag. Bumped
+    /// when a newer dispatcher version writes a blob an older binary
+    /// then tries to decode.
+    #[error("hybrid dispatcher: unknown codec tag {0}")]
+    UnknownCodecTag(u8),
+
+    /// A classical codec (zstd / bzip3 / lz4) returned an error through
+    /// its library API. The string wraps the underlying error's display.
+    #[error("classical codec {codec}: {message}")]
+    ClassicalCodec {
+        /// Which codec produced the error, e.g. `"zstd"` or `"bzip3"`.
+        codec: &'static str,
+        /// Underlying error message.
+        message: String,
+    },
+
+    /// The hybrid blob header's magic bytes, version, or length fields
+    /// were malformed. This catches accidental feeding of a non-hybrid
+    /// blob to the hybrid decoder.
+    #[error("hybrid dispatcher: bad blob header ({0})")]
+    BadHybridHeader(&'static str),
 }
 
 /// Convenience `Result` alias bound to [`Error`].

@@ -55,6 +55,16 @@ rayon = "1.10"
 # Rust, no transitive deps, auto-vectorizes via SIMD where available.
 crc32fast = "1.4"
 
+# --- Hybrid dispatcher (new in the hybrid codec work) -------------
+# bzip3 for the text fallback path. 3-10% smaller than zstd-22 on
+# prose; LGPL-3.0, Rust wrapper over the C bzip3 library. Pinned at
+# 0.12 (not 0.2) because the 0.2-era sys crate needs nightly Rust.
+bzip3 = "0.12"
+
+# lz4 for the small-chunk / incompressible-content fallback codec.
+# Pure Rust, no C deps, gigabyte/sec class speeds.
+lz4_flex = { version = "0.11", default-features = false, features = ["frame"] }
+
 # --- install-models (task 27): binary-only deps ---
 # Pure-Rust HTTP client with rustls (no OpenSSL). Blocking API, ~400 KB.
 # Only used by the `install-models` CLI subcommand.
@@ -63,7 +73,12 @@ ureq = { version = "2.10", default-features = false, features = ["tls"], optiona
 # Streaming .tar.zst extraction and SHA-256 hashing for bundle
 # verification. All Apache-2.0 / MIT, no C deps.
 tar = { version = "0.4", optional = true }
-zstd = { version = "0.13", default-features = false, optional = true }
+# zstd used by both the CLI install-models flow AND the hybrid-codec
+# dispatcher. Kept unconditional (no `optional = true`) so the
+# library path has it; the `cli` feature gate only gates tar+sha2.
+# `experimental` feature exposes `ZSTD_trainFromBuffer` for
+# per-dataset trained dictionaries.
+zstd = { version = "0.13", default-features = false, features = ["experimental"] }
 sha2 = { version = "0.10", optional = true }
 
 # Manifest parsing. serde_json chosen over toml because the manifest
@@ -93,7 +108,6 @@ cli = [
     "dep:anyhow",
     "dep:ureq",
     "dep:tar",
-    "dep:zstd",
     "dep:sha2",
     "dep:serde",
     "dep:serde_json",

@@ -45,10 +45,16 @@ pub mod backend;
 pub mod bitio;
 pub mod checkpoint;
 pub mod codec;
+pub mod dispatcher;
 pub mod error;
 pub mod rwkv;
 pub mod tensor;
 pub mod tokenizer;
+
+pub use dispatcher::{
+    decode_blob as hybrid_decode, encode_blob as hybrid_encode, Bzip3Codec, Codec, CodecTag,
+    DispatchStats, Lz4Codec, PassthroughCodec, Zstd22Codec, ZstdDictCodec, DEFAULT_CHUNK_SIZE,
+};
 
 pub use backend::{Backend, GPU_AUTO_THRESHOLD_BYTES};
 pub use checkpoint::{Checkpoint, Tensor};
