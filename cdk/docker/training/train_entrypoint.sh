@@ -46,6 +46,7 @@ EPOCH_LENGTH="${EPOCH_LENGTH:-50000}"
 BATCH_SIZE="${BATCH_SIZE:-32}"
 SAMPLE_MB="${SAMPLE_MB:-200}"  # SPM training sample size; "0" means use full corpus
 MAX_PIECE_LENGTH="${MAX_PIECE_LENGTH:-16}"  # SPM max chars per token; Phase C bumps to ~256 for template absorption
+NORMALIZE_VARIABLE_FIELDS="${NORMALIZE_VARIABLE_FIELDS:-0}"  # Phase C4: pre-tokenize normalization of log-variable fields (1 to enable)
 
 echo "[train] config: vocab=${VOCAB_SIZE} num_layers=${NUM_LAYERS} ctx=${CONTEXT_LEN} epochs=${EPOCHS} epoch_len=${EPOCH_LENGTH} batch=${BATCH_SIZE} sample_mb=${SAMPLE_MB}"
 
@@ -76,6 +77,26 @@ train_bytes=$(( corpus_bytes * 80 / 100 ))
 head -c "$train_bytes" "$MODEL_DIR/corpus.txt" > "$MODEL_DIR/train.txt"
 tail -c +$(( train_bytes + 1 )) "$MODEL_DIR/corpus.txt" > "$MODEL_DIR/val.txt"
 echo "[train] train=$(wc -c < "$MODEL_DIR/train.txt")B val=$(wc -c < "$MODEL_DIR/val.txt")B"
+
+# Phase C4: variable-field normalization BEFORE SPM + RWKV training.
+# Replaces timestamps, block IDs, IPs, task/job IDs with fixed
+# placeholders so the SPM trainer sees a train-vs-val-invariant
+# skeleton. Both ratio measurement and zstd baseline use the
+# *normalized* val so the comparison is apples-to-apples; the side
+# channel cost (encoding the captured values) is an open question
+# addressed at the service level later.
+if [ "${NORMALIZE_VARIABLE_FIELDS}" = "1" ]; then
+  echo "[train] normalizing variable fields (Phase C4)…"
+  mv "$MODEL_DIR/train.txt" "$MODEL_DIR/train.raw.txt"
+  mv "$MODEL_DIR/val.txt"   "$MODEL_DIR/val.raw.txt"
+  python /app/scripts/normalize_variable_fields.py \
+      --corpus "$MODEL_DIR/train.raw.txt" \
+      --out    "$MODEL_DIR/train.txt"
+  python /app/scripts/normalize_variable_fields.py \
+      --corpus "$MODEL_DIR/val.raw.txt" \
+      --out    "$MODEL_DIR/val.txt"
+  echo "[train] after normalize: train=$(wc -c < "$MODEL_DIR/train.txt")B val=$(wc -c < "$MODEL_DIR/val.txt")B"
+fi
 
 # Determine next model version by listing existing models in S3.
 existing=$(aws s3 ls "s3://${BUCKET_NAME}/${S3_MODEL_PREFIX}" 2>/dev/null \
@@ -273,6 +294,7 @@ cat > "$MODEL_DIR/metadata.json" <<EOF
   "hidden_size": ${HIDDEN_SIZE},
   "context_len": ${CONTEXT_LEN},
   "max_piece_length": ${MAX_PIECE_LENGTH},
+  "normalize_variable_fields": ${NORMALIZE_VARIABLE_FIELDS},
   "epochs": ${EPOCHS},
   "epoch_length": ${EPOCH_LENGTH},
   "batch_size": ${BATCH_SIZE},

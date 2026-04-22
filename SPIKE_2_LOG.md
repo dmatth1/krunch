@@ -36,6 +36,42 @@ into short byte-fallback tokens. Net bits/byte goes up.
 
 Moving directly to **Phase B** (model capacity scaling with 16K vocab).
 
+| hdfs-b1/v1 | B1 (6L × 192H, 18.7 M params, ctx 2048) | 16 384 | 6 | 2048 | 1058 | 3 | 8 | **~0.144 at best epoch (0)** | 0.0466 | 0.0457 | ~55 min | ~$0.73 | **FAIL** | 18.7M total params (12.4M body). Final-epoch eval bits/token 3.97; best-epoch (0) was 3.76. **Eval loss climbed across epochs** — 2.61 → 2.72 → 2.75 nats — classic overfitting trajectory. Ratio even at best epoch (~0.144) is only marginally better than 200K baseline (0.1405). Capacity scaling didn't help on HDFS; same pattern as A: variable fields (block IDs, IPs) are genuinely hard regardless of capacity, more params just memorize training-set-specific values. Also hit WKV T_MAX=2048 assertion when trying ctx=4096 first — vendor kernel is hardcoded. Noted. |
+
+### Phase B verdict
+
+Capacity scaling alone does not help on HDFS. The pattern from A
+repeats: bigger models memorize training-specific variable-field
+values (block IDs, IPs) that don't appear in val, hurting generalization.
+And after epoch 0 we see clear overfitting.
+
+**Pivot to Phase C (template-absorbing tokenizer)** — let SPM's
+`max_sentencepiece_length` find whole HDFS templates as single pieces
+so the model doesn't have to predict template bytes at all.
+
+| hdfs-c1/v1 | C1 (max_piece_len=256, baseline model) | 16 384 | 2 | 2048 | 1058 | 5 | 32 | **0.1010** (bits/token 2.198 / val bytes/token 2.720) | 0.0466 | 0.0457 | ~40 min | ~$0.53 | **FAIL but biggest improvement yet** | 28% better than Spike 1 (0.1405 → 0.1010). Still 2.17× worse than zstd. SPM did learn 196 pieces ≥ 30 chars, longest 63 chars — but they're training-specific Hadoop paths like `/user/root/sortrand2/_temporary/_task_200811101024_0003_r_00001`. Val has different task IDs → fragments these back to byte-fallback → val bytes/token 2.72, SHORTER than Spike 1's 3.02. Token density hurt, but per-token predictability improved much more (bits/token 3.39 → 2.20). Still the wrong compression axis — need templates that *generalize* across train/val. |
+
+### Phase C1 diagnosis: template mining with unigram SPM overfits paths
+
+Longest 10 pieces from C1 tokenizer, all `_task_200811101024_0003_r_XXXXX`
+prefixes. SPM's unigram trainer can't distinguish "common template
+with varying suffix" from "entire frequent substring"; with a
+budget of 16 K vocab slots it burns slots on full training-path
+variants. Val sees different tasks → byte-fallback.
+
+Fix directions, in order of engineering cost:
+- C2: bigger vocab (32K-128K) with max_piece_length=256, unigram.
+  More slots may cover enough training-path variants that val hits
+  fewer misses. Still training-specific, so bounded.
+- C3: switch to BPE. BPE greedily merges character pairs, tends to
+  produce template PREFIXES rather than full paths. Natural split
+  point between "template" and "variable".
+- C4 (proper fix): mask known variable fields
+  (timestamps `\d{6} \d{6}`, block IDs `blk_-?\d+`, IPs
+  `\d+\.\d+\.\d+\.\d+`, task IDs `_task_\d+_\d+`) with placeholders
+  BEFORE SPM. Templates stabilize; SPM learns the real structure.
+  Rust runtime will need the same preprocessing + postprocessing.
+
 ## Infra fixes folded in for Spike 2
 
 - Compression Dockerfile: `PYTHONUNBUFFERED=1` so the worker's
