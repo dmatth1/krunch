@@ -39,12 +39,13 @@ echo "[train] customer=${CUSTOMER_ID} dataset=${DATASET_ID} trigger=${TRIGGER}"
 # containerOverrides.environment.
 VOCAB_SIZE="${VOCAB_SIZE:-16384}"
 NUM_LAYERS="${NUM_LAYERS:-2}"
-HIDDEN_SIZE="${HIDDEN_SIZE:-96}"  # informational; train script uses its own default for this
-CONTEXT_LEN="${CONTEXT_LEN:-2048}"  # informational; train script uses its own default for this
+HIDDEN_SIZE="${HIDDEN_SIZE:-96}"
+CONTEXT_LEN="${CONTEXT_LEN:-2048}"
 EPOCHS="${EPOCHS:-10}"
 EPOCH_LENGTH="${EPOCH_LENGTH:-50000}"
 BATCH_SIZE="${BATCH_SIZE:-32}"
 SAMPLE_MB="${SAMPLE_MB:-200}"  # SPM training sample size; "0" means use full corpus
+MAX_PIECE_LENGTH="${MAX_PIECE_LENGTH:-16}"  # SPM max chars per token; Phase C bumps to ~256 for template absorption
 
 echo "[train] config: vocab=${VOCAB_SIZE} num_layers=${NUM_LAYERS} ctx=${CONTEXT_LEN} epochs=${EPOCHS} epoch_len=${EPOCH_LENGTH} batch=${BATCH_SIZE} sample_mb=${SAMPLE_MB}"
 
@@ -101,12 +102,13 @@ if [ "${SAMPLE_MB}" = "0" ]; then
 else
   SAMPLE_MB_ARG="${SAMPLE_MB}"
 fi
-echo "[train] training SPM tokenizer (vocab=${VOCAB_SIZE} unigram, domain=${DOMAIN}, sample_mb=${SAMPLE_MB_ARG})..."
+echo "[train] training SPM tokenizer (vocab=${VOCAB_SIZE} unigram, domain=${DOMAIN}, sample_mb=${SAMPLE_MB_ARG}, max_piece_length=${MAX_PIECE_LENGTH})..."
 python /app/scripts/train_specialist_tokenizer.py \
     --domain "${DOMAIN}" \
     --corpus "$MODEL_DIR/train.txt" \
     --output-dir "$MODEL_DIR" \
     --vocab-size "${VOCAB_SIZE}" \
+    --max-piece-length "${MAX_PIECE_LENGTH}" \
     --sample-mb "${SAMPLE_MB_ARG}" 2>&1 | tee /tmp/tokenizer.log
 rc=${PIPESTATUS[0]}
 if [ "$rc" -ne 0 ]; then
@@ -268,7 +270,9 @@ cat > "$MODEL_DIR/metadata.json" <<EOF
   "zstd_baseline_ratio": ${zstd_baseline_ratio},
   "vocab_size": ${VOCAB_SIZE},
   "num_layers": ${NUM_LAYERS},
+  "hidden_size": ${HIDDEN_SIZE},
   "context_len": ${CONTEXT_LEN},
+  "max_piece_length": ${MAX_PIECE_LENGTH},
   "epochs": ${EPOCHS},
   "epoch_length": ${EPOCH_LENGTH},
   "batch_size": ${BATCH_SIZE},

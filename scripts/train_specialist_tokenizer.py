@@ -112,13 +112,15 @@ def sample_bytes_to_file(sources: list[Path], dst: Path, target_mb: float, seed:
     return dst
 
 
-def train_spm(sample_path: Path, output_dir: Path, domain: str, vocab_size: int):
+def train_spm(sample_path: Path, output_dir: Path, domain: str, vocab_size: int,
+              max_piece_length: int = 16):
     import sentencepiece as spm
 
     output_dir.mkdir(parents=True, exist_ok=True)
     prefix = output_dir / "spm"
 
-    print(f"training SPM unigram: domain={domain} vocab={vocab_size}")
+    print(f"training SPM unigram: domain={domain} vocab={vocab_size} "
+          f"max_piece_length={max_piece_length}")
     t0 = time.time()
 
     # Lossless round-trip is non-negotiable for a compression tokenizer:
@@ -154,6 +156,13 @@ def train_spm(sample_path: Path, output_dir: Path, domain: str, vocab_size: int)
         character_coverage=1.0,
         byte_fallback=True,
         max_sentence_length=16384,
+        # Let the unigram trainer build template-length pieces when
+        # the data supports it. Default is 16 chars; Phase C bumps
+        # this to ~256 so SPM can absorb templates like "INFO
+        # dfs.DataNode$DataXceiver: Receiving block blk_" as a single
+        # token. LogShrink-style template compression through the
+        # tokenizer instead of a custom preprocessor.
+        max_sentencepiece_length=max_piece_length,
         add_dummy_prefix=False,
         remove_extra_whitespaces=False,
         normalization_rule_name="identity",
@@ -221,6 +230,10 @@ def main():
                         "200 MB saturates B/T; 1 GB runs 30x slower "
                         "with no gain.")
     p.add_argument("--vocab-size", type=int, default=16384)
+    p.add_argument("--max-piece-length", type=int, default=16,
+                   help="Max characters in a single SPM token. Bumping "
+                        "to 200-500 lets the unigram trainer learn "
+                        "whole log templates as single tokens.")
     p.add_argument("--seed", type=int, default=1204)
     args = p.parse_args()
 
@@ -238,6 +251,7 @@ def main():
 
     model_path, vocab_path = train_spm(
         sample_path, args.output_dir, args.domain, args.vocab_size,
+        max_piece_length=args.max_piece_length,
     )
     report = bytes_per_token_report(model_path, sample_path, args.domain)
 
