@@ -62,20 +62,32 @@ order within each bucket.
 ### 6. Decompression API
 - `GET /v1/customers/{cid}/datasets/{dsid}/events` Lambda exists but
   returns placeholder JSON; it doesn't actually decode anything.
-- Fix: once compression moves off zstd-fallback, implement
-  streaming decode: list `compressed/` objects, stream each through
-  the codec, concatenate as NDJSON response. Pagination via
-  continuation tokens.
+- Fix: list `compressed/` objects, stream each through the
+  appropriate codec, concatenate as NDJSON response. Pagination via
+  continuation tokens. Hybrid blobs use the Rust `l3tc
+  hybrid-decompress` (same binary shipped in the compression image);
+  `zstd_fallback` blobs use `zstd -d`.
 
 ## Should-have (blocks growth past a handful of customers)
 
-### 7. L3TC runtime integration (gated on Spike 1 pass)
-- Fargate compression worker currently runs **zstd_fallback only**.
-  The model is trained, the ratio is measured, but we don't store
-  model-compressed bytes.
-- Fix (if Spike 1 passes): build a Rust-based compression image from
-  `l3tc-rust/`; wire into the worker when `codec=l3tc`; add
-  decode path for the GET endpoint.
+### 7. Hybrid codec runtime integration (Tier 1)
+
+**Done in code 2026-04-22 (commit `3f883f2`), pending CodeBuild
+deploy.** The full pipeline `PUT → train → convert_checkpoint.py →
+.bin + .zstd_dict → hybrid-compress → hybrid-decompress` is wired
+end-to-end. Still open:
+- Trigger `krunch-image-build` so the hybrid-capable Fargate
+  image lands in ECR. First build exercises the new multi-stage
+  Dockerfile (Rust builder + bzip3 from source); failures here will
+  need the bzip3 tag bumped.
+- Update the CDK compression stack's image URI to the new tag and
+  redeploy.
+- Run one end-to-end customer job against the hybrid path;
+  validate CloudWatch EMF metrics land under `Krunch/Hybrid`
+  with all the dimensions populated.
+- Re-validate against the real 277 MB Loghub HDFS corpus to
+  confirm 1 MB chunks recover the window-penalty loss we saw in
+  the 64 KB Python simulation.
 
 ### 8. Per-dataset tokenizer domain
 - Per-dataset tokenizer training: ✓ already in place.
@@ -147,8 +159,25 @@ Still open:
 
 ## Tracking
 
-When Spike 1 lands (pass or fail), re-prioritize this list based on
-outcome:
-- Pass → items 1-5 are the path to first customer; 7/9/10 close after.
-- Fail → revisit thesis first; none of this matters if the model
-  doesn't beat zstd.
+**Status 2026-04-22.** Spike 1 + Spike 2 closed (see
+`SPIKE_1_LOG.md`, `SPIKE_2_LOG.md`). Core product pivoted to the
+hybrid dispatcher (see `HYBRID_CODEC_DESIGN.md`,
+`RUST_DISPATCHER_BENCH.md`); Tier 1 code-complete, deploy pending.
+
+Open by priority:
+1. **Item 7 deploy** (CodeBuild the hybrid image, flip CDK, validate
+   against Spike 1 HDFS). Unblocks a live customer on the hybrid
+   path.
+2. **Items 1-5** (GPU capacity, observability, error surfacing,
+   retry policy, auth) — customer-facing gates.
+3. **Item 6** (decompression API) — trivial once Item 7 ships.
+4. **Items 8-10** (operational hygiene) — not customer-facing but
+   close once above are shipped.
+
+Tier 1+ work (not on this list):
+- Full CLP port to replace `ClpStub` (3-5 days). Unblocks the
+  templated-log chunk class in the codec menu.
+- Brotli shared-dictionary codec (Tag 0x5). Useful on
+  near-duplicate document archives.
+- Per-dataset chunk-size tuning in the detector, not a hardcoded
+  1 MB.

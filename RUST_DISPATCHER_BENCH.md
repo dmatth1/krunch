@@ -113,6 +113,24 @@ chunks for a 4-8× speedup if we need it.
 | hdfs dispatcher ratio | 0.0662 at 64 KB | 0.1850 at 64 KB (synthetic, not real) | different corpus; synthetic is 14× smaller and less repetitive than real HDFS |
 | chunk-size sensitivity | untested | 1 MB gives +8-20% gain | simulator ran only at 64 KB |
 
+## End-to-end neural validation (smoke test)
+
+A separate, smaller run to sanity-check that `convert_checkpoint.py`
+produces a `.bin` the Rust dispatcher can actually load and
+round-trip against. Uses the pre-distilled L3TC-200K weights in
+`l3tc-rust/checkpoints/l3tc_200k_distilled.pth` + the
+enwik8-trained SPM in `vendor/L3TC/dictionary/`.
+
+| corpus | bytes in | bytes out | ratio | zstd shadow | savings vs per-chunk zstd | codec picked | throughput |
+|---|---|---|---|---|---|---|---|
+| enwik6 first-100KB | 100,000 | 18,011 | **0.1801** | 0.3374 | **+46.6%** | neural 1/1 | 0.15 MB/s |
+
+Round-trip byte-identical. Confirms the full pipeline
+`.pth → convert_checkpoint.py → .bin → l3tc hybrid-compress →
+l3tc hybrid-decompress → original` works end-to-end. Throughput
+is the ~150 KB/s envelope we already know for L3TC-200K on an M-class
+CPU; service-side A10G / L40S will be faster.
+
 ## Open follow-ups
 
 1. Re-run on the real 277 MB Loghub HDFS corpus once it's back on
