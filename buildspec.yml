@@ -38,13 +38,28 @@ phases:
       # it. Pin strategy tracked in PRODUCTION_TODO item 9.
       - git clone --depth 1 https://github.com/alipay/L3TC-leveraging-rwkv-for-learned-lossless-low-complexity-text-compression.git vendor/L3TC
       - echo "L3TC cloned at $(git -C vendor/L3TC rev-parse HEAD)"
+      # Register QEMU user-mode emulators so `docker build --platform
+      # linux/arm64` works from this x86 CodeBuild host. The
+      # compression image targets ARM64 Fargate Graviton; the training
+      # image stays x86_64 (PyTorch CUDA wheels are x86-only).
+      # tonistiigi/binfmt installs the handlers once per build and the
+      # kernel registers them for the lifetime of the container.
+      - docker run --privileged --rm tonistiigi/binfmt --install arm64
 
   build:
     commands:
-      - echo "=== build training image ==="
+      # Training image stays on x86_64: the PyTorch CUDA training wheel
+      # set is x86_64-only for the NVIDIA G-series GPUs, so training
+      # runs on x86 Batch and the image has to match.
+      - echo "=== build training image (linux/amd64) ==="
       - docker build -f ${TRAIN_DOCKERFILE} --platform linux/amd64 -t ${ECR_URI}:${TRAIN_TAG} .
-      - echo "=== build compression image ==="
-      - docker build -f ${COMPRESS_DOCKERFILE} --platform linux/amd64 -t ${ECR_URI}:${COMPRESS_TAG} .
+      # Compression image is linux/arm64: Fargate Graviton recovers
+      # the M-series NEON SIMD path for the l3tc-rust neural codec,
+      # which was 10x slower on x86 Fargate. CodeBuild project must
+      # run on ARM_CONTAINER compute so this is a native build (not
+      # QEMU emulation, which would be 5x slower).
+      - echo "=== build compression image (linux/arm64) ==="
+      - docker build -f ${COMPRESS_DOCKERFILE} --platform linux/arm64 -t ${ECR_URI}:${COMPRESS_TAG} .
 
   post_build:
     commands:

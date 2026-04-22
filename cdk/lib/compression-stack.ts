@@ -110,6 +110,17 @@ export class CompressionStack extends cdk.Stack {
         image,
         cpu: 2048, // 2 vCPU — zstd-22 is single-threaded but this gives the OS room and cuts compression walltime by ~30% in practice
         memoryLimitMiB: 4096,
+        // Graviton ARM64 Fargate. The l3tc-rust neural codec uses
+        // the `matrixmultiply` crate's NEON SIMD path; on x86 Fargate
+        // we saw ~10 min wall-clock on a 5 MB / 200K-param hybrid run,
+        // vs ~30 s on M-series (both NEON). Graviton recovers that
+        // gap AND costs ~20% less than x86 at the same spec. The
+        // ECR image must be built linux/arm64 — buildspec.yml passes
+        // the flag and uses ARM_CONTAINER CodeBuild compute.
+        runtimePlatform: {
+          cpuArchitecture: ecs.CpuArchitecture.ARM64,
+          operatingSystemFamily: ecs.OperatingSystemFamily.LINUX,
+        },
         // min=0 is now safe: the worker calls the ECS task-protection
         // endpoint (PUT $ECS_AGENT_URI/task-protection/v1/state) with
         // ProtectionEnabled=true for the lifetime of each SQS message,
