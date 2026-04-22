@@ -1,202 +1,197 @@
-# Hybrid codec design — splitting skeleton from variable fields
+# Hybrid codec design — model + zstd dispatcher
 
 Status: design spec, pre-implementation. Written 2026-04-22 off the
-back of Spike 2 findings (see SPIKE_2_LOG.md).
+back of Spike 2 findings (see `SPIKE_2_LOG.md`). Rewrite
+post-discussion with user: throw out the idea of hand-rolling
+dictionary + delta encoders. Reuse zstd as the traditional-
+compression half, build only a per-chunk codec dispatcher.
 
-## The insight from Spike 2
+## The insight
 
-HDFS compression with a small RWKV model stalls at ~0.07 ratio —
-50-60% worse than `zstd --long=27 -22`'s 0.047. We ran 7 experiments
-varying vocab, model size, context, tokenizer config, and variable-
-field normalization. Consistent pattern across all seven:
+Spike 2 ran 8 variations of a small RWKV model on HDFS logs and
+landed at best ratio 0.074 vs. zstd's 0.047. The pattern is clean:
+on HDFS-class templated data, zstd's LZ + 128 MB window + Huffman
+tail is near-optimal. A 200 K–25 M-param model can't beat it
+through prediction alone, because the remaining bits are
+dominated by repeated variable-value dictionary hits that zstd
+serves for free. On less-templated data (JSON events, app logs,
+prose) a small model wins because patterns are context-dependent.
 
-**The bytes of a log line split into two distinct populations**,
-each compressible by very different mechanisms:
+**Conclusion**: don't build a codec that tries to be better than
+zstd on zstd's home turf. Build a **codec dispatcher** that picks
+between our model and zstd per chunk, and ships the smaller output
+with a 2-bit codec tag.
 
-| Kind | Fraction of bytes | Example (HDFS) | What compresses it |
-|---|---|---|---|
-| **Skeleton / template** | ~80% | `INFO dfs.DataNode$DataXceiver: Receiving block` | Model prediction — a small RWKV can get to ~0.05 bits/byte on skeleton text because the template repeats endlessly. |
-| **Variable fields** | ~20% | `081109 203518` (timestamp), `blk_-1608999687919862906` (block ID), `10.250.19.102:50010` (IP) | **Dictionary lookup**, not prediction. These values are near-random when you see them for the first time, but they *repeat* across the corpus — the same block ID appears when that block is written, allocated, replicated, and deleted; the same IPs appear in thousands of lines. zstd's 128 MB window captures them all and turns each reference into ~4 bytes. |
+The result is **"never worse than zstd-with-dict, strictly better
+on most real data"** — which is a much stronger product statement
+than any single-codec approach, and holds even on HDFS.
 
-A learned model trying to beat zstd end-to-end has to do both jobs.
-It turns out a 200 K-param RWKV is great at one (skeleton) and useless
-at the other (variable fields are near-random from its short-context
-view). Scaling the model to 25 M params helped only incrementally
-because the bottleneck isn't capacity — it's access to a large
-dictionary.
+## What we reuse (not reinvent)
 
-**zstd wins on HDFS by being a dictionary coder with a huge window;
-loses on variable-content data where patterns need real prediction.
-A hybrid that does both beats both.**
-
-## The codec, at the level of an encode/decode flow
-
-```
-               ┌─────────────────────────────┐
-plaintext ───▶ │ 1. NORMALIZE                │
-               │   regex-scan for variable    │
-               │   fields, emit placeholders  │
-               │   into the skeleton stream   │
-               │   and captured literals      │
-               │   into per-field streams     │
-               └──────────┬────────┬─────────┘
-                          │        │
-                          ▼        ▼
-             skeleton stream   var streams
-                          │    (TS, BLKID,
-                          │     IP, TASKID, …)
-                          ▼
-               ┌─────────────────────────────┐
-               │ 2. SKELETON ENCODE           │
-               │   SPM (trained on normalized │
-               │   corpus) → token ids        │
-               │   RWKV → arithmetic-coded    │
-               │   bitstream                  │
-               │   ≈ 0.02 bits/byte on skel   │
-               └──────────┬──────────────────┘
-                          │
-                          ▼
-               ┌─────────────────────────────┐
-               │ 3. VARIABLE ENCODE (per field)  │
-               │   each field gets its own    │
-               │   encoder keyed to the       │
-               │   field's structure:         │
-               │                              │
-               │ · TS    → delta-encode from  │
-               │           last value (times  │
-               │           are monotonic)     │
-               │ · BLKID → 63-bit int literal │
-               │           + dictionary of    │
-               │           previously seen    │
-               │           block IDs          │
-               │ · IP    → 4-byte literal +   │
-               │           dictionary of seen │
-               │           IPs (short keys)   │
-               │ · TASKID → delta from last   │
-               │           value in same job  │
-               └──────────┬──────────────────┘
-                          │
-                          ▼
-               ┌─────────────────────────────┐
-               │ 4. MUX + HEADER              │
-               │   tiny envelope: skeleton    │
-               │   length, per-stream         │
-               │   offsets, field-dictionary  │
-               │   metadata                    │
-               └──────────┬──────────────────┘
-                          │
-                          ▼
-                   compressed blob
-
-DECODE = reverse, stitching back in order.
-```
-
-## Why each stream compresses cheaply
-
-### Skeleton (~80% of bytes)
-
-- After normalization the skeleton has only ~2000 unique HDFS
-  templates (measured in Spike 2 C4 — SPM complained it couldn't
-  reach 16 K vocab because only 1119 distinct skeleton pieces
-  existed).
-- A 200 K-param RWKV easily models 2000 templates because the
-  "next template given previous template" transition matrix is
-  low-rank and learnable from ~100 K samples.
-- Target: **≤ 0.05 bits/byte on skeleton**, i.e. 20× compression of
-  the skeleton bytes.
-
-### Variable fields (~20% of bytes)
-
-Three sub-kinds; each gets a tailored encoder:
-
-#### (a) Monotonic fields — timestamps
-
-Delta-encoded against the previous value in the same field.
-Deltas are small integers, Huffman or range-coded. Target: **1-2
-bits per timestamp** instead of the 12 raw bytes.
-
-#### (b) Dictionary fields — block IDs, IPs, task IDs
-
-Maintain a per-field dictionary in encode order. When a value
-repeats (which it does, heavily — HDFS block IDs repeat ~10-40
-times each across allocation/replication/read/delete events), emit
-a short code for its dictionary index. First occurrences emit the
-raw value + a new-index marker.
-
-Zstd does this already but at the byte level with a generic hash.
-We do it at the **semantic-field level** so we can use smaller
-indices and skip the byte-level redundancy inside a block ID (no
-need to re-hash the "blk_-" prefix every line).
-
-#### (c) Literal fields — first-occurrence variable values
-
-Fall through to raw literal bytes. For genuinely-random fields
-(rare UUIDs, unique error strings) this is the same cost as plain
-storage. Small overall footprint.
-
-## Throughput envelope
-
-This design stays **well inside** the user's inference-speed
-constraint (≥ 1 MB/s decompress single-stream on L4 GPU):
-
-- **Skeleton decode** dominates total model work. 200 K-param RWKV
-  at ctx 2048 on L4 does ~10 MB/s skeleton bytes per stream
-  (from l3tc-rust benchmarks, extrapolating to skeleton
-  throughput). Per corpus byte, that's `10 MB/s × 80% skeleton
-  fraction = 8 MB/s` model-limited.
-- **Variable decode** is just table lookup + arithmetic decoding
-  of integer fields. Hundreds of MB/s per core.
-- Net single-stream decompress: **~5-10 MB/s** on L4, well
-  above the 1 MB/s floor.
-
-## Engineering effort
-
-| Chunk | Estimate | Notes |
+| component | reuse source | why |
 |---|---|---|
-| Finalize the normalizer for HDFS + 2 other corpora | 2 days | Already prototyped in `scripts/normalize_variable_fields.py`; needs generalization + round-trip tests. |
-| Skeleton encode/decode wiring in `l3tc-rust` | 3-4 days | The Rust runtime already has SPM + RWKV AC paths; plumbing the normalized stream through is mechanical. |
-| Per-field encoders (TS / BLKID / IP / TASKID) | 4-5 days | Each is 100-300 lines of Rust with round-trip property tests. |
-| Mux + header format + versioning | 1-2 days | Small bit packer; important to get right once. |
-| Integration test harness with a round-trip gate | 2-3 days | Must be **bit-exact**: decode(encode(x)) == x. No exceptions. |
-| Benchmarking against zstd on HDFS + 2 corpora | 1-2 days | Confirms the design on the spike corpora. |
-| Customer-agnostic discovery path | 1-2 weeks | How do we auto-learn the right regex patterns per customer? Two options: (a) customers declare a schema, (b) infer from a sample. Both have failure modes. Design + prototype only — deep learning-based field inference is a separate research bet. |
+| LZ dictionary coder | `libzstd` via `zstd` Rust crate | 10+ years battle-tested; 100+ MB/s; we'd do a worse job |
+| Per-dataset dictionary | `zstd --train` / `ZSTD_trainFromBuffer()` | Existing API; takes a sample, emits a 100 KB dict; 2-3× better than default zstd on homogeneous data |
+| Huffman tail | inside zstd | free |
+| BWT + MTF option | `bzip2` library if we want a fourth codec | optional, case-by-case |
+| Arithmetic coding | already in `l3tc-rust` for the model path | keep |
+| SPM tokenizer | already wired | keep |
+| Neural model | `l3tc-rust` RWKV-v4 runtime | keep |
 
-Fixed HDFS-specific path: **~2 weeks, 1 engineer**. Generalized
-per-customer path: **~3-4 weeks**. The HDFS-specific path is enough
-to prove the thesis and beat zstd on at least one corpus, which is
-the Spike 2 hard constraint.
+## What we build
 
-## What this buys us vs. what it costs
+1. **Per-dataset dictionary training** — add a zstd dictionary training
+   pass to our training pipeline. Takes the first ~100 MB of a
+   customer's data, emits `v{N}.zstd_dict` alongside the `.pth` and
+   `.tokenizer.model` artifacts.
+2. **Codec dispatcher** at encode time: given a chunk (say 64 KB), run
+   all available codecs, pick the one with shortest output, write a
+   2-bit tag + the encoded bytes into the final blob.
+3. **Decode-side dispatcher**: read the 2-bit tag per chunk, route to
+   the matching decoder.
+4. **New blob format** with per-chunk codec tagging (2 bits per chunk
+   = negligible overhead at 64 KB chunks).
+5. **Service-side plumbing**: the training-complete Lambda now puts
+   both `.pth` AND `.zstd_dict` into DDB; the compression worker
+   downloads both; the Rust codec uses both.
 
-**Buys:**
-- Beats zstd on HDFS (our hardest corpus).
-- Stays inside the inference envelope (small model + cheap lookups).
-- Gives us a compression story customers can reason about: "we
-  model the structure, dictionary-encode the identifiers."
-- Opens the door to field-aware tools for customers (e.g., "give
-  me all logs where BLKID = X" is easier when BLKID is a named
-  stream, not embedded raw bytes).
+## The codec menu
 
-**Costs:**
-- **Schema dependency.** The HDFS-specific encoder doesn't ship
-  as-is for a customer with Stripe webhooks or nginx logs. We
-  need per-customer regex configs or a field-discovery pipeline.
-- **Round-trip correctness risk.** Every new field type is a
-  chance to introduce an encode/decode mismatch. Needs aggressive
-  property testing.
-- **Rust runtime complexity.** Today `l3tc-rust` is a pure
-  model + SPM pipeline. Adding field-stream mux + per-field
-  encoders roughly doubles the code size.
+```
+Tag  Codec                    When it wins
+───────────────────────────────────────────────────────────────
+0x0  zstd --long=27 -22       Default zstd, plain mode.
+                              Good fallback if dict isn't ready.
+0x1  zstd --dict <trained>    Templated data with known vocab of
+                              variable values (HDFS, Stripe audit
+                              trails, nginx access). Usually
+                              strictly better than 0x0 when a
+                              dict exists.
+0x2  model + AC               Context-dependent patterns where
+                              prediction beats dictionary recall
+                              (JSON events with free-text fields,
+                              prose, app logs with error strings).
+0x3  RESERVED                 future — bzip2 / PAQ-class / etc.
+```
 
-## Open decision
+Each chunk picks its own tag independently. No global choice.
 
-Before building: **do we commit to HDFS-class corpora in the
-product scope?** If the product really is "dump your logs here and
-we give you good compression," HDFS-class templated data is a
-realistic customer profile and we have to beat it. If the product
-is "structured audit trails + free-text content," HDFS is an
-adversarial outlier and we can skip this work, ship on realistic
-data, and flag the limitation.
+## Encode pseudocode
 
-Either answer is viable. Don't start the 2-week build without the
-answer.
+```rust
+fn encode_blob(raw: &[u8], model: &RWKVModel, zstd_dict: &[u8]) -> Vec<u8> {
+    let mut out = BlobHeader::new();
+    for chunk in raw.chunks(64 * 1024) {
+        let mut candidates = vec![];
+
+        candidates.push((0x0, zstd_encode(chunk, /*dict=*/None)));
+        candidates.push((0x1, zstd_encode(chunk, Some(zstd_dict))));
+        candidates.push((0x2, model_encode(chunk, model)));
+        // (optional: 0x3 bzip2)
+
+        let (tag, encoded) = candidates.into_iter()
+            .min_by_key(|(_, e)| e.len())
+            .unwrap();
+
+        out.push_chunk(tag, encoded);
+    }
+    out.finalize()
+}
+```
+
+Decode is just the inverse dispatch. Round-trip correctness per
+chunk is enforced by the library calls — zstd guarantees its own
+round-trip; our model path already has a round-trip test in
+`l3tc-rust`.
+
+## Speed + cost budget
+
+Worst case per chunk we run three encoders (zstd default, zstd+dict,
+model). zstd runs ~100+ MB/s so the zstd passes are effectively
+free. The model pass is the slow one at ~150 KB/s compress
+(l3tc-rust on L4 single-stream). For a 64 KB chunk that's ~0.4 s
+of model work.
+
+Net encode throughput on mixed data:
+- Chunks where zstd wins (short circuit after zstd finishes first):
+  ~100 MB/s chunk throughput.
+- Chunks where model wins: ~150 KB/s (model-bound).
+- Mixed corpus: aggregate ~1-10 MB/s depending on model-vs-zstd
+  mix.
+
+For async compression (the customer never waits), that's fine.
+
+Decode is similar but only runs the chosen codec per chunk, so
+decode throughput = whichever codec was picked. On the L4 GPU with
+batching, ~5-10 MB/s effective for the model path. Well inside the
+1 MB/s single-stream floor.
+
+## Guarantees this buys
+
+- **"Never worse than zstd-with-dict"**: for every chunk, the
+  dispatcher has the zstd-dict option available, so the worst case
+  is a chunk where zstd wins and we emit exactly what zstd would
+  have emitted + 2 bits tag. Header + tag overhead is < 0.01% of a
+  reasonably-sized blob.
+- **"Strictly better than zstd"** on data where the model beats
+  zstd on enough chunks to overcome the header cost. Measurably so
+  on variable-content corpora.
+- **No per-customer engineering.** The same codec dispatcher ships
+  to every customer; it just picks per-chunk.
+
+## What this means per-corpus
+
+| corpus | expected winner | why |
+|---|---|---|
+| HDFS logs | `zstd --dict` on most chunks | highly templated; dict covers the repeats; model rarely wins |
+| nginx access logs (with full query strings) | mixed, model-leaning | URL params + user agents are context-dependent |
+| JSON API events w/ variable payloads | model on most chunks | free-text descriptions + structured fields; good prediction target |
+| Stripe-style audit trails | mixed | structured fields zstd-friendly, free-text fields model-friendly |
+| Prose (docs, articles) | model on almost all chunks | zstd's n-gram approach is weak on natural language |
+| Binary blobs | zstd / raw | model has no business here |
+
+## Engineering plan
+
+| step | days | notes |
+|---|---|---|
+| Wire `zstd` crate into `l3tc-rust` | 0.5 | already a dependency; just expose it |
+| Add `ZSTD_trainFromBuffer()` call to training container entrypoint | 0.5 | emits `v{N}.zstd_dict` |
+| Per-chunk codec dispatcher + 2-bit tag in blob header | 1.5 | `l3tc-rust/src/codec.rs` + new blob version |
+| Update metadata JSON to record which codecs are available + winning-chunk histogram | 0.5 | useful for ops to see where model is contributing |
+| Decode-side dispatcher | 1 | mirror of encode side |
+| Round-trip tests on HDFS + 1 JSON corpus + 1 prose corpus | 1 | must be bit-exact; no exceptions |
+| Benchmark: total ratio, chunk-by-chunk codec distribution, decode throughput | 0.5 | writes up the numbers |
+| Wire into service: Fargate worker downloads dict; training pipeline emits dict | 1 | CDK + worker changes |
+
+**Total: ~1 week, 1 engineer.** An order of magnitude less than
+the original (hand-rolled encoders) design. Keeps the neural
+runtime simple — it only has to encode bytes to bits, same as
+today; the dispatcher is separate plumbing.
+
+## Open decisions
+
+1. **Chunk size.** 64 KB is a reasonable default (balances per-chunk
+   overhead vs. coder efficiency). Might tune per-corpus later.
+2. **Whether to add `0x3 bzip2`** as a fourth option. Could help on
+   extremely sorted / structured data. Low-cost to add; nice-to-have.
+3. **Dictionary refresh cadence.** If a dataset drifts, the zstd
+   dict may stale. Need policy for when to retrain (parallel to the
+   model retrain logic).
+4. **Dictionary size.** zstd's default is 110 KB; customers with
+   huge vocabularies of variable values might want larger. Bench on
+   real data.
+
+## What this does NOT claim
+
+- We are **not** beating the theoretical entropy of HDFS. Nobody
+  can.
+- We are **not** claiming our neural model is better than zstd on
+  templated log data in isolation — it isn't, and that's fine.
+- We are **not** eliminating the need for zstd as a dependency — we
+  are doubling down on it.
+
+The product claim is **"we pick the best compressor per chunk of
+your data, automatically, from a menu that includes zstd-with-a-
+dictionary-trained-on-your-data + a neural model trained on your-
+data."** That is strictly better than any of the components on
+their own on any mixed corpus.
