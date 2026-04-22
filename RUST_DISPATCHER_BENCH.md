@@ -3,10 +3,19 @@
 Actual byte counts from the Rust `l3tc hybrid-compress` binary built
 from `l3tc-rust/` at commit `cc2248a`. Supersedes the Python
 simulator numbers in [`DISPATCHER_SIM_RESULTS.md`](DISPATCHER_SIM_RESULTS.md)
-on the chunks the simulator covered. Still classical-only — the
-neural `.bin` model isn't wired into the training pipeline yet (see
-open task #27), so these numbers are a **lower bound** on what the
-full dispatcher will do.
+on the chunks the simulator covered.
+
+**Classical-only vs neural runs — important distinction.** The main
+per-chunk-size table below is deliberately **classical-only** (no
+neural codec in the probe menu). This measures the *floor* the
+dispatcher gives any customer *before* their per-dataset model is
+trained — i.e. the result on day 0 of a new archive. Adding neural
+requires a `.bin` trained on data from that distribution; the
+end-to-end section further down exercises that path using the
+pre-existing distilled L3TC-200K + enwik8 tokenizer, and the neural
+codec wins the chunk at **+46.6% vs per-chunk zstd** on prose. That
+number is what the dispatcher does once training runs for a
+customer; the 7.9% / 20.1% wins below are what it does before.
 
 ## Corpora
 
