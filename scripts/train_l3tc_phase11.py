@@ -312,18 +312,26 @@ class L3TCTokenDataset(Dataset):
 # Model + optimizer setup
 # ============================================================
 def build_model(device: torch.device, num_layers: int = DEFAULT_NUM_LAYERS,
-                vocab_size: int = DEFAULT_VOCAB_SIZE) -> RWKV_TC_HIRA:
+                vocab_size: int = DEFAULT_VOCAB_SIZE,
+                hidden_size: int = HIDDEN_SIZE,
+                intermediate_size: int | None = None,
+                rwkv_rank: int = RWKV_RANK,
+                ctx_len: int = CTX_LEN) -> RWKV_TC_HIRA:
+    # Default intermediate_size to hidden_size (L3TC-200K convention).
+    if intermediate_size is None:
+        intermediate_size = hidden_size
     print(
-        f"building RWKV_TC_HIRA: layers={num_layers} hidden={HIDDEN_SIZE} "
-        f"intermediate={INTERMEDIATE_SIZE} rank={RWKV_RANK} vocab={vocab_size}"
+        f"building RWKV_TC_HIRA: layers={num_layers} hidden={hidden_size} "
+        f"intermediate={intermediate_size} rank={rwkv_rank} vocab={vocab_size} "
+        f"ctx={ctx_len}"
     )
     model = RWKV_TC_HIRA(
         vocab_size=vocab_size,
-        hidden_size=HIDDEN_SIZE,
+        hidden_size=hidden_size,
         num_hidden_layers=num_layers,
-        intermediate_size=INTERMEDIATE_SIZE,
-        rwkv_rank=RWKV_RANK,
-        ctx_len=CTX_LEN,
+        intermediate_size=intermediate_size,
+        rwkv_rank=rwkv_rank,
+        ctx_len=ctx_len,
         dropout_prob=0.0,
     )
     n_params = sum(p.numel() for p in model.parameters())
@@ -605,6 +613,14 @@ def main() -> int:
                    help="Number of validation samples per eval pass.")
     p.add_argument("--num-layers", type=int, default=DEFAULT_NUM_LAYERS,
                    help="Number of RWKV transformer layers.")
+    p.add_argument("--hidden-size", type=int, default=HIDDEN_SIZE,
+                   help="Model hidden dim. L3TC-200K convention is 96.")
+    p.add_argument("--intermediate-size", type=int, default=None,
+                   help="FFN intermediate size; defaults to --hidden-size.")
+    p.add_argument("--rwkv-rank", type=int, default=RWKV_RANK,
+                   help="HiRA low-rank residual dim. L3TC default 4.")
+    p.add_argument("--ctx-len", type=int, default=CTX_LEN,
+                   help="Context length in tokens. RWKV is linear in ctx.")
     p.add_argument("--vocab-size", type=int, default=DEFAULT_VOCAB_SIZE,
                    help="Vocabulary size (must match the SPM tokenizer).")
     p.add_argument("--batch-size", type=int, default=BATCH_SIZE)
@@ -648,11 +664,13 @@ def main() -> int:
     train_ds = L3TCTokenDataset(
         args.train_file,
         epoch_length=args.epoch_length,
+        segment_length=args.ctx_len,
         seed=args.seed,
     )
     val_ds = L3TCTokenDataset(
         args.val_file,
         epoch_length=args.val_length,
+        segment_length=args.ctx_len,
         seed=args.seed + 1,
     )
     train_loader = DataLoader(
@@ -671,7 +689,15 @@ def main() -> int:
     )
 
     # Model + optimizer + scheduler
-    model = build_model(device, num_layers=args.num_layers, vocab_size=args.vocab_size)
+    model = build_model(
+        device,
+        num_layers=args.num_layers,
+        vocab_size=args.vocab_size,
+        hidden_size=args.hidden_size,
+        intermediate_size=args.intermediate_size,
+        rwkv_rank=args.rwkv_rank,
+        ctx_len=args.ctx_len,
+    )
     model = maybe_compile(model, device, args.no_compile)
     optimizer = build_optimizer(model)
     steps_per_epoch = args.epoch_length // args.batch_size

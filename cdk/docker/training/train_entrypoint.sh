@@ -177,6 +177,8 @@ python /app/scripts/train_l3tc_phase11.py \
     --epoch-length "${EPOCH_LENGTH}" \
     --batch-size "${BATCH_SIZE}" \
     --num-layers "${NUM_LAYERS}" \
+    --hidden-size "${HIDDEN_SIZE}" \
+    --ctx-len "${CONTEXT_LEN}" \
     --vocab-size "${VOCAB_SIZE}" \
     --lr 1e-4 \
     --device cuda \
@@ -210,6 +212,9 @@ held_out_ratio=$(python /app/scripts/measure_held_out_ratio.py \
     --checkpoint "$CHECKPOINT" \
     --tokenizer "$MODEL_DIR/spm.model" \
     --num-layers "${NUM_LAYERS}" \
+    --hidden-size "${HIDDEN_SIZE}" \
+    --ctx-len "${CONTEXT_LEN}" \
+    --segment-len "${CONTEXT_LEN}" \
     --vocab-size "${VOCAB_SIZE}" 2>/tmp/measure.stderr)
 rc=$?
 cd /app

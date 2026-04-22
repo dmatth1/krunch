@@ -32,24 +32,27 @@ import torch.nn.functional as F
 import sentencepiece as spm
 
 
-def load_model(checkpoint_path: Path, num_layers: int, vocab_size: int):
+def load_model(checkpoint_path: Path, num_layers: int, vocab_size: int,
+               hidden_size: int = 96, ctx_len: int = 2048,
+               intermediate_size: int | None = None, rwkv_rank: int = 4):
     """Load the RWKV model using the same factory as train_l3tc_phase11.
 
     We import at call time so that this script can be used standalone
     without pulling vendor/L3TC/ into sys.path globally."""
     sys.path.insert(0, "/app")  # so `scripts.*` resolves inside the container
     sys.path.insert(0, "/app/vendor/L3TC")
-    try:
-        # train_l3tc_phase11.py defines the model architecture we need.
-        # Importing it triggers its module-level code but we just need
-        # the model class + factory.
-        from scripts.train_l3tc_phase11 import build_model  # type: ignore
-    except ImportError:
-        # Fallback — try alternate import locations
-        raise
+    from scripts.train_l3tc_phase11 import build_model  # type: ignore
 
     device = torch.device("cpu")  # load on CPU first; caller moves to GPU
-    model = build_model(device, num_layers=num_layers, vocab_size=vocab_size)
+    model = build_model(
+        device,
+        num_layers=num_layers,
+        vocab_size=vocab_size,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        rwkv_rank=rwkv_rank,
+        ctx_len=ctx_len,
+    )
 
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     state_dict = ckpt.get("model_state_dict", ckpt)
@@ -72,6 +75,10 @@ def main() -> None:
     p.add_argument("--tokenizer", type=Path, required=True)
     p.add_argument("--num-layers", type=int, default=2)
     p.add_argument("--vocab-size", type=int, default=16384)
+    p.add_argument("--hidden-size", type=int, default=96)
+    p.add_argument("--ctx-len", type=int, default=2048)
+    p.add_argument("--intermediate-size", type=int, default=None)
+    p.add_argument("--rwkv-rank", type=int, default=4)
     p.add_argument("--segment-len", type=int, default=2048)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = p.parse_args()
@@ -94,7 +101,11 @@ def main() -> None:
         sys.exit(2)
 
     # Load model + run inference to accumulate log-likelihood.
-    model = load_model(args.checkpoint, args.num_layers, args.vocab_size)
+    model = load_model(
+        args.checkpoint, args.num_layers, args.vocab_size,
+        hidden_size=args.hidden_size, ctx_len=args.ctx_len,
+        intermediate_size=args.intermediate_size, rwkv_rank=args.rwkv_rank,
+    )
     model = model.to(args.device)
 
     total_neg_log2 = 0.0
