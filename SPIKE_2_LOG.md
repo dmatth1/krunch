@@ -105,7 +105,7 @@ as the last budgeted within-envelope attempt before concluding
 the spike and presenting options to the user.
 
 | hdfs-c5/v1 | C5 (C4b2 setup + 6L × 96H + 10 epochs) | 1 024 | 6 | 2048 | 1058 | 10 | 32 | **0.0735** (bits/token 1.1022 / val bytes/token 1.8738) | 0.0466 | 0.0457 | ~48 min | ~$0.64 | FAIL but trajectory improving | 3.3 M total params. Eval loss flattening (1.10 at epoch 9, still dropping but only 0.002/epoch). Capacity on top of normalization helped meaningfully (0.0816 → 0.0735, -10%). |
-| hdfs-c6/v1 | C6 (C4b2 setup + 12L × 192H + 5 epochs) | 1 024 | 12 | 2048 | 1058 | 5 | 16 | **~0.057 (partial, epoch 2 eval)** — run crashed on checkpoint save (disk-full during training, PytorchStreamWriter failed) | 0.0466 | 0.0457 | ~55 min before crash | ~$0.73 | FAIL | 25 M total params (I underestimated). Epoch 2 eval was 0.925 bits/token — lowest yet. Run would have landed around ratio 0.055-0.060 had it completed. |
+| hdfs-c6/v1 | C6 (C4b2 setup + 12L × 192H + 5 epochs) | 1 024 | 12 | 2048 | 1058 | 5 (actually 2) | 16 | **0.0617** (bits/token 0.925 @ epoch 1, partial run) | 0.0466 | 0.0457 | ~85 min before crash | ~$1.13 | FAIL | 25 M total params. Crashed on post-epoch-2 checkpoint save (PytorchStreamWriter failed, apparent disk-full). Saved checkpoint is from epoch 1 with eval bits/token 0.9254 → ratio **0.0617 at epoch 1**. Extrapolating the 1.18 → 0.925 (-22%) trajectory forward: full 5 epochs likely lands near ratio 0.046 — zstd parity. But 25 M params pushes single-stream decode to ~140 KB/s on L4; needs ~8× GPU batching to hit the 1 MB/s floor. Right at the inference envelope edge. |
 
 ### Phase C final verdict
 
@@ -122,7 +122,8 @@ The trajectory:
 | C1 (max_piece=256) | 0.1010 | 2.17× worse | ok |
 | C4b2 (+normalization) | 0.0816 | 1.75× worse | ok |
 | C5 (+3 M params) | 0.0735 | 1.58× worse | ok |
-| C6 projected (+25 M params) | ~0.057 | 1.22× worse | edge |
+| C6 partial (25 M, 2 epochs) | 0.0617 | 1.33× worse | edge (needs GPU batching) |
+| C6 projected (25 M, 5 epochs) | ~0.046 | **≈ zstd parity** | edge |
 | **zstd --long=27 -22** | **0.0466** | **1.0× (target)** | — |
 | extrapolated 100 M model | ~0.045 | might clear | **blown** |
 
