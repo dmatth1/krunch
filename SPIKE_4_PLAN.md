@@ -23,49 +23,60 @@ Fail = the thesis is broken and the pivot was wrong.
 
 ## Corpora
 
-Two publicly available, reproducible corpora, ordered by
-diagnostic value. Both are real LLM chat transcripts — the exact
-data shape our target customers retain.
+Two publicly available chat corpora chosen to separate **"neural
+wins on dialogue"** from **"neural wins on *production* dialogue
+specifically"**. Running both gives us a diagnostic signal
+beyond a simple pass/fail.
 
-### Corpus A: OASST2 (`OpenAssistant/oasst2`)
+### Corpus A (primary): WildChat-4.8M (`allenai/WildChat-4.8M`)
+
+- **Source**: [allenai/WildChat-4.8M on Hugging Face](https://huggingface.co/datasets/allenai/WildChat-4.8M)
+- **License**: ODC-BY (Open Data Commons Attribution). Ungated,
+  scriptable download.
+- **Content**: 3,199,860 real conversations between human users
+  and ChatGPT, non-toxic filtered, coverage through August 2025.
+- **Character**: **production LLM chat transcripts** — real users
+  typing real questions, real GPT-4/3.5 responses, including typos,
+  retries, abandoned threads, vocabulary drift. This is the closest
+  public analog to what Harvey's attorneys, Abridge's clinicians,
+  or Hebbia's analysts actually generate every day.
+- **Size**: subset to ~200 MB for shake-down, ~1 GB for full spike
+- **Why primary**: if the product thesis is "we win on regulated-
+  vertical AI chat archives," WildChat is the proxy for that data
+  shape. Passing on WildChat is the defensible signal; failing on
+  WildChat kills the thesis.
+
+### Corpus B (diagnostic): OASST2 (`OpenAssistant/oasst2`)
 
 - **Source**: [OpenAssistant/oasst2 on Hugging Face](https://huggingface.co/datasets/OpenAssistant/oasst2)
-- **Content**: human-generated conversations with OpenAssistant-style
-  assistant, 208,584 messages across 70,642 conversation trees. 101
-  languages (English dominant). Quality-annotated.
-- **Size**: ~150–250 MB raw (estimate; HF API reports message count
-  but not bytes)
-- **Character**: assistant-style Q&A, multi-turn, mostly English
-  prose. Analog to what a legal-AI or healthcare-AI platform
-  would archive: user asks, model answers at length.
-
-### Corpus B: LMSYS-Chat-1M (`lmsys/lmsys-chat-1m`)
-
-- **Source**: [lmsys/lmsys-chat-1m on Hugging Face](https://huggingface.co/datasets/lmsys/lmsys-chat-1m)
-- **Content**: 1,000,000 real conversations between humans and 25
-  LLMs (Vicuna demo + Chatbot Arena). English heavy, 5-month
-  collection window in 2023. Public, reproducible.
-- **Size**: ~2–3 GB raw estimated (1M × avg 6 turns × avg ~500
-  bytes/turn)
-- **Character**: most realistic proxy for production LLM chat
-  logs — diverse user questions, multiple model styles of
-  response. Closest to what a multi-tenant AI customer support
-  platform would have.
+- **Content**: 208,584 curated human-generated conversations across
+  70,642 trees, quality-annotated in 101 languages (English dominant).
+- **Character**: **curated assistant-training data** — volunteers
+  coached to produce high-quality Q&A, not real production traffic.
+  Cleaner, more structured, less noise. Closer to the text the
+  model was trained on (OpenAssistant conversations are the
+  L3TC-era RWKV training neighborhood) than to what customers
+  actually archive.
+- **Size**: ~150–250 MB raw
+- **Why diagnostic**: if WildChat passes and OASST2 passes, neural
+  wins on dialogue broadly (simple product story). If WildChat
+  passes and OASST2 fails, production messiness helps us. If
+  WildChat fails and OASST2 passes, we can only win on curated
+  corpora — a narrower product that requires upstream content
+  filtering before ingest. If both fail, the thesis is broken.
 
 ### Corpus choice rationale
 
-**OASST2 first** (shake-down, ~200 MB): small enough to train a
-model in <1 hour on g6.xlarge and run full compression in <15 min
-on 4-vCPU ARM Fargate. Fast feedback loop.
+Two experiments let us read the *shape* of the win, not just
+pass/fail. Previous draft plan had OASST2 first for
+convenience — WildChat is the correct primary because it matches
+the product's target data shape. OASST2 stays as the second
+experiment specifically because its curation gap vs WildChat is
+the diagnostic signal.
 
-**LMSYS-Chat-1M second** (real test, ~1 GB English subset): at
-training-realistic scale, confirms OASST2 result isn't a small-corpus
-artifact. Filter to English-only to avoid multilingual vocab
-blowup in the 16K SPM model.
-
-Skipping the older Spike 3 corpora (Python code, pure
-OpenAssistant) — the pivot targets dialogue specifically, not
-general text.
+Skipped: LMSYS-Chat-1M (access-gated on HF, not scriptable),
+ShareGPT (redistribution-unclear), Python code and raw OpenAssistant
+from the original Spike 3 plan (wrong data shape post-pivot).
 
 ## Pass gates (stricter than Spike 3)
 
@@ -90,8 +101,8 @@ From published literature + our own enwik8 measurement:
 
 | corpus | expected dispatcher ratio | vs zstd-22 | confidence |
 |---|---|---|---|
-| OASST2 | 0.15–0.22 | 20–35% better | high — English dialogue is the L3TC sweet spot |
-| LMSYS-Chat-1M | 0.16–0.24 | 18–32% better | medium — more content diversity, per-user model may not generalize as cleanly |
+| WildChat-4.8M (production chat) | 0.17–0.25 | 18–30% better | medium — real production diversity is a harder prediction problem than curated data |
+| OASST2 (curated) | 0.15–0.22 | 20–35% better | high — English dialogue is the L3TC sweet spot, quality-filtered lowers noise |
 
 These predictions are informed by:
 - `bench/results/enwik8-l3tc.md`: 200K RWKV on enwik8 prose → 14%
@@ -127,63 +138,85 @@ CodeBuild a fresh training image carrying the two bug fixes (commit
 after this plan lands). Register as jobdef revision 18. ~10 min
 build + 10 sec register.
 
-### Step 2 — OASST2 experiment (~1 hr training + ~5 min compression)
+### Step 2 — WildChat experiment (~1 hr training + ~5–15 min compression)
 
-1. Download OASST2 "ready" split from Hugging Face → flatten to
-   NDJSON locally → upload to
-   `s3://archive-dev-archive/spike4/oasst2/raw/`
-2. Submit training via SQS to `archive-dev-training-submit` with
-   `{cid: spike4, dsid: oasst2, trigger: initial}`. Defaults are
-   fine (vocab 16K, 2L×96h, 10 epochs).
-3. Monitor via rich-log monitor. Expect: SPM + tokenize in ~5 min,
-   RWKV train in ~45 min, measure + convert + zstd-dict in ~2 min,
-   upload + compression enqueue automatic.
-4. Compression worker runs on the full corpus (should be <15 min
-   at ~200 MB / 0.25 MB/s if the speed-fixes compound).
-5. Read EMF metrics + compare to zstd-22 baseline.
+1. Fetch a ~200 MB subset of WildChat-4.8M from Hugging Face
+   (`pip install datasets; load_dataset("allenai/WildChat-4.8M",
+   split="train", streaming=True)` → take conversations until
+   ~200 MB). Flatten each conversation into a NDJSON record with
+   `{conversation_id, turn, role, content, timestamp}` — same
+   shape production chat logs use.
+2. Upload to `s3://archive-dev-archive/spike4/wildchat/raw/`.
+3. Submit training via SQS to `archive-dev-training-submit` with
+   `{cid: spike4, dsid: wildchat, trigger: initial}`. Entrypoint
+   defaults OK (vocab 16K, 2L × 96 h, 10 epochs, LR 1e-4).
+4. Rich monitor tails: expect SPM train ~5 min, corpus tokenize
+   ~5 min, RWKV 10 epochs ~45 min, post-training (convert +
+   zstd-dict + measure + metadata upload) ~2 min, compression
+   auto-enqueued.
+5. Compression on the 5 MB val split (or the full raw if we're
+   patient) via the 4-vCPU Graviton Fargate path. 5 MB ≈ 3 min at
+   current throughput; expand if faster.
+6. Read EMF metrics under `Krunch/Hybrid` (CustomerId=spike4,
+   DatasetId=wildchat). Compare ratio to whole-file zstd-22 on
+   the same val split.
 
-### Step 3 — LMSYS-Chat-1M experiment (~2 hr training + ~1 hr compression)
+### Step 3 — OASST2 experiment (~45 min training + ~5 min compression)
 
-If Step 2 hits the required gate, scale up to the 1 M conversation
-corpus (English subset). Same flow, bigger data.
+Run **regardless** of WildChat result (both runs cheap, diagnostic
+signal is the point).
 
-If Step 2 **misses** the required gate, STOP before Step 3 and
-re-examine. Possible causes + fixes before spending 2 hours:
-- 200K too small → bump to 1M params (bigger hidden_size)
-- Chunk size too small → bump to 4 MB
-- SPM vocab wrong for dialogue → retrain with different
-  `max_piece_length`
+1. Download OASST2 "ready" split from Hugging Face
+   (`load_dataset("OpenAssistant/oasst2", split="train")`).
+2. Flatten conversation trees → NDJSON, same schema as WildChat
+   step.
+3. Upload to `s3://archive-dev-archive/spike4/oasst2/raw/`, submit
+   training, monitor, compress same as Step 2.
 
 ### Step 4 — writeup
 
 `SPIKE_4_LOG.md` with:
 - Per-corpus table: ratio, zstd shadow, savings %, codec
-  distribution, throughput
-- Pareto plot vs the existing enwik8 + HDFS + GH-events data
-  points (5 datapoints total across the three spikes)
+  distribution, throughput, per-epoch loss curve summary
+- Pareto plot: ratio vs throughput across all corpora measured
+  so far (enwik8, HDFS, GH events, WildChat, OASST2) — the chart
+  that makes the narrowed product claim concrete
+- Diagnostic read of WildChat × OASST2 × production-proxy quality
+  (see Decision tree below)
 - Decision: does the narrowed product pitch hold empirically?
+  Update `CUSTOMER_PROFILE.md` if the result refines the segment
+  fit.
 
 ## Cost estimate
 
 | step | compute | wall | $ |
 |---|---|---|---|
 | Rebuild training image | CodeBuild | 10 min | ~$0.10 |
-| OASST2 training | g6.xlarge on-demand | ~1 hr | ~$1.20 |
-| OASST2 compression | Fargate 4 vCPU ARM | ~15 min | ~$0.02 |
-| LMSYS training (if gate hit) | g6.xlarge on-demand | ~2 hr | ~$2.40 |
-| LMSYS compression (if gate hit) | Fargate 4 vCPU ARM | ~1 hr | ~$0.08 |
-| **Total if full plan runs** | | ~4 hr wall | **~$3.80** |
+| WildChat training | g6.xlarge on-demand | ~1 hr | ~$1.20 |
+| WildChat compression | Fargate 4 vCPU ARM | ~5–15 min | ~$0.02 |
+| OASST2 training | g6.xlarge on-demand | ~45 min | ~$0.90 |
+| OASST2 compression | Fargate 4 vCPU ARM | ~5 min | ~$0.01 |
+| **Total** | | ~2–3 hr wall (parallelizable) | **~$2.25** |
 
-Negligible $ but half a working day of wall clock.
+Both experiments can run serially on the same Batch queue; the two
+training jobs don't share state so they could also run in parallel
+if we bump max vCPU on the compute env. For now: serial, one
+afternoon.
 
-## Decision tree
+## Decision tree (WildChat × OASST2 matrix)
 
-| outcome | product impact | next step |
-|---|---|---|
-| OASST2 + LMSYS both hit STRONG gate (≥ 25%) | Pitch defensible at "20–40% smaller than zstd on chat archives"; first customer outreach (Abridge / Nabla / similar) | Begin compliance cert work (SOC 2 / BAA) + fix the per-conversation-deletion gap called out in CUSTOMER_PROFILE.md |
-| Both hit REQUIRED gate (≥ 15%) but miss STRONG | Pitch is "15–25% smaller on chat" — weaker but still meaningful, ~$20K/year savings on a 100 TB Harvey-scale customer | Keep the 200K model but plan a path to 1M–10M params for customers who want more savings |
-| OASST2 misses REQUIRED | Thesis problem. Either 200K is too small for dialogue or the architecture is wrong for this shape. Stop before LMSYS. Re-think. | Architecture investigation: bigger model, different tokenizer, rethink segment_bytes |
-| OASST2 strong, LMSYS weak | Per-customer specialization works but single-model-for-many-users doesn't. The pitch holds for dedicated customers (most regulated-vertical) but not for multi-tenant platforms | Refine the product to require per-customer models; no shared-model mode |
+| WildChat | OASST2 | read | next step |
+|---|---|---|---|
+| **STRONG (≥25%)** | **STRONG (≥25%)** | Clean win. "20–40% smaller on AI chat archives" is defensible empirically. | First customer outreach (Abridge / Nabla / Hebbia / similar series-C vertical AI). Begin BAA + SOC 2 work + per-conversation-deletion engineering per `CUSTOMER_PROFILE.md`. |
+| STRONG | REQUIRED (15–25%) | Production data is *easier* than curated to compress (unusual but possible — repetitive retry patterns in WildChat help us). Neural wins decisively where it matters most. | Same first-customer outreach. Note: we'd need to tell customers "dirtier data compresses better with us" which is actually a nice talking point. |
+| REQUIRED (15–25%) | STRONG | Curated text is easier than production to compress; neural still wins on real chat but less. | Pitch "15–25% smaller on your real chat traffic." Still meaningful — ~$20K/yr savings for a 100 TB Harvey-scale customer. Consider 1M-param model roadmap. |
+| REQUIRED | REQUIRED | Thesis holds but at the weak end. Product story is real but less dramatic. | Ship at current quality for early-design-partner customers. Plan path to 1M-param model to expand the margin. |
+| **MISS** | STRONG | Production messiness breaks our model. Per-customer training on an individual customer's own data might fix it. | Investigate: try training WildChat in per-conversation-tree splits, or try smaller domain-specific slices. May mean the product REQUIRES true per-customer fine-tuning (which we already have, but maybe with more data). |
+| MISS | MISS | **Thesis failure.** 200K model does not decisively beat zstd on real-world dialogue. | Stop the pivot. Architecture investigation: bigger neural (1M–10M params), different tokenizer (e.g. 32K vocab), different backbone (Mamba-2 instead of RWKV-v4). ~1–2 weeks of research before any more customer discussion. |
+
+The two-experiment design specifically exists to distinguish the
+last two rows from the first four. A single-corpus spike can't tell
+us whether failure is in our model or in the corpus.
 
 ## Out of scope (defer to later spikes / work)
 
@@ -198,9 +231,11 @@ Negligible $ but half a working day of wall clock.
 
 ## Success criterion
 
-**Spike 4 succeeds if at least the OASST2 experiment hits the
-REQUIRED gate (dispatcher ratio ≤ 0.85 × zstd-22 on the val
-split).**
+**Spike 4 succeeds if WildChat hits the REQUIRED gate (dispatcher
+ratio ≤ 0.85 × zstd-22 on the val split).** OASST2 is diagnostic
+only — a strong OASST2 alone doesn't validate the product because
+OASST2 is not the target data shape.
 
-That's the floor for making "we beat zstd 20–40% on AI chat
-archives" into a defensible product claim to show customers.
+That's the floor for making "we beat zstd by 15–40% on AI chat
+archives" into a defensible product claim we can show to Abridge /
+Nabla / Hebbia / other first-customer candidates.
