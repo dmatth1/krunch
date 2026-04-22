@@ -23,7 +23,12 @@
 # dodge the anonymous Docker Hub rate limit (429 Too Many Requests)
 # that killed the compression-image build on 2026-04-22. Same upstream
 # image, mirrored by AWS — zero functional difference.
-FROM public.ecr.aws/docker/library/rust:1.82-bookworm AS rust-builder
+# 1-bookworm floats to the latest Rust 1.x stable. Pinning to 1.82
+# broke on 2026-04-22 because cargo's dep resolver pulled in
+# clap_builder 4.6.0 (edition 2024 in its Cargo.toml) which 1.82
+# can't parse. Latest-stable avoids re-breaking every time an indirect
+# dep bumps its MSRV.
+FROM public.ecr.aws/docker/library/rust:1-bookworm AS rust-builder
 
 # bzip3 headers aren't in Debian Bookworm yet; build from upstream.
 # Pin to a specific tag so CodeBuild reruns are reproducible.
