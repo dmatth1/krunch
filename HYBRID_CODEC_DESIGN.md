@@ -4,6 +4,77 @@ Status: design decided, pre-implementation. Revised 2026-04-22 after
 Spike 2 findings + research on cmix/paq8 detection primitives + user
 review of detector + within-file hybrid options.
 
+## Where AI compression beats zstd (with real numbers)
+
+From published literature + our own enwik8 measurement + Spike 2 data:
+
+| content | zstd-22 ratio | our 200K RWKV ratio | neural win | source |
+|---|---|---|---|---|
+| English prose (enwik8) | 0.2527 | 0.2166 | **14%** | `bench/results/enwik8-l3tc.md` |
+| English prose (enwik8, bigger LM) | 0.2527 | ~0.11 (NNCP) | ~55% | NNCP Hutter-prize-class papers |
+| Source code | ~0.33 | ~0.20 | ~40% | DeepMind "Language Modeling Is Compression" |
+| Clinical / medical prose | ~0.28 | ~0.16 | ~40% | LMCompress Nature paper |
+| Legal prose | ~0.25 | ~0.15 | ~40% | LMCompress Nature paper |
+| Chat / transcripts | ~0.28 | ~0.17 | ~40% | LMCompress Nature paper |
+| JSON with free-text fields | ~0.30 | ~0.20 | ~30% | estimate from similar work |
+| Templated machine logs (HDFS) | 0.047 | 0.14 | **loses 3×** | our own Spike 1/2 |
+| Pre-compressed / binary | ~1.0 | ~1.0 | tied | trivial |
+| Near-duplicate docs | varies | **brotli shared-dict wins** | 90%+ reduction | RFC 9842 |
+
+The pattern: **text-like content (the bulk of realistic customer
+data, per `CUSTOMER_PROFILE.md`) → neural wins 15–40%. Templated
+machine-log content → classical wins. Binary → neither helps, just
+store raw.**
+
+## Algorithms the product uses vs. algorithms it doesn't yet
+
+Current runtime = neural codec + zstd-fallback only. The dispatcher
+design brings in the following, each closing a specific ratio gap:
+
+1. **CLP (Uber's Compressed Log Processor)** — Apache-2.0,
+   ~2× smaller than zstd on real logs. The single biggest missing
+   piece for the HDFS-class case and what makes us competitive on
+   any log corpus.
+2. **Zstd trained dictionaries** (`ZSTD_trainFromBuffer`) — 2–5×
+   smaller than default zstd on ≤1 KB chunks. Free lift on any
+   homogeneous-schema customer (fintech, structured logs).
+3. **Brotli shared dictionaries (RFC 9842)** — 90%+ smaller on
+   incremental document versions. Necessary for legal / contract /
+   document archival use-cases.
+4. **bzip3** — 3–10% smaller than zstd-22 on text. Small incremental
+   lift on chunks where neural and zstd-dict both underperform.
+5. **Field-aware columnar compression** (Tier 2 of our design) —
+   2–5× smaller on JSON/NDJSON with known schema. Critical for
+   audit-trail and event-stream customers.
+6. **XWRT-style text preprocessor** — 15–35% extra on top of any
+   classical coder for XML/HTML. Optional.
+7. **Bigger neural models** — NNCP-size or Mamba-2 class at 10–100 M
+   params. Would push the "neural wins" column from +14–40% to
+   +40–60% on text. Gated on GPU batching for inference envelope.
+8. **The per-chunk dispatcher itself** — just picking the right
+   codec per chunk delivers 20–40% aggregate savings vs.
+   always-zstd on mixed data.
+
+Tier 1 implementation (engineering plan below) includes items 1–4,
+the dispatcher framing (#8), and the core neural path we already
+have. Tier 2 adds item 5. Items 6–7 are opt-in optimizations for
+specific customer types and deferred.
+
+## The product pitch this design supports
+
+> "We compress your data with the best codec for each chunk,
+> automatically. On text-heavy content — which is most data
+> customers actually pay to archive — we beat zstd by 15–40%. On
+> templated infrastructure logs we match zstd via CLP preprocessing.
+> You never pay more than zstd + a small dispatcher overhead,
+> because our safety-net always substitutes zstd when it would have
+> been smaller. Per-dataset, we train a compression model on your
+> data; savings compound with scale."
+
+Defensible, honest, and doesn't require us to cherry-pick
+benchmarks. See `CUSTOMER_PROFILE.md` for the vertical-by-vertical
+breakdown that backs this claim.
+
 ## Product thesis
 
 **Neural is the primary codec for text-like content. Classical codecs
