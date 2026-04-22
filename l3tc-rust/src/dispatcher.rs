@@ -824,6 +824,24 @@ mod tests {
     }
 
     #[test]
+    fn clp_stub_never_wins_and_decode_errors() {
+        // Encode always inflates so shortest-pick will prefer any
+        // real codec; decode must surface a clear NotImplemented
+        // error rather than silently returning garbage.
+        let stub = ClpStub;
+        let encoded = stub.encode(b"hello").unwrap();
+        assert!(
+            encoded.len() > b"hello".len(),
+            "ClpStub.encode must inflate so dispatcher never picks it"
+        );
+        let err = stub.decode(&encoded).unwrap_err();
+        assert!(
+            matches!(err, Error::NotImplemented(_)),
+            "ClpStub.decode must surface NotImplemented, got {err:?}"
+        );
+    }
+
+    #[test]
     fn codec_tag_roundtrip() {
         for &t in &[
             CodecTag::Passthrough,

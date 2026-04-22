@@ -23,7 +23,9 @@ FROM rust:1.82-bookworm AS rust-builder
 
 # bzip3 headers aren't in Debian Bookworm yet; build from upstream.
 # Pin to a specific tag so CodeBuild reruns are reproducible.
-ARG BZIP3_VERSION=1.5.1
+# Match the version libbzip3-sys 0.5.1+1.5.3 bundles — the crate's
+# build.rs links against whatever headers we install here.
+ARG BZIP3_VERSION=1.5.3
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential cmake git pkg-config \
         libsentencepiece-dev \
