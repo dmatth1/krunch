@@ -61,6 +61,21 @@ RUN cd l3tc-rust \
  && strip target/release/l3tc \
  && cp target/release/l3tc /l3tc
 
+# Stage the dynamic libs /l3tc actually needs into a single path so the
+# runtime stage can copy them verbatim. ldd lists every shared-lib
+# dependency with its resolved path; we skip libc / libm / libstdc++ /
+# libgcc (those come from the runtime base image and must match its
+# glibc version) and copy only the project-specific ones — sentencepiece
+# is apt-installable in the runtime stage, but bzip3 is built from
+# source here and nowhere else, so we MUST carry it. Using ldd keeps us
+# robust against upstream soname changes (1.5.3 ships libbzip3.so, 1.5.0
+# shipped libbz3.so — globbing missed the rename on 2026-04-22).
+RUN mkdir -p /runtime-libs \
+ && ldd /l3tc | awk '/=>/ {print $3}' \
+    | grep -E 'bz|bzip3' \
+    | xargs -I{} cp -av {} /runtime-libs/ \
+ && ls -la /runtime-libs/
+
 # -----------------------------------------------------------------------------
 # Stage 2: Python runtime
 # -----------------------------------------------------------------------------
@@ -82,14 +97,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         zstd ca-certificates libsentencepiece0 libstdc++6 libgcc-s1 \
  && rm -rf /var/lib/apt/lists/*
 
-# The l3tc binary + bzip3 shared library both come from stage 1.
-# bzip3 1.5.3 installs `libbzip3.so.*` (earlier versions used
-# `libbz3.so.*`); glob both so we survive future renames. ldconfig
-# rebuilds the linker cache so the newly-placed libs are visible
-# without having to drop LD_LIBRARY_PATH on the PID.
+# The l3tc binary + the bzip3 shared libs it dynamically links to
+# both come from stage 1. `/runtime-libs` is the staged set ldd
+# identified in the builder (see the RUN step there) — copying from
+# that single path is robust against multi-arch install-dir layouts
+# and upstream soname changes. ldconfig rebuilds the linker cache so
+# the newly-placed libs are visible without LD_LIBRARY_PATH.
 COPY --from=rust-builder /l3tc /usr/local/bin/l3tc
-COPY --from=rust-builder /usr/lib/libbz* /usr/lib/
-RUN ldconfig
+COPY --from=rust-builder /runtime-libs/ /usr/lib/
+RUN ldconfig && ldd /usr/local/bin/l3tc | head -10
 
 WORKDIR /app
 
