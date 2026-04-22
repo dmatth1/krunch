@@ -166,6 +166,39 @@ can't claim "best on any dataset" — has a known weakness.
 I can build either. Need your call before starting — they're
 non-overlapping work.
 
+## C6full result (2026-04-22) — closes out Spike 2
+
+Re-ran C6 with the /tmp cleanup fix to avoid the disk-full
+checkpoint crash. Completed 3 epochs of the planned 5 before
+hitting the same `PytorchStreamWriter` failure (different root
+cause — torch atomic-write temp file exhaustion on the 25 M model's
+~200 MB checkpoint saves). Eval history through epoch 1:
+
+| epoch | bits/token | ratio @ val bytes/token 1.874 |
+|---|---|---|
+| 0 | 1.1801 | 0.0787 |
+| 1 | 0.9254 | **0.0617** |
+
+C6full at epoch 1 matches the earlier C6 partial result (0.0617).
+Epoch-2 training loss was 0.469 nats (eval not recorded), suggesting
+a further small improvement toward ~0.055–0.060 had training
+continued — but also suggesting diminishing returns.
+
+**Conclusion: capacity scaling to 25 M params does not close the
+gap to whole-file zstd's 0.0466 on HDFS. Within the inference
+envelope (≥ 1 MB/s single-stream decode on L4) the best neural-only
+result is ~0.062, about 33% worse than the best classical result.
+Spike 2 closed.**
+
+The structural gap is zstd's 128 MB hash dictionary working across
+chunks, which no small neural model approximates via prediction.
+Path forward is **Tier 1 dispatcher + CLP in the codec menu + larger
+chunks on templated-log datasets** — all of which are committed to
+in `HYBRID_CODEC_DESIGN.md`. `DISPATCHER_SIM_RESULTS.md` shows the
+simulated dispatcher already matches per-chunk zstd on HDFS and
+beats whole-file zstd by 14.5% on enwik8 *before* CLP is wired in;
+CLP closes the HDFS gap.
+
 ## Infra fixes folded in for Spike 2
 
 - Compression Dockerfile: `PYTHONUNBUFFERED=1` so the worker's
