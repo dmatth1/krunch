@@ -55,27 +55,83 @@ No second corpus for this spike — the question here is **model
 size + inference compute**, not corpus variety. OASST2 / other
 dialogue corpora are noise relative to that variable.
 
-## Model spec
+## Model spec — match L3TC-12M from the paper exactly
 
-| param | Spike 4 (200K) | **Spike 5 (10M)** | delta |
+Pulled from L3TC paper Table 6 (supplementary). No reason to
+diverge from their measured sweet spot for this size class.
+
+| param | vendor trainer name | Spike 4 (200K) | **Spike 5 (L3TC-12M)** |
 |---|---|---|---|
-| layers | 2 | **4** | 2× depth |
-| hidden dim | 96 | **256** | 2.7× width |
-| ctx_len | 2048 | 2048 | — |
-| vocab (SPM unigram) | 16K | 16K | — |
-| HiRA rank | 4× base | 4× base | — |
-| params | ~200K | **~10M** | 50× |
+| layers | `num_layers` | 2 | **4** |
+| residual / attn dim (`n_embed` in vendor code) | `hidden-size` CLI flag | 96 | **384** |
+| FFN intermediate dim | `intermediate-size` CLI flag | 96 (default = hidden) | **1024** |
+| ctx_len | `ctx-len` | 2048 | 2048 |
+| vocab (SPM unigram) | `vocab-size` | 16K | **16K** |
+| HiRA rank | `rwkv-rank` | 4 | 4 |
+| params | | ~200K | **~12M** |
 
-50× parameter count is deliberate — below that the GPU advantage
-is marginal, above it training cost starts to bite per customer.
-10M sits in the literature sweet spot for small LM compressors
-(NNCP's 1.7M model beats zstd by ~55% on enwik8; scaling to 10M
-should saturate the compression curve for this model family).
+Naming gotcha: what the L3TC paper calls "embedding dim" (384) is
+what the vendor code calls `n_embed` — it's both the residual
+stream and the attention dim (RWKV ties them via
+`key = Linear(n_embed, n_embed)`). What the paper calls "hidden
+size" (1024) is the **FFN intermediate size**, a separate
+parameter.
 
-Training stays per-customer (our design differentiator):
-- 10 epochs, batch=32, LR=1e-4 (same as Spike 4 — fair comparison)
+Our entrypoint's env var `HIDDEN_SIZE` maps to `--hidden-size` CLI
+= `n_embed` in the model = 384. The FFN intermediate is controlled
+by `--intermediate-size` which defaults to `--hidden-size` when
+not specified. **We need to add `INTERMEDIATE_SIZE` env override
+to `train_entrypoint.sh` before step 2** — small change, one line.
+
+On vocab: the paper explicitly found *"excessively large
+vocabularies may require a larger model capacity, leading to a
+slight decline in compression performance when vocabulary sizes
+exceed 16K."* Capacity goes to the vocab table instead of the
+backbone. 16K is an ablation-derived sweet spot, not a guess.
+
+Training stays per-customer:
+- 10 epochs, batch=32, LR=1e-4 (same as Spike 4 — fair comparison
+  vs the 200K baseline)
 - Expected training cost: ~$5–15 per dataset on g6.xlarge
   (~3–4 hr wall clock vs 1.5 hr for 200K)
+- Batch=64 (paper setting) worth testing if the L40S has memory
+  headroom at this parameter count — likely fine at 12M
+
+### Why 12M is the GPU-throughput sweet spot (not bigger)
+
+At A10G / L40S-class GPUs with batch=256 lanes:
+
+| model size | per-step wall (compute + dispatch overhead) | tokens/s @ batch=256 | throughput @ 4 B/tok |
+|---|---|---|---|
+| 200K (current) | ~550 µs (overhead-dominated) | ~465K | 1.9 MB/s *in theory* — but GPU **loses to CPU** at this size |
+| 1M | ~550 µs | ~465K | ~1.9 MB/s, ~tie with 16 vCPU CPU |
+| **12M** | **~700 µs** (compute ≈ overhead) | **~365K** | **~1.4 MB/s** — GPU sweet spot |
+| 25M | ~1.5 ms | ~170K | ~680 KB/s |
+| 50M | ~3 ms | ~85K | ~340 KB/s |
+| 100M | ~6 ms | ~42K | ~170 KB/s |
+
+Below 1M, GPU dispatch overhead (~500 µs) dominates and CPU wins.
+Above 12M, compute grows linearly while batching amortization
+plateaus — throughput goes DOWN. **12M is the local maximum of
+tokens/second-per-cost** for our shape of workload (batched
+per-token RWKV forward).
+
+Memory budget check for 12M at batch=256, ctx=2048:
+- Weights: 12M × 4 bytes = 48 MB
+- Activations: 256 × 2048 × 384 × 4 bytes ≈ 800 MB
+- Total ~850 MB, fits easily in 24 GB (A10G) or 48 GB (L40S)
+
+Ratio curve from the L3TC paper on enwik8:
+- 200K → 0.22, 800K → 0.20, 3.2M → 0.19, 12M → 0.18
+- Scaling law predicts 25M → ~0.175, 50M → ~0.17 (single-percent gains)
+- Training cost scales ~linearly; going past 12M costs 2-4× more
+  per customer for 1-2% more ratio. Not a good trade unless the
+  target customer explicitly pays for premium compression tier.
+
+**Decision: 12M for Spike 5.** If 12M hits STRONG gate with
+throughput headroom, a later spike could try 25M for customers
+willing to pay a speed/cost premium for another 3-5% ratio. But
+that's optional product scope, not base-tier.
 
 ## GPU inference path — pick one
 
@@ -177,7 +233,7 @@ work."
 | step | effort | $ | gate |
 |---|---|---|---|
 | 1. Wait on Spike 4 exp 2 completion | — | — | baseline number for comparison |
-| 2. Train 10M model on WildChat-English (Batch, env override NUM_LAYERS=4 HIDDEN_SIZE=256) | ~4 hr | ~$5 | loss curve healthy + convert_checkpoint survives on 4L × 256h |
+| 2. Train L3TC-12M on WildChat-English (Batch, env overrides NUM_LAYERS=4 HIDDEN_SIZE=384 INTERMEDIATE_SIZE=1024) — requires one-line entrypoint patch to expose INTERMEDIATE_SIZE as env var | ~4 hr | ~$5 | loss curve healthy + convert_checkpoint survives on 4L × 384h × 1024 ffn |
 | 3. ONNX export + local sanity check (Mac, CPU-ORT) | ~2 days | $0 | round-trip equivalence vs PyTorch |
 | 4. Spin up one-off g5.xlarge EC2, pull model + run ONNX hybrid-compress on 5 MB English sample | ~2 days | ~$5 | compiles + round-trips |
 | 5. Measure ratio + throughput | ~0.5 day | — | **gate 1 + 2** |
