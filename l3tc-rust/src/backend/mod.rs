@@ -45,6 +45,9 @@ pub mod mtl;
 #[cfg(feature = "metal")]
 pub mod batched;
 
+#[cfg(feature = "cuda")]
+pub mod cuda;
+
 /// The set of inference backends this build was compiled to support.
 ///
 /// `Cpu` is always present. `Metal` is present iff this crate was
@@ -60,6 +63,12 @@ pub enum Backend {
     /// a Metal-capable device at runtime.
     #[cfg(feature = "metal")]
     Metal,
+
+    /// NVIDIA CUDA GPU. Requires the `cuda` cargo feature **and**
+    /// a CUDA-capable device at runtime. Tier-2 RWKV-4-Pile-169M
+    /// inference uses this backend.
+    #[cfg(feature = "cuda")]
+    Cuda,
 }
 
 /// Below this many input bytes, GPU init overhead exceeds the
@@ -105,6 +114,8 @@ impl Backend {
             "cpu" => Some(Backend::Cpu),
             #[cfg(feature = "metal")]
             "metal" => Some(Backend::Metal),
+            #[cfg(feature = "cuda")]
+            "cuda" => Some(Backend::Cuda),
             _ => None,
         }
     }
@@ -115,6 +126,8 @@ impl Backend {
             Backend::Cpu => "cpu",
             #[cfg(feature = "metal")]
             Backend::Metal => "metal",
+            #[cfg(feature = "cuda")]
+            Backend::Cuda => "cuda",
         }
     }
 }

@@ -94,6 +94,22 @@ metal = { version = "0.29", optional = true }
 objc2 = { version = "0.5", optional = true }
 objc2-foundation = { version = "0.2", optional = true }
 
+# --- Tier-2: optional CUDA backend ---
+# cudarc is a pure-Rust CUDA driver API wrapper. No libtorch, no
+# libcudnn — just CUDA driver + NVRTC for runtime PTX loading. Our
+# wkv.cu is compiled at build time via build.rs (nvcc → PTX), then
+# loaded at runtime via cudarc. Enable with `--features=cuda`.
+cudarc = { version = "0.13", default-features = false, features = ["std", "cuda-12040", "driver", "nvrtc"], optional = true }
+
+# --- Tier-2: pretrained model loading ---
+# PyTorch .pth files are zip containers holding a Pickle stream +
+# raw tensor blobs. serde-pickle deserializes the Pickle; we pair it
+# with zip-rs (already transitive) to pull the tensor blobs.
+serde-pickle = { version = "1.1", optional = true }
+
+# tokenizers (HuggingFace) for 20B_tokenizer.json (GPT-NeoX BPE).
+tokenizers = { version = "0.20", default-features = false, features = ["onig"], optional = true }
+
 [dev-dependencies]
 # Deterministic rng for tests
 rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
@@ -117,9 +133,16 @@ cli = [
 # omit this entirely and have no GPU dependency. Enable with:
 #     cargo build --release --features=metal
 metal = ["dep:metal", "dep:objc2", "dep:objc2-foundation"]
+# Tier-2: opt-in NVIDIA CUDA backend (linux + nvcc toolchain).
+# Enable with `--features=cuda`. See src/backend/cuda.rs +
+# build.rs for the nvcc invocation that produces wkv.ptx.
+cuda = ["dep:cudarc"]
+# Tier-2: RWKV-4-Pile-169M inference path. Pulls the .pth loader,
+# the tokenizer, and the CUDA backend.
+rwkv-v4-pile = ["cuda", "dep:serde-pickle", "dep:tokenizers"]
 # Convenience meta-feature for "the most featureful local backend";
-# resolves to `metal` on Apple Silicon. Future: add `cuda` and
-# extend this to pick automatically.
+# resolves to `metal` on Apple Silicon. Future: resolve to `cuda`
+# on x86-64 Linux with nvcc present.
 gpu = ["metal"]
 
 # Lint policy. Applied by any `cargo clippy` or `cargo check` run,
