@@ -371,6 +371,145 @@ together**: ship the 16 vCPU Spot config, and add a per-dataset
 codec policy so we spend the neural budget where it materially
 wins. Defer (3) until a customer commits.
 
+### 2026-04-22 Decision: commit to (3) — bigger model + GPU
+
+After discussion, decided to pursue the bigger-model + GPU path
+(renamed Track 3 to distinguish from the dead Track 2). Before
+committing to plan, a colleague review caught five errors in my
+back-of-envelope math, which materially changed the expected
+outcome. Fixing them so the plan isn't built on wrong numbers.
+
+#### Corrections to my earlier math
+
+| Claim (mine) | Reality (reviewer + our measurements) |
+|---|---|
+| CPU per-token at 200K = 120 µs | **30 µs measured** (170 KB/s ÷ 8 cores ÷ ~5 B/tok). CPU baseline is 4× cheaper than I wrote. |
+| GPU dispatch overhead = 500 µs | 500 µs is naive launch; persistent command graphs (CUDA Graphs / MPSGraph, which our Metal path already uses) drop it to ~20 µs. |
+| Batching amortizes dispatch 256× | RWKV's recurrent state + per-lane memory bandwidth mean **real speedups from batching are 20-50×**, not 256×. Our own Metal measurement saw ~4× from batch=256. |
+| ~3 B/token SPM | **4-5 B/token** on our tokenizer. enwik8 ≈ 3.5, GH events 5.0, WildChat est 4-5. |
+| "T4G GPU" | **T4G is Graviton2 CPU, not a GPU**. g4dn has T4, g5 has A10G, g6 has L40S. Name-confusion fix. |
+
+#### Corrected crossover picture
+
+Per-token latency at different model sizes (measured CPU + realistic
+batched GPU with persistent command graph):
+
+| model | CPU/token (measured-derived) | GPU batched/token (realistic) | winner |
+|---|---|---|---|
+| 200K | ~30 µs | ~20 µs (dispatch-dominated) | ~tie |
+| 1M | ~150 µs | ~25 µs | GPU 6× |
+| 10M | ~1.5 ms | ~50 µs | GPU 30× |
+| 100M | ~15 ms | ~200 µs | GPU 75× |
+
+Crossover is ~200-500K params (lower than my initial 1M claim).
+GPU advantage at 10M is bigger than I first wrote. The dead Track
+2 thesis was "200K on GPU beats 200K on CPU" — measured wrong.
+**Track 3 thesis is "10M on GPU beats 200K on CPU"**, which the
+math actually supports.
+
+#### Recalibrated targets
+
+Old optimistic extrapolation: 1.1 MB/s on 10M/T4G.
+Reviewer's realistic: ~300 KB/s without serious tuning, 500 KB/s-
+1 MB/s with a tuned persistent-command-graph backend + honest
+batching.
+
+- **Commit**: ≥ 500 KB/s compression at ≤ $0.17/GB on g6.xlarge spot
+- **Stretch**: 1 MB/s at ~ $0.08/GB
+
+The ratio improvement (est 20-30% from 200K → 10M on dialogue per
+LMCompress scaling laws) is the stronger economic argument than raw
+throughput. Ratio compounds across the archive's lifetime; speed is
+mostly a per-job latency and one-time cost.
+
+### What needs to be in place for Track 3
+
+Five workstreams:
+
+**1. Bigger model trained on chat data.** Pick a 10M-class RWKV-v4
+config (likely 4-6 layers × 384h, vocab stays 16K). Existing
+`scripts/train_l3tc_phase11.py` + `archive-dev-training` Batch on
+g6.xlarge — only config bump needed. 10M × 10 epochs on 200 MB
+WildChat should finish in 4-8 hours, ~$10-20. **Gate: ratio ≤ 0.15
+on held-out WildChat; if ratio barely moves, abandon.**
+
+**2. CUDA inference backend in `l3tc-rust`.** Today the neural
+codec in `dispatcher.rs` hard-codes `crate::codec::compress` (CPU-
+only). Options:
+- `cudarc` + hand-port Metal kernels to CUDA (~1 week, full control)
+- `candle` crate (has RWKV kernels already, but heavier deps, less
+  control over batched-session pattern)
+Leaning `cudarc`. **Persistent command graph is mandatory** — this
+is what keeps dispatch under 50 µs and makes the Track 3 math
+actually hold. Add `cuda` Cargo feature mirroring existing `metal`.
+
+**3. ECS EC2-GPU compute with scale-to-zero.** Fargate doesn't
+support GPU. Need EC2 launch type + capacity provider + ASG:
+- Instance: `g6.xlarge` spot (L40S, 48 GB VRAM, ~$0.30/hr spot)
+- ASG `min=0, max=N`, ECS Managed Scaling + Managed Termination
+  Protection
+- Spot + capacity-optimized allocation
+- Image: NVIDIA CUDA runtime base + our Rust binary (~3 GB)
+- Cold start estimate: 3-5 min (EC2 boot + image pull). Slower than
+  Fargate's ~2 min.
+
+**4. Routing / metadata.** Per-dataset metadata gets `backend`
+field. Training pipeline routes >1M-param models to GPU queue.
+Either a second SQS queue `archive-{env}-compression-gpu` or a
+single queue with worker-side assertion. Leaning two queues so
+CPU and GPU scaling are independent.
+
+**5. CPU service stays.** Small zstd-only jobs and datasets
+where neural doesn't win stay on the Fargate 16 vCPU Spot config.
+Don't over-engineer: the CPU path is already deployed and doing
+~90 KB/s / ~$0.61/GB; it's fine for small classical-only jobs.
+
+### Proposed spike structure
+
+| Day | Task | Gate |
+|---|---|---|
+| 1 | Model config + training on WildChat | Ratio ≤ 0.15 on held-out |
+| 2-3 | `cudarc` BatchedSession port + persistent graph | ≥300 KB/s on g6.xlarge |
+| 4 | Wire CUDA path into NeuralCodec + hybrid-compress | Round-trip tests pass |
+| 5 | CDK: EC2-GPU capacity provider, ASG min=0, new queue | `cdk deploy` clean |
+| 6 | Deploy to dev, end-to-end measurement | ≥500 KB/s empirically |
+| 7 | Writeup, go/no-go | decision |
+
+Budget ~$30-50 of AWS spend. Start with **Day 1 (train the bigger
+model)** because that kills the whole idea cheapest if ratio
+doesn't improve. If ratio wins, engineering is just execution.
+If it's flat, save a week of CUDA porting.
+
+### Session learnings (non-technical)
+
+Worth keeping for future work on this kind of problem:
+
+- **Measure before extrapolating.** My first Track 2 estimate
+  claimed 1.1 MB/s on 10M GPU — off by 4× on the CPU baseline and
+  5× on batching amortization. The 500 µs GPU overhead quote came
+  from memory, not a measurement on our codebase. Using our own
+  measurements would have caught these errors earlier.
+- **A colleague review is worth more than extra self-polishing.**
+  All five errors were caught by one review pass, not by me
+  writing more carefully.
+- **Instance-family name confusion is common.** g4dn=T4, g5=A10G,
+  g6=L40S, g5g=Graviton2+T4G (where T4G is a GPU tile on Graviton2
+  chassis — which I mistakenly called T4G and treated as on g5g,
+  a separate mistake). Look up the actual chip before quoting.
+- **Persistent command graphs are not a luxury for tight inference
+  loops.** They're what makes the GPU regime work for autoregressive
+  per-token inference at small model sizes. Writing "GPU" without
+  checking whether we have CUDA Graphs / MPSGraph is the difference
+  between 500 µs and 20 µs per step.
+- **Framing commit-vs-stretch targets is better than single number.**
+  "1 MB/s" invites over-promising. "Commit ≥500 KB/s, stretch 1 MB/s"
+  gives room for honest measurement without reneging.
+- **Ratio compounds; speed amortizes.** For a storage-as-a-service
+  product, a 20% ratio win is worth more than a 20% speed win
+  because ratio affects every byte forever and speed only affects
+  the one-time compression cost. Lead product conversations with
+  ratio when they're both available.
+
 ### Remaining open items
 
 - **Decompression benchmark** (partially measured 2026-04-22):
