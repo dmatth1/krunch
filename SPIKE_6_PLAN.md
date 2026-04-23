@@ -128,11 +128,29 @@ of the Track 3 pivot.
 
 ~$2–3 compute, ~4 eng-hours.
 
-## Track 3 — Pretrained base + per-tenant LoRA (C)
+## Track 3 — Pretrained RWKV base + per-tenant LoRA (C, revised)
 
-**Starts after Tracks 1 + 2 complete.** This is the real architectural
-pivot. L3TC trains from scratch per-dataset; we flip to: one shared
-pretrained base model + tiny per-tenant LoRA adapter.
+**Revision note (2026-04-23):** originally scoped as
+SmolLM2-360M (transformer) + LoRA. After published-throughput
+research, pivoted to **pretrained RWKV** as the base. Reasoning:
+
+- L3TC paper (RWKV-4 + HiRA) reports **4.35 MB/s on A100** — 14× the
+  300 KB/s gate.
+- ts_zip (Bellard, RWKV-4 169M) reports **1 MB/s on RTX 4090** — 3×
+  the gate.
+- Transformer-based neural compressors (FineZip/Llama-3-8B,
+  LLMZip/LLaMA-7B) are **0.67 KB/s and 0.012 KB/s respectively** —
+  orders of magnitude below the gate.
+- No published evidence of Mamba for AC text compression; the
+  "Mamba is faster" claim doesn't translate directly to AC
+  workloads.
+
+RWKV is the demonstrated fast-GPU-compression substrate.
+Transformer LMs would be a first-of-kind engineering bet.
+
+**Starts after Tracks 1 + 2 complete.** L3TC trains from scratch
+per-dataset; we flip to: one shared pretrained RWKV base + tiny
+per-tenant LoRA adapter.
 
 ### Why this works
 
@@ -146,21 +164,22 @@ pretrained base model + tiny per-tenant LoRA adapter.
   tokens, fine-tuned on tenant's archive only for specialization.
   Spike 5's "200 MB is 1/5th the paper's regime" complaint goes away.
 
-### Base model candidate evaluation
+### Base model candidate evaluation (revised — RWKV only)
 
-| candidate | params | tokenizer | license | pretrain budget |
+| candidate | params | tokenizer | license | pretrain |
 |---|---|---|---|---|
-| SmolLM2-135M | 135M | BPE 49K | Apache 2.0 | 2T tokens |
-| SmolLM2-360M | 360M | BPE 49K | Apache 2.0 | 4T tokens |
-| Qwen2.5-0.5B | 494M | BBPE 152K | Apache 2.0 | 18T tokens |
-| TinyLlama-1.1B | 1.1B | BPE 32K | Apache 2.0 | 3T tokens |
-| **(stretch) own 200M RWKV** | 200M | SPM 32K | — | ~$5k to pretrain |
+| RWKV-4-169m-pile | 169M | GPT-NeoX 50K | Apache 2.0 | ~330B tokens (The Pile) |
+| RWKV-4-430m-pile | 430M | GPT-NeoX 50K | Apache 2.0 | ~330B tokens |
+| RWKV-5-world-1.5B | 1.5B | RWKV World 65K | Apache 2.0 | multilingual |
+| RWKV-6-world-1.6B | 1.6B | RWKV World 65K | Apache 2.0 | multilingual |
 
-**Default pick: SmolLM2-360M.** Strong English+code, Apache 2.0,
-standard transformer with efficient decode, smaller vocab than Qwen
-so ONNX path is lean.
+**Default pick: RWKV-4-169m-pile.** Smallest, fastest decode, same
+family as ts_zip (proven 1 MB/s at this exact config). HF hub:
+`RWKV/rwkv-4-169m-pile`. English-Pile pretraining matches our
+WildChat-English corpus. Upgrade to 430m if 169m ratio misses gate.
 
-Revisit own-pretrain if SmolLM2 misses throughput gate.
+Skipping transformer candidates (SmolLM2, Qwen, Phi, TinyLlama) —
+published throughput numbers rule them out for our 300 KB/s gate.
 
 ### Fine-tuning recipe (per tenant)
 
@@ -172,24 +191,42 @@ Revisit own-pretrain if SmolLM2 misses throughput gate.
 - Data: raw corpus (post-schema-preprocess content stream from Track 1)
 - Target train: val CE gap < 0.3 nats (keep adapter underfit)
 
-### Spike 6 experiment
+### Spike 6 experiments (revised — three sequential measurements)
 
-1. Download SmolLM2-360M base model
-2. Apply Track 1 preprocessor to WildChat-English → content stream
-   (same content stream used for preprocess+zstd measurement — both
-   fine-tune AND compress-time input go through the preprocessor)
-3. LoRA fine-tune on content stream (2 epochs, ~200 MB corpus)
-4. Export base + merged LoRA to ONNX
-5. Run full dispatcher sweep on g5.xlarge:
-   - Measure held-out ratio
-   - Measure end-to-end throughput
-6. Compare to:
-   | target | ratio | throughput |
-   |---|---|---|
-   | zstd baseline | 0.167 | 300 MB/s |
-   | Spike 5 L3TC-12M | 0.221 | (TBD Track 2) |
-   | **Spike 6 commit** | ≤0.15 | ≥200 KB/s |
-   | **Spike 6 stretch** | ≤0.12 | ≥400 KB/s |
+**3a. L3TC-12M GPU throughput** (resolves Track 2). Load existing
+Spike 5 `v1.pth` on g5.2xlarge A10G, run the throughput sweep from
+`scripts/gpu_throughput_test.py`. Compare to L3TC paper's 4.35 MB/s
+on A100 (A10G should be ~50-70% of that — so 2-3 MB/s expected).
+**Question answered: does our existing architecture already pass the
+speed gate?**
+
+**3b. RWKV-4-169m-pile zero-shot ratio on WildChat-English**. Apply
+Track 1 preprocessor → content stream. Forward-pass the held-out
+split through untrained RWKV-4-169m. Compute entropy-bound ratio.
+Compare to:
+- Spike 5 L3TC-12M held-out ratio: 0.2208
+- zstd-19 ratio: 0.167
+- bzip3 whole-file: 0.145
+- SmolLM2-360M local tiny-sample: 0.09 (suspect, but reference)
+
+Expected window: 0.10-0.18. Gate: beats from-scratch L3TC-12M
+(0.22) by at least 25% → ≤0.165. Stretch: beats bzip3 (0.145).
+
+**3c. RWKV-4-169m-pile + LoRA fine-tuned ratio**. Rank-16 LoRA over
+all attention + FFN linears. 2 epochs × ~5k steps × batch 8 over
+the content stream. Measure held-out ratio after training. Gate:
+beats 3b by ≥10% (fine-tune earns its keep). Stretch: ≤0.10 end-to-
+end (clear win vs everything classical).
+
+### Deliverables
+
+All three measurements land in
+`s3://archive-dev-archive/spike6/gpu-throughput/`:
+- `l3tc_throughput.json` (throughput + per-chunk latency histogram)
+- `rwkv_zeroshot.json` (ratio + bits-per-token)
+- `rwkv_lora.json` (trained LoRA ratio + loss curve)
+
+Plus tarballed LoRA adapter ready for future Tier-2 plumbing.
 
 ### Decision gates
 
