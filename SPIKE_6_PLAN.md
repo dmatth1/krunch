@@ -58,19 +58,35 @@ Decoder: strict roundtrip. Property test: decode(encode(x)) == x for
 
 ### Measurement
 
-Re-run WildChat-English 200 MB end-to-end on each codec stack:
-| stack | ratio | vs baseline |
-|---|---|---|
-| zstd alone | 0.167 | reference |
-| dispatcher alone (Spike 5 model) | 0.178 (measured) | — |
-| preprocess + zstd | **TBD** | expected 5–15% lift |
-| preprocess + dispatcher + Spike 5 model | **TBD** | ditto |
+The preprocessor runs at **both training time and compression time**
+— if training data is raw NDJSON but compression-time input is
+stripped, the model sees a distribution shift and arithmetic coding
+wastes bits. Tokenizer is also trained on the content stream, not
+raw NDJSON, so merges optimize for real content rather than JSON
+framing noise.
+
+Consequence: Spike 5's `v1.bin` (trained on raw NDJSON) cannot be
+re-used for preprocess-then-neural measurement. We'd need to retrain
+an L3TC-12M on the preprocessed corpus to get an apples-to-apples
+number — but that's Spike 5 compute all over again. So Track 1's
+neural measurement is deferred; the primary gate is the
+classical-codec-only stack:
+
+| stack | ratio | vs baseline | status |
+|---|---|---|---|
+| zstd alone | 0.167 | reference | measured |
+| dispatcher alone (Spike 5 model, raw NDJSON) | 0.178 | — | measured |
+| **preprocess + zstd** | **TBD** | expected 5–15% lift | **Track 1 gate** |
+| preprocess + bzip3 | **TBD** | similar | secondary |
+| preprocess + dispatcher + *new* 12M model | TBD | deferred — needs retrain | out-of-scope |
 
 ### Gate
 
 Declare success if **preprocess + zstd** ratio ≤ 0.155 (≥7% better
 than bare zstd). That proves the preprocessor has standalone value
-independent of any neural model.
+independent of any neural model — and importantly, that value
+transfers to Track 3 (SmolLM2 + LoRA fine-tunes on the same
+content stream, gets the same structural lift for free).
 
 ### Budget
 
@@ -160,6 +176,8 @@ Revisit own-pretrain if SmolLM2 misses throughput gate.
 
 1. Download SmolLM2-360M base model
 2. Apply Track 1 preprocessor to WildChat-English → content stream
+   (same content stream used for preprocess+zstd measurement — both
+   fine-tune AND compress-time input go through the preprocessor)
 3. LoRA fine-tune on content stream (2 epochs, ~200 MB corpus)
 4. Export base + merged LoRA to ONNX
 5. Run full dispatcher sweep on g5.xlarge:
