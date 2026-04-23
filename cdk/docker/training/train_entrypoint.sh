@@ -48,6 +48,9 @@ df -h /tmp | head -2
 VOCAB_SIZE="${VOCAB_SIZE:-16384}"
 NUM_LAYERS="${NUM_LAYERS:-2}"
 HIDDEN_SIZE="${HIDDEN_SIZE:-96}"
+# FFN intermediate dim. Defaults to HIDDEN_SIZE (L3TC-200K recipe).
+# For L3TC-12M (Spike 5), paper uses 1024 with HIDDEN_SIZE=384.
+INTERMEDIATE_SIZE="${INTERMEDIATE_SIZE:-}"
 CONTEXT_LEN="${CONTEXT_LEN:-2048}"
 EPOCHS="${EPOCHS:-10}"
 EPOCH_LENGTH="${EPOCH_LENGTH:-50000}"
@@ -206,6 +209,14 @@ mkdir -p "$MODEL_DIR/train_out"
 # time, so the trainer must run with cwd=/app/vendor/L3TC.
 # This mirrors phase11_bootstrap_helpers.sh's "cd vendor/L3TC" step.
 cd /app/vendor/L3TC
+# Optional --intermediate-size flag. L3TC paper ties emb=hidden and
+# separately specifies FFN intermediate. Only pass the flag when
+# INTERMEDIATE_SIZE is explicitly set, so the trainer default
+# (equal to --hidden-size) still kicks in for smaller configs.
+INTERMEDIATE_ARG=""
+if [ -n "${INTERMEDIATE_SIZE}" ]; then
+  INTERMEDIATE_ARG="--intermediate-size ${INTERMEDIATE_SIZE}"
+fi
 python /app/scripts/train_l3tc_phase11.py \
     --train-file "$MODEL_DIR/train.tok.txt" \
     --val-file "$MODEL_DIR/val.tok.txt" \
@@ -215,6 +226,7 @@ python /app/scripts/train_l3tc_phase11.py \
     --batch-size "${BATCH_SIZE}" \
     --num-layers "${NUM_LAYERS}" \
     --hidden-size "${HIDDEN_SIZE}" \
+    $INTERMEDIATE_ARG \
     --ctx-len "${CONTEXT_LEN}" \
     --vocab-size "${VOCAB_SIZE}" \
     --lr 1e-4 \
@@ -258,6 +270,7 @@ python /app/scripts/measure_held_out_ratio.py \
     --tokenizer "$MODEL_DIR/spm.model" \
     --num-layers "${NUM_LAYERS}" \
     --hidden-size "${HIDDEN_SIZE}" \
+    $INTERMEDIATE_ARG \
     --ctx-len "${CONTEXT_LEN}" \
     --segment-len "${CONTEXT_LEN}" \
     --vocab-size "${VOCAB_SIZE}" >/tmp/measure.stdout 2>/tmp/measure.stderr
