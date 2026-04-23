@@ -136,7 +136,122 @@ Pass gate **missed by −15.2%** vs required. As predicted.
   + dashboard + S3 upload) worked cleanly. Infrastructure is at
   "handles degraded inputs gracefully" maturity.
 
-## Experiment 2 — WildChat English-only (queued)
+## Experiment 2 — WildChat English-only (complete)
+
+### Setup (actual)
+
+- Corpus: 200 MB WildChat-4.8M filtered to `language == "English"`
+  at stream time. ~35K conversations, ~207K turns.
+- Hardware, model config, training recipe: identical to exp 1
+  (200K RWKV, 2L × 96h, 10 epochs, batch 32)
+- Training job: `426b3d6d` on jobdef rev 19 (image carrying the
+  `input_types + train=True` and `zstd --train` multi-sample fixes
+  from this session; held_out_ratio bug still latent, not yet
+  fixed at time of run).
+- Wall time: ~1h10m training + ~25 min compression
+
+### Training loss curve (English vs multilingual)
+
+| epoch | English | Multilingual (exp 1) | delta |
+|---|---|---|---|
+| 0 | 6.7444 | 6.9226 | −0.18 |
+| 1 | 5.1864 | 5.3223 | −0.14 |
+| 2 | 4.8519 | 4.9842 | −0.13 |
+| 3 | 4.6493 | 4.7717 | −0.12 |
+| 4 | 4.5165 | 4.6285 | −0.11 |
+| 5 | 4.4290 | 4.5337 | −0.10 |
+| 6 | 4.3731 | 4.4733 | −0.10 |
+| 7–9 | (not captured) | (similar plateau) | |
+
+Consistent ~0.1 nat improvement per epoch over multilingual.
+Final loss (epoch 9) projected ~4.30 vs multilingual's ~4.41.
+
+### Metadata emitted
+
+```json
+{
+  "codec": "hybrid",
+  "held_out_ratio": 0.54439,
+  "zstd_baseline_ratio": 0.166851,
+  "bytes_per_token": 3.4223,
+  "has_bin": true,
+  "has_zstd_dict": true
+}
+```
+
+`held_out_ratio = 0.544` is WRONG — the measure script was still
+loading the checkpoint under the wrong key (`"model_state_dict"` vs
+actual `"model"`). This produced near-uniform next-token
+predictions → entropy ≈ ln(16384) nats ≈ 9.7 nats/token → ratio
+≈ 0.51, matching the 0.544 bogus output.
+
+**Bug was diagnosed and fixed in commit `08d8802` after this run.**
+All three prior training-job runs produced meaningless
+`held_out_ratio` values. Real compression ratio (below) was always
+the source of truth.
+
+### Compression run result
+
+| metric | value |
+|---|---|
+| bytes in | 209,716,337 (200 MB) |
+| bytes out | 37,357,111 (35.6 MB) |
+| **dispatcher ratio** | **0.1781** |
+| per-chunk zstd-22 shadow | 0.2022 |
+| savings vs zstd shadow | +11.9% |
+| **whole-file zstd-22** | **0.1526** |
+| **dispatcher vs whole-file zstd** | **−16.7% (worse)** |
+| chunks total | 201 |
+| codec: bzip3 | 200 / 201 |
+| codec: neural | 1 / 201 (271 bytes — effectively zero) |
+| safety-net substitutions | 0 |
+| throughput | 0.13 MB/s |
+| wall time | ~25 min |
+
+### Pass gate outcome
+
+| gate | target | actual | result |
+|---|---|---|---|
+| Required (≥15% better than zstd-22) | ≤ 0.1297 | 0.1781 | **MISS** (−16.7%) |
+| Strong (≥25%) | ≤ 0.1145 | 0.1781 | miss |
+| Stretch (≥35%) | ≤ 0.0992 | 0.1781 | miss |
+
+### Interpretation
+
+Neural won only 1 of 201 chunks (271 bytes). Bzip3 took
+everything else. The 200K model produces an entropy bound
+(inferred from training loss ~4.30 nats) around 0.22 at
+bytes_per_token 3.42 — meaningfully worse than bzip3's ~0.18 on
+this data.
+
+**This is a capacity problem, not a training problem.** Multiple
+angles confirm:
+- Switching from 10 → 20 epochs would buy ~2% ratio (geometric
+  loss decay), moving −16.7% to ~−14%. Still misses.
+- English-only cleaned the multilingual tax but zstd also got
+  more effective on English content (baseline 0.1723 → 0.1526).
+  Relative gap widened slightly.
+- Architecture-level fix (bigger model): Spike 5 (L3TC-12M)
+  changes model capacity by ~60× and tests directly.
+
+Product-level finding: **the 200K model is not enough for AI
+chat archives**. Either we ship the 12M model (Spike 5) or
+restrict the product's neural codec to prose-heavier content
+types (documents, long-form legal correspondence, medical notes
+that read more like articles than chat turns).
+
+## Cross-experiment data table (updated)
+
+| corpus | size | zstd-22 | dispatcher | savings | codec distribution |
+|---|---|---|---|---|---|
+| enwik8 prose | 5 MB | 0.2878 | 0.1876 | +34.8% | neural 5/5 |
+| GH events JSON | 5 MB | 0.1436 | 0.1475 | −2.7% | bzip3 5/5 |
+| **WildChat multilingual** | **200 MB** | **0.1723** | **0.1986** | **−15.3%** | **bzip3 200/201, neural 1/201** |
+| **WildChat English** | **200 MB** | **0.1526** | **0.1781** | **−16.7%** | **bzip3 200/201, neural 1/201** |
+
+Clear pattern: neural wins decisively on enwik8 prose, loses on
+both JSON and chat at this model size. Spike 5 (12M) targets
+the chat case directly.
 
 ### Setup
 
