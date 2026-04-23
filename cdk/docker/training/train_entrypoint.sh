@@ -244,7 +244,15 @@ cd /app/vendor/L3TC
 # Capture rc of the python call specifically — not the cd that
 # follows. Previous version captured $? AFTER the cd which silently
 # masked every Python failure as rc=0.
-held_out_ratio=$(python /app/scripts/measure_held_out_ratio.py \
+# Capture stdout to file; extract the ratio number from the LAST
+# non-empty line. Why: torch's cpp_extension.load() prints ninja
+# build output + model-arch info to stdout during measure, not just
+# the ratio. On 2026-04-22 the shell variable capture pulled in
+# "ninja: no work to do.\nbuilding RWKV_TC_HIRA: ...\n0.567952"
+# as the whole `held_out_ratio` value, which then broke metadata.json
+# parsing in the training-complete Lambda. Fix: capture to file,
+# grep the last line that looks like a bare float, default to 1.0.
+python /app/scripts/measure_held_out_ratio.py \
     --val-file "$MODEL_DIR/val.txt" \
     --checkpoint "$CHECKPOINT" \
     --tokenizer "$MODEL_DIR/spm.model" \
@@ -252,12 +260,18 @@ held_out_ratio=$(python /app/scripts/measure_held_out_ratio.py \
     --hidden-size "${HIDDEN_SIZE}" \
     --ctx-len "${CONTEXT_LEN}" \
     --segment-len "${CONTEXT_LEN}" \
-    --vocab-size "${VOCAB_SIZE}" 2>/tmp/measure.stderr)
+    --vocab-size "${VOCAB_SIZE}" >/tmp/measure.stdout 2>/tmp/measure.stderr
 rc=$?
 cd /app
+# Extract the last line that's a bare float (matches ^[0-9]+\.[0-9]+$).
+# If no such line, fall back to sentinel 1.0.
+held_out_ratio=$(grep -E '^[0-9]+\.[0-9]+$' /tmp/measure.stdout | tail -1)
 if [ "$rc" -ne 0 ] || [ -z "$held_out_ratio" ]; then
   echo "[train] WARN: ratio measurement failed (rc=$rc) — using sentinel 1.0"
-  cat /tmp/measure.stderr 2>/dev/null | tail -20
+  echo "[train] measure stdout tail:"
+  tail -10 /tmp/measure.stdout 2>/dev/null | sed 's/^/  /'
+  echo "[train] measure stderr tail:"
+  tail -10 /tmp/measure.stderr 2>/dev/null | sed 's/^/  /'
   held_out_ratio="1.0"
 fi
 echo "[train] measure.stderr:"
