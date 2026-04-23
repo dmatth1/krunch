@@ -191,42 +191,56 @@ published throughput numbers rule them out for our 300 KB/s gate.
 - Data: raw corpus (post-schema-preprocess content stream from Track 1)
 - Target train: val CE gap < 0.3 nats (keep adapter underfit)
 
-### Spike 6 experiments (revised — three sequential measurements)
+### Spike 6 experiments (revised 2026-04-23 after RWKV pivot)
 
-**3a. L3TC-12M GPU throughput** (resolves Track 2). Load existing
-Spike 5 `v1.pth` on g5.2xlarge A10G, run the throughput sweep from
-`scripts/gpu_throughput_test.py`. Compare to L3TC paper's 4.35 MB/s
-on A100 (A10G should be ~50-70% of that — so 2-3 MB/s expected).
-**Question answered: does our existing architecture already pass the
-speed gate?**
+**Simpler scope.** After establishing that RWKV-4-169m-pile raw is
+the likely product (zero-shot dry-run ratio 0.11 already beats
+everything classical, and ts_zip proves the same model runs at 1
+MB/s on RTX 4090), the spike narrows to two measurements:
 
-**3b. RWKV-4-169m-pile zero-shot ratio on WildChat-English**. Apply
-Track 1 preprocessor → content stream. Forward-pass the held-out
-split through untrained RWKV-4-169m. Compute entropy-bound ratio.
-Compare to:
-- Spike 5 L3TC-12M held-out ratio: 0.2208
-- zstd-19 ratio: 0.167
-- bzip3 whole-file: 0.145
-- SmolLM2-360M local tiny-sample: 0.09 (suspect, but reference)
+**P1. RWKV-4-169m-pile zero-shot ratio on WildChat-English ≥10 MB.**
+Previous sample was 2 MB. At 10+ MB the result is trustworthy for a
+product decision. Apply Track 1 preprocessor → content stream, take
+the tail 20 MB, forward-pass, compute entropy-bound ratio. Gate:
+ratio ≤ 0.165 (25% better than zstd-19 at 0.167). Stretch: ≤ 0.115
+(matches our dry-run).
 
-Expected window: 0.10-0.18. Gate: beats from-scratch L3TC-12M
-(0.22) by at least 25% → ≤0.165. Stretch: beats bzip3 (0.145).
+**P2. RWKV-4-169m-pile decode throughput on A10G, bf16.** Use
+`scripts/smollm2_throughput_test.py` (works on any HF CausalLM)
+pointing at `RWKV/rwkv-4-169m-pile`. Expected: 500–700 KB/s based
+on ts_zip's 1 MB/s on RTX 4090 scaled to A10G. Gate: ≥ 300 KB/s.
+Stretch: ≥ 1 MB/s (matches ts_zip).
 
-**3c. RWKV-4-169m-pile + LoRA fine-tuned ratio**. Rank-16 LoRA over
-all attention + FFN linears. 2 epochs × ~5k steps × batch 8 over
-the content stream. Measure held-out ratio after training. Gate:
-beats 3b by ≥10% (fine-tune earns its keep). Stretch: ≤0.10 end-to-
-end (clear win vs everything classical).
+**Dropped from scope:** L3TC-12M throughput measurement and
+RWKV + LoRA fine-tune. Rationale:
+
+- L3TC-12M number is no longer load-bearing; the product candidate
+  is RWKV-4-169m-pile (not L3TC from-scratch). Re-litigate later if
+  needed.
+- LoRA is premature optimization if raw zero-shot already hits the
+  gate. Per-tenant fine-tuning adds training cost, adapter storage,
+  versioning complexity, and onboarding latency for maybe 10–20%
+  ratio improvement. Defer to v2.
 
 ### Deliverables
 
-All three measurements land in
-`s3://archive-dev-archive/spike6/gpu-throughput/`:
-- `l3tc_throughput.json` (throughput + per-chunk latency histogram)
-- `rwkv_zeroshot.json` (ratio + bits-per-token)
-- `rwkv_lora.json` (trained LoRA ratio + loss curve)
+Results land in `s3://archive-dev-archive/spike6/gpu-throughput/`:
+- `rwkv_zeroshot.json` (ratio + bits-per-token on ≥10 MB held-out)
+- `rwkv_throughput.json` (KB/s on A10G bf16)
 
-Plus tarballed LoRA adapter ready for future Tier-2 plumbing.
+### Decision gates (post-measurement)
+
+- **Both P1 and P2 pass gates** → Krunch v1 substrate is
+  RWKV-4-169m-pile used raw. Next work: Rust adapter for HF RWKV,
+  GPU decode path in `l3tc-rust`, dispatcher integration.
+- **P1 passes, P2 misses** → ratio works, speed doesn't. Investigate
+  the 2–5× speed lever stack (int8, torch.compile, CUDA graphs,
+  custom CUDA kernel).
+- **P1 misses** → larger base needed (RWKV-4-430m or 1.5B). Rerun
+  with same harness; cost scales proportionally.
+- **Both miss** → reconsider whether a general-chat benchmark is
+  the right proving ground (pivot to vertical corpora: legal docs,
+  medical notes, per-tenant chat logs).
 
 ### Decision gates
 
