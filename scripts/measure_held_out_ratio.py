@@ -55,8 +55,38 @@ def load_model(checkpoint_path: Path, num_layers: int, vocab_size: int,
     )
 
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    state_dict = ckpt.get("model_state_dict", ckpt)
-    model.load_state_dict(state_dict, strict=False)
+    # train_l3tc_phase11.py saves `{"model": state_dict, "optimizer":
+    # ..., "epoch": ...}` — the key is "model" (not "model_state_dict"
+    # as the original L3TC reference used). Fall back to `ckpt`
+    # itself for the rare case of a bare-state-dict save, but error
+    # loudly if neither produces any matching keys.
+    #
+    # Before the 2026-04-22 fix this silently fell through to
+    # `strict=False` with a state_dict of metadata keys (model,
+    # optimizer, epoch, ...) that matched *zero* model parameters
+    # → model loaded with random init → held_out_ratio came out
+    # ~0.54 (entropy of uniform 16K vocab) regardless of training
+    # quality. Real numbers only.
+    state_dict = ckpt.get("model", ckpt.get("model_state_dict", ckpt))
+    load_result = model.load_state_dict(state_dict, strict=False)
+    # Sanity check: if EVERY parameter ended up missing, we're
+    # loading a random-init model. That was the bug pre-2026-04-22.
+    model_param_count = sum(1 for _ in model.state_dict().keys())
+    missing_count = len(load_result.missing_keys)
+    if missing_count >= model_param_count * 0.9:
+        print(
+            f"FATAL: load_state_dict missed {missing_count}/{model_param_count} "
+            f"parameters — checkpoint structure mismatch. Check the top-level "
+            f"keys of the .pth: {list(ckpt.keys()) if isinstance(ckpt, dict) else 'not a dict'}",
+            file=sys.stderr,
+        )
+        sys.exit(3)
+    if missing_count > 0:
+        print(
+            f"[measure] WARN: {missing_count} model params not in checkpoint "
+            f"(continuing with partial load)",
+            file=sys.stderr,
+        )
     model.eval()
     return model
 
