@@ -83,6 +83,27 @@ pub enum Error {
     /// blob to the hybrid decoder.
     #[error("hybrid dispatcher: bad blob header ({0})")]
     BadHybridHeader(&'static str),
+
+    /// A GPU backend (CUDA, Metal) returned an initialization or launch
+    /// error. The `backend` field identifies which one; `message` wraps
+    /// the underlying driver/SDK error.
+    #[error("backend {backend}: {message}")]
+    Backend {
+        /// Which backend produced the error (`"cuda"`, `"metal"`, ...).
+        backend: &'static str,
+        /// Underlying error message.
+        message: String,
+    },
+
+    /// A model-loading or architecture error (shape mismatch beyond
+    /// what ShapeMismatch describes, missing weight tensor, unsupported
+    /// dtype, etc.). Tier-2 RWKV-4-Pile loader uses this for safetensors
+    /// validation failures.
+    #[error("model: {message}")]
+    Model {
+        /// Human-readable description of the problem.
+        message: String,
+    },
 }
 
 /// Convenience `Result` alias bound to [`Error`].

@@ -51,6 +51,15 @@ pub mod rwkv;
 pub mod tensor;
 pub mod tokenizer;
 
+// Tier-2: RWKV-4-Pile-169M pretrained inference (service-side neural
+// compressor). Gated behind `rwkv-v4-pile` feature which also pulls
+// in cuda + tokenizers + safetensors.
+#[cfg(feature = "rwkv-v4-pile")]
+pub mod rwkv_v4_pile;
+
+#[cfg(feature = "rwkv-v4-pile")]
+pub mod weights_rwkv;
+
 pub use dispatcher::{
     decode_blob as hybrid_decode, encode_blob as hybrid_encode, Bzip3Codec, ClpStub, Codec,
     CodecTag, DispatchStats, Lz4Codec, NeuralCodec, PassthroughCodec, Zstd22Codec, ZstdDictCodec,

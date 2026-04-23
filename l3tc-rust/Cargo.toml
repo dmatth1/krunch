@@ -110,6 +110,15 @@ serde-pickle = { version = "1.1", optional = true }
 # tokenizers (HuggingFace) for 20B_tokenizer.json (GPT-NeoX BPE).
 tokenizers = { version = "0.20", default-features = false, features = ["onig"], optional = true }
 
+# safetensors: mature flat-binary + JSON-header tensor format. One-shot
+# converter `scripts/convert_rwkv_pth_to_safetensors.py` turns BlinkDL's
+# .pth into safetensors; the Rust side uses this crate to mmap + parse
+# tensor headers without copying blob bytes.
+safetensors = { version = "0.4", optional = true }
+
+# Memory-mapped file reads for the safetensors blob. Already a dep
+# (memmap2 above); noting here that weights_rwkv.rs will reuse it.
+
 [dev-dependencies]
 # Deterministic rng for tests
 rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
@@ -139,7 +148,7 @@ metal = ["dep:metal", "dep:objc2", "dep:objc2-foundation"]
 cuda = ["dep:cudarc"]
 # Tier-2: RWKV-4-Pile-169M inference path. Pulls the .pth loader,
 # the tokenizer, and the CUDA backend.
-rwkv-v4-pile = ["cuda", "dep:serde-pickle", "dep:tokenizers"]
+rwkv-v4-pile = ["cuda", "dep:safetensors", "dep:tokenizers"]
 # Convenience meta-feature for "the most featureful local backend";
 # resolves to `metal` on Apple Silicon. Future: resolve to `cuda`
 # on x86-64 Linux with nvcc present.
