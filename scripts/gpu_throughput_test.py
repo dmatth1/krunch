@@ -25,9 +25,14 @@ import sentencepiece as spm
 
 def load_model(checkpoint_path: Path, num_layers: int, vocab_size: int,
                hidden_size: int, intermediate_size: int, rwkv_rank: int,
-               ctx_len: int):
-    sys.path.insert(0, "/app")
-    sys.path.insert(0, "/app/vendor/L3TC")
+               ctx_len: int, repo_root: Path | None = None):
+    if repo_root is None:
+        # Default to /app for the container case.
+        sys.path.insert(0, "/app")
+        sys.path.insert(0, "/app/vendor/L3TC")
+    else:
+        sys.path.insert(0, str(repo_root))
+        sys.path.insert(0, str(repo_root / "vendor" / "L3TC"))
     from scripts.train_l3tc_phase11 import build_model  # type: ignore
 
     device = torch.device("cpu")
@@ -71,14 +76,32 @@ def main() -> None:
                    help="Cap chunks measured (50 × 64KB = 3.2 MB sampled)")
     p.add_argument("--dtype", type=str, default="bf16",
                    choices=["fp32", "fp16", "bf16"])
+    p.add_argument("--device", type=str, default="auto",
+                   choices=["auto", "cuda", "mps", "cpu"])
+    p.add_argument("--repo-root", type=Path, default=None,
+                   help="Path to repo root (for `scripts.train_l3tc_phase11` import). Default /app.")
     p.add_argument("--result-path", type=Path, default=Path("/tmp/gpu_result.json"))
     args = p.parse_args()
 
-    assert torch.cuda.is_available(), "CUDA not available"
-    device = torch.device("cuda")
+    if args.device == "auto":
+        if torch.cuda.is_available():
+            device_str = "cuda"
+        elif torch.backends.mps.is_available():
+            device_str = "mps"
+        else:
+            device_str = "cpu"
+    else:
+        device_str = args.device
+    device = torch.device(device_str)
     torch_dtype = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[args.dtype]
 
-    print(f"[gpu] device={torch.cuda.get_device_name(0)}  dtype={args.dtype}", file=sys.stderr)
+    if device_str == "cuda":
+        dev_name = torch.cuda.get_device_name(0)
+    elif device_str == "mps":
+        dev_name = "Apple MPS"
+    else:
+        dev_name = "CPU"
+    print(f"[gpu] device={dev_name}  dtype={args.dtype}", file=sys.stderr)
 
     sp = spm.SentencePieceProcessor()
     sp.Load(str(args.tokenizer))
@@ -107,11 +130,18 @@ def main() -> None:
         args.checkpoint, args.num_layers, args.vocab_size,
         hidden_size=args.hidden_size, intermediate_size=args.intermediate_size,
         rwkv_rank=args.rwkv_rank, ctx_len=args.ctx_len,
+        repo_root=args.repo_root,
     )
     model = model.to(device=device, dtype=torch_dtype)
     model.eval()
     n_params = sum(p.numel() for p in model.parameters())
     print(f"[gpu] model loaded  params={n_params/1e6:.1f}M", file=sys.stderr)
+
+    def sync():
+        if device_str == "cuda":
+            torch.cuda.synchronize()
+        elif device_str == "mps":
+            torch.mps.synchronize()
 
     # Warmup (kernel cache, autotune, allocator)
     with torch.no_grad():
@@ -120,7 +150,7 @@ def main() -> None:
             inp = torch.tensor(seg, dtype=torch.long, device=device).unsqueeze(0)
             types = torch.zeros_like(inp)
             _ = model(inp, types, train=True)
-    torch.cuda.synchronize()
+    sync()
 
     # Measurement loop
     total_tokens_processed = 0
@@ -138,12 +168,12 @@ def main() -> None:
             tgt = torch.tensor(seg[1:], dtype=torch.long, device=device).unsqueeze(0)
             types = torch.zeros_like(inp)
 
-            torch.cuda.synchronize()
+            sync()
             t0 = time.perf_counter()
             out = model(inp, types, train=True)
             if isinstance(out, (tuple, list)):
                 out = out[0]
-            torch.cuda.synchronize()
+            sync()
             t1 = time.perf_counter()
             per_chunk_latency_ms.append((t1 - t0) * 1000.0)
 
@@ -164,7 +194,7 @@ def main() -> None:
 
     per_chunk_ms = sorted(per_chunk_latency_ms)
     result = {
-        "device": torch.cuda.get_device_name(0),
+        "device": dev_name,
         "dtype": args.dtype,
         "params_M": round(n_params / 1e6, 2),
         "tokens_per_chunk": tokens_per_chunk,
