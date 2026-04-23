@@ -46,6 +46,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::backend::cuda::CudaContextHandle;
+use crate::dispatcher::{Codec, CodecTag};
 use crate::error::{Error, Result};
 use crate::weights_rwkv::{RwkvConfig, RwkvV4PileWeights};
 
@@ -171,6 +172,82 @@ impl RwkvV4Pile169m {
              forward path (embed, LN, GEMM, time-mix, channel-mix). The \
              WKV kernel itself is already ported to src/cuda/wkv.cu and \
              loaded by backend::cuda::CudaContextHandle.",
+        ))
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Dispatcher integration
+// -----------------------------------------------------------------------------
+
+/// Dispatcher codec for the pretrained RWKV-4-Pile-169M path.
+///
+/// Shares one `RwkvV4Pile169m` across all chunks; each encode/decode
+/// call creates fresh per-layer state (chunks are independent so the
+/// dispatcher can reorder them for parallel decode).
+pub struct NeuralRwkvCodec {
+    model: Arc<RwkvV4Pile169m>,
+    /// GPT-NeoX BPE tokenizer (`20B_tokenizer.json`). Loaded once per
+    /// process, shared across requests.
+    tokenizer: Arc<tokenizers::Tokenizer>,
+}
+
+impl NeuralRwkvCodec {
+    /// Construct from a shared model + tokenizer.
+    pub fn new(model: Arc<RwkvV4Pile169m>, tokenizer: Arc<tokenizers::Tokenizer>) -> Self {
+        Self { model, tokenizer }
+    }
+
+    /// Convenience constructor: load tokenizer + model from files.
+    pub fn from_paths(model_safetensors: &Path, tokenizer_json: &Path) -> Result<Self> {
+        let model = Arc::new(RwkvV4Pile169m::from_safetensors(
+            model_safetensors,
+            RwkvConfig::RWKV_4_PILE_169M,
+        )?);
+        let tokenizer = tokenizers::Tokenizer::from_file(tokenizer_json)
+            .map_err(|e| Error::Tokenizer(format!("load {tokenizer_json:?}: {e}")))?;
+        Ok(Self::new(model, Arc::new(tokenizer)))
+    }
+}
+
+impl Codec for NeuralRwkvCodec {
+    fn tag(&self) -> CodecTag {
+        CodecTag::NeuralRwkv
+    }
+
+    fn encode(&self, input: &[u8]) -> Result<Vec<u8>> {
+        // Phase 3 flow:
+        //  1. text = str::from_utf8(input)?
+        //  2. tokens = self.tokenizer.encode(text, false)?.get_ids()
+        //  3. state = self.model.new_state(batch=1)
+        //  4. logits = self.model.forward(tokens, 1, tokens.len(), &mut state)?
+        //  5. for each position t: AC.encode(logits[t].softmax(), tokens[t+1])
+        //  6. return AC-coded bitstream + small header
+        //
+        // Phase 2 unblocks this: once forward() returns real logits
+        // the encode path reduces to straightforward AC coding.
+        let _ = input;
+        Err(Error::NotImplemented(
+            "NeuralRwkvCodec::encode — Phase 3 adds the tokenize + AC \
+             coding glue; depends on Phase 2 (forward pass implementation).",
+        ))
+    }
+
+    fn decode(&self, input: &[u8]) -> Result<Vec<u8>> {
+        // Phase 3 flow (step-by-step, inherently sequential):
+        //  1. state = self.model.new_state(batch=1)
+        //  2. tokens: Vec<u32> = vec![];
+        //  3. loop until original-length reached:
+        //       logits = self.model.forward(&[last_token], 1, 1, &mut state)?
+        //       tok = AC.decode(logits.softmax())
+        //       tokens.push(tok)
+        //       last_token = tok
+        //  4. text = self.tokenizer.decode(tokens, false)?
+        //  5. return text.into_bytes()
+        let _ = input;
+        Err(Error::NotImplemented(
+            "NeuralRwkvCodec::decode — Phase 3 adds the step-by-step \
+             decode loop; depends on Phase 2 (forward pass implementation).",
         ))
     }
 }

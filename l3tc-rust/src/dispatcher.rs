@@ -80,6 +80,11 @@ pub enum CodecTag {
     Clp = 6,
     /// Our neural model (RWKV + SPM + arithmetic coding).
     Neural = 7,
+    /// Tier-2 neural: pretrained RWKV-4-Pile-169M + GPT-NeoX BPE +
+    /// arithmetic coding. Shared base model, no per-archive weight
+    /// shipping. Requires the `rwkv-v4-pile` cargo feature and an
+    /// initialized CUDA backend at encode/decode time.
+    NeuralRwkv = 8,
 }
 
 impl CodecTag {
@@ -94,6 +99,7 @@ impl CodecTag {
             Self::BrotliDict => "brotli_dict",
             Self::Clp => "clp",
             Self::Neural => "neural",
+            Self::NeuralRwkv => "neural_rwkv",
         }
     }
 
@@ -109,6 +115,7 @@ impl CodecTag {
             5 => Self::BrotliDict,
             6 => Self::Clp,
             7 => Self::Neural,
+            8 => Self::NeuralRwkv,
             other => return Err(Error::UnknownCodecTag(other)),
         })
     }
