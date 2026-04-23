@@ -34,6 +34,26 @@ workload (80 KB/s on M1@4-thread vs 30 KB/s on Fargate@4-vCPU). That
 gap is architectural (Graviton's weaker NEON + L2 bandwidth + the
 vCPU-is-a-thread-not-a-core penalty), not a code defect.
 
+### M1 local sweep (2026-04-22, 200K distilled, enwik8 corpus)
+
+Full neural path, 8 cores:
+
+| File size | Compress | Decompress |
+|---|---|---|
+| 1 MB | 170 KB/s | 195 KB/s |
+| 5 MB | 164 KB/s | 194 KB/s |
+| 10 MB | 166 KB/s | 192 KB/s |
+
+Flat across sizes → forward-pass compute is the bottleneck and
+rayon is already saturating cores at 1 MB. Decompression is
+marginally faster (AC decode < AC encode). This is the neural
+ceiling on M1 8-core.
+
+Projection for 16 vCPU Fargate ARM Spot (Graviton2, per-core ~0.35×
+M1 per-core): ~130-150 KB/s compress, ~160-180 KB/s decompress.
+**That's well below the 1 MB/s goal.** If confirmed empirically
+after the neoverse-n1 image rebuild, Track 2 (GPU) is required.
+
 ### Per-phase breakdown (sequential, 256 KB, no rayon)
 
 | Phase | Time | % | Per-step |
@@ -175,52 +195,199 @@ and we want one deploy round-trip:
 Expected: ~4× throughput from cores (if rayon scales as on M1) + ~70%
 cost drop from Spot. Combined: ~$0.14/GB at 120 KB/s estimated.
 
-**Actual measured result (far better than expected):**
+**First deploy measured result (MISLEADING — hit a SIGILL bug):**
 
-| File | Chunks (1 MB each) | Throughput | $/GB @ $0.19/hr |
+| File | Throughput | Codec actually used |
+|---|---|---|
+| 1 MB | 0.82 MB/s | **zstd_fallback** (not neural!) |
+| 5 MB | 1.08 MB/s | zstd_fallback |
+| 10 MB | 2.43 MB/s | zstd_fallback |
+
+Post-mortem: the worker emitted `rc=-4 (SIGILL); falling back to zstd`
+for every message. Root cause: the image was built with
+`RUSTFLAGS="-C target-cpu=neoverse-v1"` (Graviton3). Fargate Spot
+lands on Graviton2 (neoverse-n1) for these task sizes, and the
+LLVM-emitted instructions that require v1-only features crash the
+process. The original 4 vCPU on-demand baseline happened to land on
+Graviton3-class hardware, which is why it succeeded with neural —
+pure placement luck.
+
+The throughput numbers above are **real for zstd_fallback** (~3400
+KB/s CPU ceiling, amortized across 2 parallel tasks + network),
+and confirm that the Fargate configuration itself (Spot, 16 vCPU)
+works. But we haven't yet measured the actual neural path on this
+config.
+
+### Fix + rebuild
+
+- Changed Dockerfile `RUSTFLAGS` to `-C target-cpu=neoverse-n1`.
+  Graviton3 is a superset of Graviton2; a neoverse-n1-compiled
+  binary runs on both. Our hand-written NEON kernels in `tensor.rs`
+  don't use any n1-vs-v1-differential instructions, so the 10×
+  matvec speedup from Phase 2.5a is preserved.
+- Triggered CodeBuild (`krunch-image-build`) from commit
+  `29f8620` to produce a new image. Build in progress.
+- After build completes: redeploy with new image tag, re-run
+  neural-path measurements, update this log.
+
+### Remaining status (pre-neural-remeasurement)
+
+| Goal | Target | Status |
+|---|---|---|
+| Speed (stretch) | ≥ 1 MB/s | ⏳ awaiting neoverse-n1 rebuild |
+| Cost | ≤ $0.05/GB | ⏳ awaiting above |
+| Scale-to-zero | required | ✅ Spot capacity, min=0 |
+| zstd_fallback throughput | n/a | ~1-2.4 MB/s confirmed on Spot 16 vCPU |
+
+### 2026-04-22 Re-measurement on 16 vCPU Spot + neoverse-n1 image
+
+Image `krunch-compress-29f862005c9e` deployed. Neural codec
+confirmed working (Codec=neural in EMF, ratio matches expected
+0.178). Results:
+
+| File | Throughput | Codec | $/GB @ $0.19/hr |
 |---|---|---|---|
-| 1 MB | 1 | **0.82 MB/s** | $0.066 |
-| 5 MB | 5 | **1.08 MB/s** | **$0.050** |
-| 10 MB | 10 | **2.43 MB/s** | **$0.022** |
+| 1 MB | 80 KB/s | neural | $0.68 |
+| 5 MB | 90 KB/s | neural | $0.61 |
+| 10 MB | 90 KB/s | neural | $0.61 |
+| 100 MB | (still running — same plateau expected) | | |
 
-Where the multipliers came from vs baseline (30 KB/s):
-- 16× more vCPU + Spot discount was the expected 4× win
-- The actual **27× on 1 MB / 80× on 10 MB** came from chunk-level
-  rayon parallelism finally having enough chunks to fill cores.
-  At 10 chunks × 16 cores, with each chunk running segment-level
-  rayon on its own work, the outer `par_iter` fans out and work-
-  stealing evens the load. This was dormant in the 4 vCPU config
-  because 5 chunks × 4 cores barely saturated.
+Plateau at ~90 KB/s across file sizes on 16 vCPU Fargate Spot.
 
-Cost per GB calculation:
-- Fargate ARM Spot (16 vCPU + 32 GB, us-east-1): ~$0.19/hr
-- At 2.43 MB/s: 1 GB → 7.0 min → **$0.022/GB**
-- At 1.08 MB/s: 1 GB → 15.4 min → **$0.050/GB**
+**This is disappointing.** Only 2.6-3× the 4 vCPU baseline despite
+4× the vCPU and Spot pricing. The scaling breakdown:
 
-### Goal status after Track 1
+- 4 vCPU on-demand on Graviton-likely-3: 30 KB/s (baseline)
+- 16 vCPU Spot on Graviton2 + neoverse-n1: 90 KB/s
 
-| Goal | Target | Actual (10 MB, steady-state) | Status |
+So 4× cores ≠ 4× throughput on Graviton2. The 16 vCPU instance
+probably has less per-core memory bandwidth than 4 individual
+tasks would (NUMA / shared L3 / memory-controller contention), and
+the neoverse-n1 codegen may lose a few more percent vs neoverse-v1.
+The forward pass is memory-bandwidth bound on the head matvec
+(16384 × 96 INT8 weights ≈ 1.5 MB streamed per token), which is
+precisely where Graviton2's narrower memory subsystem loses ground.
+
+At **90 KB/s / $0.61/GB**, we miss both top-level goals by an
+order of magnitude. CPU Fargate is not a path to ≥1 MB/s at
+<$0.05/GB.
+
+### Track 1 verdict — CPU alone is not enough
+
+Fargate Spot 16 vCPU on Graviton2 is a real improvement (3× the
+throughput and ~3× the $/GB), but it is not a path to either
+top-level goal. Keep the config as-is for day-to-day ops (it's
+3× cheaper and faster than baseline) and move to Track 2.
+
+### 2026-04-22 Track 2 (GPU) — starting
+
+Approach: the repo **already has a Metal GPU backend** (`l3tc-rust/
+src/backend/mtl.rs` + `batched.rs`, 5,000+ lines) that handles
+batched-segment forward passes at `batch_size=256` with ULP-parity
+bookkeeping (`FLAG_GPU_ENCODED`). Porting this to CUDA for a T4G-
+class GPU is real work, but the design is proven.
+
+**First step before writing any CUDA**: build the Metal path on
+M1 and measure. M1 GPU is the same ballpark as T4G (similar
+int8/fp16 TFLOPS, comparable memory bandwidth). If batch=256 on
+M1 Metal hits ≥1 MB/s, we know the pattern works and the CUDA
+port is pure engineering effort, not a research bet. If it
+doesn't, we revisit the whole approach before spending days on a
+port.
+
+### M1 Metal measurement (2026-04-22)
+
+Built `l3tc-rust` with `--features metal` locally and ran the
+same 200K model over the same enwik8 slices:
+
+| Config | 5 MB wall | Throughput |
+|---|---|---|
+| Metal batch=256 workers=1 (tuned default) | 39.2 s | **128 KB/s** |
+| Metal batch=256 workers=4 | 47.5 s | 105 KB/s |
+| Metal batch=512 workers=2 | 48.6 s | 103 KB/s |
+| Metal batch=1024 workers=1 | 59.3 s | 84 KB/s |
+| CPU NEON (reference) | 30.5 s | **164 KB/s** |
+
+**M1 Metal is 25-50% SLOWER than tuned M1 CPU NEON** on the 200K
+model at every tuning point. More workers and bigger batches made
+it worse, not better. This is not a bug; it's the regime the model
+is in:
+
+- Per-token forward pass is ~300 µs of compute
+- Per-token GPU dispatch + buffer prep is ~500 µs  
+- Batching across 256 segments amortizes dispatch across lanes, but
+  the per-lane compute is small enough that the GPU can't hide
+  kernel-launch latency even at the amortization knee
+- More workers introduces command-queue contention on one GPU
+
+This pattern generalizes: a T4G GPU on g5g.xlarge would face the
+same regime (same compute:dispatch ratio), so **porting Metal to
+CUDA would not help**. I'm not doing the port.
+
+### Honest verdict on both tracks
+
+| Platform | Neural throughput | $/GB | Source |
 |---|---|---|---|
-| Speed (stretch) | ≥ 1 MB/s | 2.43 MB/s | ✅ ×2.4 |
-| Cost | ≤ $0.05/GB | $0.022/GB | ✅ ×2.3 |
-| Scale-to-zero | required | Spot capacity, min=0 | ✅ |
+| M1 8-core NEON (ceiling) | 170 KB/s | — (local) | measured |
+| M1 GPU (Metal, batch=256) | 128 KB/s | — (local) | measured |
+| Fargate 4 vCPU on-demand (baseline) | 31 KB/s | $1.84 | measured |
+| **Fargate 16 vCPU Spot + neoverse-n1 (deployed)** | **90 KB/s** | **$0.61** | measured |
+| Projected Fargate 32 vCPU (ceiling?) | ~150 KB/s | ~$0.45 | extrapolated |
+| Projected T4G GPU on g5g.xlarge | likely ≤128 KB/s | ~$0.90 | inferred from M1 |
 
-**Both top-level goals are met by Track 1 alone. Track 2 (GPU) is
-no longer on the critical path** — it stays as a future option if we
-eventually ship customers whose traffic justifies sub-cent-per-GB
-economics, but that's a nice-to-have, not a requirement.
+The 1 MB/s and $0.05/GB goals are **not reachable with the current
+200K-model architecture**. The physics:
 
-### 2026-04-22 Track 2 (GPU) — status
+- Each byte compressed requires ~1-2 tokens through RWKV forward
+- Each token takes ~300 µs minimum (memory-bound head matvec on 1.5 MB
+  INT8 weights) even with perfect SIMD
+- 1 MB/s ≈ 200-400 k tokens/s ≈ 2.5-5 µs/token across all cores
+- Even with 64 cores that's 160-320 µs/core, just barely above the
+  floor — and we'd need perfect scaling, which Graviton doesn't give
 
-Deferred. CPU Fargate Spot + 16 vCPU already clears both targets.
-Revisit only if production traffic economics demand it.
+### Three honest options to present
+
+1. **Accept the 3× improvement and ship current config.** 90 KB/s /
+   $0.61/GB is real progress from 30 KB/s / $1.84/GB, and good
+   enough for early design-partner customers archiving at moderate
+   volumes. Revisit speed/cost after real customer usage data.
+
+2. **Change the compression target: allow the dispatcher to drop
+   neural on datasets where the ratio win is small.** We saw on
+   Spike 3 that neural isn't always the right pick. For datasets
+   where classical (bzip3) comes within a few pp of neural, skip
+   neural and get 3400 KB/s + $0.02/GB. Tier the product:
+   dataset-by-dataset, pick ratio-first or speed-first.
+
+3. **Bigger model (1M-10M params) where GPU actually pays off.**
+   At 10M params the GPU regime flips — per-token compute rises
+   into the ms range, GPU dispatch becomes negligible. A 10M model
+   on T4G could easily do 3-5 MB/s and deliver a better ratio on
+   dialogue. But this is a Spike 5-scale commitment (weeks of
+   training + eval), not a week of engineering.
+
+The cheap-and-right answer for now is probably **(1) + (2)
+together**: ship the 16 vCPU Spot config, and add a per-dataset
+codec policy so we spend the neural budget where it materially
+wins. Defer (3) until a customer commits.
 
 ### Remaining open items
 
-- **Decompression benchmark**: same code path shape; hasn't been
-  measured yet in this session. Expected similar profile (segment-
-  parallel forward pass dominates). Worth measuring before claiming
-  GET-side performance numbers to customers.
+- **Decompression benchmark** (partially measured 2026-04-22):
+  M1 8-core, local, neural 1 MB blob: **195 KB/s** (5.37 s wall,
+  50.71 s user — similar 7× rayon scaling as compression). Slightly
+  faster than compression on the same hardware because AC decode
+  is a bit cheaper than AC encode. Fargate neural decompression
+  throughput TBD (pending the neoverse-n1 rebuild for round-trip
+  testing).
+- **Cross-host decode compatibility issue**: a Fargate-encoded neural
+  blob (`186,522 B`) from the baseline 4 vCPU on-demand run failed
+  to decode on M1 with `tokenizer: decode: token stream has more
+  <unk> tokens than unk payloads`. A locally-encoded blob of the
+  same input round-trips fine. Suggests a tokenizer version or ULP
+  drift between the Fargate image binary and the local release
+  binary. Orthogonal to this work but should be investigated
+  (independent of the Spot/16-vCPU change).
 - **Larger-file behavior** (100 MB+): chunk count (= file bytes /
   1 MB) will exceed core count by 6×+. Expected to plateau at
   whatever single-chunk speed each core delivers × 16 / (1 + overhead).
