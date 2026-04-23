@@ -1,5 +1,35 @@
 # Spike 4 — validate neural on chat / dialogue corpora
 
+## Update 2026-04-22 — pivot to English-only
+
+The first run (full-language WildChat-4.8M subset, 200 MB) exposed a
+multilingual capacity problem: trained held_out_ratio came in at
+0.568 (vs zstd 0.185) — the 200K RWKV + 16K SPM unigram couldn't
+cover the ~25+ languages in WildChat simultaneously. `bytes_per_token`
+dropped to 3.22 (vs GH events' 5.03 and enwik8's ~3.5), suggesting
+the tokenizer fragmented into many short multilingual pieces.
+
+This isn't a problem for target customers (Harvey, Abridge, Hebbia
+are English-first enterprise) but it's blocking the spike measurement.
+
+**Pivot**: primary experiment is now `WildChat-4.8M filtered to
+language=="English"` — same corpus, ~40–60% of the rows.
+
+Also surfaced three training-entrypoint bugs, all fixed this session:
+- `measure_held_out_ratio.py` call signature (passed `input_types`
+  + `train=True` + `model.eval()` to mirror the trainer)
+- `zstd --train` single-file → multi-sample split before training
+- Shell capture of measure-script stdout included ninja build noise
+  → grep for bare-float-only lines
+
+See `SPIKE_4_LOG.md` for the measurement + bug trail.
+
+Model-size decision for this spike: **staying at 200K params.**
+Bigger model (1M / 10M) is the right next move for Spike 5 (GPU
+compression path), but mixing English-only with a model-size change
+would confound the language fix with the capacity change. Clean
+control first, scale second.
+
 ## Why this spike
 
 The product focus narrowed on 2026-04-22 to **regulated-vertical AI
@@ -28,23 +58,32 @@ wins on dialogue"** from **"neural wins on *production* dialogue
 specifically"**. Running both gives us a diagnostic signal
 beyond a simple pass/fail.
 
-### Corpus A (primary): WildChat-4.8M (`allenai/WildChat-4.8M`)
+### Corpus A (primary): WildChat-4.8M English-only (`allenai/WildChat-4.8M`)
 
 - **Source**: [allenai/WildChat-4.8M on Hugging Face](https://huggingface.co/datasets/allenai/WildChat-4.8M)
 - **License**: ODC-BY (Open Data Commons Attribution). Ungated,
   scriptable download.
 - **Content**: 3,199,860 real conversations between human users
   and ChatGPT, non-toxic filtered, coverage through August 2025.
+  **Filter to `language == "English"` at stream time** — the
+  multilingual run exposed a capacity problem with 200K params
+  across 25+ languages.
 - **Character**: **production LLM chat transcripts** — real users
   typing real questions, real GPT-4/3.5 responses, including typos,
   retries, abandoned threads, vocabulary drift. This is the closest
   public analog to what Harvey's attorneys, Abridge's clinicians,
-  or Hebbia's analysts actually generate every day.
-- **Size**: subset to ~200 MB for shake-down, ~1 GB for full spike
+  or Hebbia's analysts actually generate every day. English-only
+  also matches the target customer deployment (Fortune 500 US/EU
+  enterprise).
+- **Size**: ~200 MB subset
 - **Why primary**: if the product thesis is "we win on regulated-
-  vertical AI chat archives," WildChat is the proxy for that data
-  shape. Passing on WildChat is the defensible signal; failing on
-  WildChat kills the thesis.
+  vertical AI chat archives," WildChat-English is the representative
+  proxy. Passing on it is the defensible signal; failing kills the
+  thesis.
+- **Baseline**: zstd-22 on the 200 MB English subset = **0.1526**
+  (tighter than the multilingual baseline 0.1723 because English
+  has more structural repetition zstd exploits). Pass gates:
+  required ≤ 0.1297, strong ≤ 0.1145, stretch ≤ 0.0992.
 
 ### Corpus B (diagnostic): OASST2 (`OpenAssistant/oasst2`)
 
