@@ -1,0 +1,6 @@
+# Model weights are not committed to git.
+# Place these files here before running docker build:
+#   RWKV-4-Pile-169M-20220807-8023.pth  (~323 MB fp32)
+#   20B_tokenizer.json
+#
+# Download from: https://huggingface.co/BlinkDL/rwkv-4-pile-169m

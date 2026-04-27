@@ -1,0 +1,16 @@
+# Core inference
+torch==2.3.1+cu124 --extra-index-url https://download.pytorch.org/whl/cu124
+tokenizers==0.19.1
+constriction==0.4.3
+
+# API server
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+
+# Classical codecs
+zstandard==0.22.0
+# bzip3 optional — falls back to stdlib bz2 if not available
+# bzip3==1.4.0
+
+# Utilities
+numpy==1.26.4

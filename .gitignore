@@ -7,27 +7,23 @@ __pycache__/
 .Python
 *.egg-info/
 
-# Vendored dependencies (set up via scripts/setup.sh)
-vendor/
+# Model weights (too large for git — see models/.gitkeep for download instructions)
+models/*.pth
+models/*.safetensors
+models/*.json
 
-# CDK build artifacts — never commit
-cdk/node_modules/
-cdk/cdk.out/
-cdk/dist/
+# Test data / corpora
+data/
+bench/corpora/*
+bench/corpora/
+
+# CDK build artifacts
+deploy/aws-cdk/node_modules/
+deploy/aws-cdk/cdk.out/
 *.tsbuildinfo
 
-# Large archived artifacts from krunch era (not needed in Krunch)
-corpus_build/
-data/
-checkpoints-phase11/
-tokenizer_pile/
-tokenizer_balanced_32k/
-tokenizer_pile_32k/
-krunch-rust/target/
-krunch-rust/fuzz/
-
-# Test corpora (downloaded via scripts/download_corpora.sh, too big for git)
-bench/corpora/*
+# WKV kernel build cache (compiled at runtime)
+server/kernel_cache/
 !bench/corpora/.gitkeep
 !bench/corpora/README.md
 
