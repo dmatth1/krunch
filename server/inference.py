@@ -14,7 +14,6 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-import torch
 import numpy as np
 from tokenizers import Tokenizer
 
@@ -101,19 +100,18 @@ def _softmax_np(logits: np.ndarray) -> np.ndarray:
 def ac_encode(tokens: list[int], logits_seq: np.ndarray) -> bytes:
     """
     Arithmetic-encode tokens[1:] using logits_seq[:-1] as distributions.
-    logits_seq shape: (T, vocab)
-    Returns raw AC bitstream bytes.
+    logits_seq shape: (T, vocab). Returns raw AC bitstream bytes.
+    ANS requires encoding in reverse order; decode reads forward.
     """
     codec = constriction.stream.stack.AnsCoder()
-    vocab = logits_seq.shape[1]
-    # Encode in reverse order for stack-based ANS
+    # Encode symbols in reverse (ANS stack property)
     for t in range(len(tokens) - 1, 0, -1):
         probs = _softmax_np(logits_seq[t - 1].astype(np.float64))
         probs = np.clip(probs, 1e-9, 1.0)
         probs /= probs.sum()
         model = constriction.stream.model.Categorical(probs, perfect=False)
-        codec.encode_symbol(tokens[t], model)
-    return bytes(codec.get_compressed())
+        codec.encode_reverse(np.array([tokens[t]], dtype=np.int32), model)
+    return np.array(codec.get_compressed(), dtype=np.uint32).tobytes()
 
 
 def ac_decode(bitstream: bytes, n_tokens: int,
@@ -122,9 +120,8 @@ def ac_decode(bitstream: bytes, n_tokens: int,
     Arithmetic-decode n_tokens using logits_fn(state, token) -> (logits, state).
     Returns decoded token list (length n_tokens, including initial_token).
     """
-    codec = constriction.stream.stack.AnsCoder(
-        np.frombuffer(bitstream, dtype=np.uint32)
-    )
+    compressed = np.frombuffer(bitstream, dtype=np.uint32)
+    codec = constriction.stream.stack.AnsCoder(compressed)
     tokens = [initial_token]
     state = None
     for _ in range(n_tokens - 1):
@@ -133,8 +130,8 @@ def ac_decode(bitstream: bytes, n_tokens: int,
         probs = np.clip(probs, 1e-9, 1.0)
         probs /= probs.sum()
         model = constriction.stream.model.Categorical(probs, perfect=False)
-        tok = codec.decode_symbol(model)
-        tokens.append(int(tok))
+        tok = int(codec.decode(model))
+        tokens.append(tok)
     return tokens
 
 
@@ -146,13 +143,15 @@ class InferenceEngine:
     def __init__(self):
         self._model = None
         self._tokenizer: Optional[Tokenizer] = None
-        self._device = "cuda" if torch.cuda.is_available() else "cpu"
+        self._device = "cpu"  # resolved in load() after torch is imported
         self._ready = False
         self._load_start: Optional[float] = None
 
     def load(self):
         """Load model + tokenizer. Blocks until ready."""
+        import torch
         self._load_start = time.time()
+        self._device = "cuda" if torch.cuda.is_available() else "cpu"
         logger.info("Loading tokenizer from %s", TOKENIZER_PATH)
         self._tokenizer = Tokenizer.from_file(str(TOKENIZER_PATH))
 
