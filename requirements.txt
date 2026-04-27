@@ -12,5 +12,9 @@ zstandard==0.22.0
 # bzip3 optional — falls back to stdlib bz2 if not available
 # bzip3==1.4.0
 
+# Orchestrator
+httpx==0.27.0
+boto3==1.34.0
+
 # Utilities
 numpy==1.26.4

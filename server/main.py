@@ -1,18 +1,24 @@
 """
-Krunch v1 — FastAPI compression server.
+Krunch v1 — FastAPI compression worker.
 
-Endpoints:
-  POST /compress    — raw bytes in, .krunch blob out
-  POST /decompress  — .krunch blob in, raw bytes out
-  GET  /healthz     — liveness (process alive)
-  GET  /readyz      — readiness (model loaded, kernel compiled)
-  GET  /metrics     — Prometheus-compatible text metrics
+Endpoints (public):
+  POST /compress        — raw bytes in, .krunch blob out
+  POST /decompress      — .krunch blob in, raw bytes out
+  GET  /healthz         — liveness (process alive)
+  GET  /readyz          — readiness (model loaded, kernel compiled)
+  GET  /metrics         — Prometheus-compatible text metrics
+
+Endpoints (orchestrator-internal):
+  POST /compress_range  — read byte range from URL, compress, write blob to URL
+  POST /decompress_range — decompress base64-encoded blob, write raw bytes to URL
 """
 
+import base64
 import time
 import zlib
 import struct
 import logging
+import asyncio
 import threading
 from contextlib import asynccontextmanager
 
@@ -159,4 +165,75 @@ async def decompress(request: Request):
     except Exception as e:
         _inc("decompress_errors_total")
         logger.exception("decompress error")
+        raise HTTPException(500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator-internal endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/compress_range")
+async def compress_range(request: Request):
+    """
+    Read a byte range from a URL, compress it, write blob to a dest URL.
+    Called by the orchestrator for large-file fan-out.
+
+    Body (JSON):
+      source      — URL to read from (s3://, http://, file://)
+      byte_range  — [start, end) inclusive of start, exclusive of end
+      dest        — URL to write the compressed blob to
+    """
+    payload = await request.json()
+    source = payload["source"]
+    start, end = payload["byte_range"]
+    dest = payload["dest"]
+
+    try:
+        from . import url_io
+        loop = asyncio.get_event_loop()
+        raw = await loop.run_in_executor(None, url_io.read_range, source, start, end)
+
+        t0 = time.perf_counter()
+        chunk_entries, n_chunks = compress_all(raw, engine.compress_chunk)
+        entries_bytes = b"".join(chunk_entries)
+        crc = zlib.crc32(raw) & 0xFFFFFFFF
+        header = encode_header(len(raw), n_chunks, crc)
+        blob = header + entries_bytes
+
+        await loop.run_in_executor(None, url_io.write, dest, blob)
+        elapsed = time.perf_counter() - t0
+        logger.info("compress_range [%d,%d) → %d bytes (%.0f KB/s)",
+                    start, end, len(blob), len(raw) / 1024 / elapsed)
+        return {"original_len": len(raw), "n_chunks": n_chunks,
+                "compressed_len": len(blob)}
+    except Exception as e:
+        logger.exception("compress_range error")
+        raise HTTPException(500, detail=str(e))
+
+
+@app.post("/decompress_range")
+async def decompress_range(request: Request):
+    """
+    Decompress a base64-encoded blob and write raw bytes to a dest URL.
+    Called by the orchestrator for large-file fan-out.
+
+    Body (JSON):
+      blob_b64  — base64-encoded .krunch blob
+      dest      — URL to write decompressed bytes to
+    """
+    payload = await request.json()
+    blob = base64.b64decode(payload["blob_b64"])
+    dest = payload["dest"]
+
+    try:
+        from . import url_io
+        loop = asyncio.get_event_loop()
+        hdr = decode_header(blob)
+        entries_bytes = blob[HEADER_SIZE:]
+        raw = decompress_all(entries_bytes, hdr["n_chunks"], engine.decompress_chunk)
+        await loop.run_in_executor(None, url_io.write, dest, raw)
+        logger.info("decompress_range → %d bytes written to %s", len(raw), dest)
+        return {"decompressed_len": len(raw)}
+    except Exception as e:
+        logger.exception("decompress_range error")
         raise HTTPException(500, detail=str(e))
