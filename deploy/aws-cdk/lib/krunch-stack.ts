@@ -1,269 +1,228 @@
 import * as cdk from "aws-cdk-lib";
 import * as ec2 from "aws-cdk-lib/aws-ec2";
 import * as iam from "aws-cdk-lib/aws-iam";
+import * as batch from "aws-cdk-lib/aws-batch";
+import * as s3 from "aws-cdk-lib/aws-s3";
 import { Construct } from "constructs";
 
 export interface KrunchStackProps extends cdk.StackProps {
-  /** Number of GPU worker instances. Default: 2 */
-  workerCount?: number;
-  /** GPU instance type per worker. Default: g5.xlarge (A10G, 16 GB VRAM) */
-  workerInstanceType?: ec2.InstanceType;
-  /** Use spot pricing for workers. Default: true */
-  spot?: boolean;
-  /** Docker image for workers. Default: ghcr.io/dmatth1/krunch:v1 */
-  workerImage?: string;
-  /** S3 bucket name the orchestrator + workers may read/write. Optional. */
+  /** Max number of concurrent GPU workers. Default: 10 */
+  maxWorkers?: number;
+  /** GPU instance type. Default: g5.xlarge (A10G, 16 GB VRAM) */
+  instanceType?: ec2.InstanceType;
+  /** Docker image. Default: ghcr.io/dmatth1/krunch:v1 */
+  image?: string;
+  /**
+   * S3 bucket for temp parts + compressed output.
+   * Created fresh if not provided.
+   */
   s3BucketName?: string;
-  /** Allow SSH to orchestrator from this CIDR. Default: disabled (use SSM) */
-  sshAllowedCidr?: string;
 }
 
 /**
- * Krunch v1 distributed deployment.
+ * Krunch v1 — AWS Batch deployment.
  *
  * Architecture:
- *   Internet → Orchestrator (t3.medium, public IP, port 8080)
- *                  ↓ fan-out via private IPs
- *           Worker-0  Worker-1  ... Worker-N  (g5.xlarge spot, port 8080)
+ *   krunch submit --source s3://... --dest s3://...
+ *     → Batch array job  (N compress tasks, each reads one byte range)
+ *     → Batch single job (1 assemble task, stitches parts → final blob)
  *
- * Orchestrator accepts /compress and /decompress.
- * Workers handle actual GPU compression; orchestrator splits + reassembles.
+ * No always-on orchestrator. Batch handles scheduling, spot retry,
+ * and scaling to maxWorkers in parallel.
  *
  * Quickstart:
- *   npm install
- *   npx cdk bootstrap   # once per account/region
- *   npx cdk deploy
+ *   npm install && npx cdk bootstrap && npx cdk deploy
  *
- * Run roundtrip test:
- *   ENDPOINT=$(aws cloudformation describe-stacks --stack-name KrunchStack \
- *     --query "Stacks[0].Outputs[?OutputKey=='KrunchEndpoint'].OutputValue" \
- *     --output text)
- *   python3 ../../scripts/roundtrip_test.py --url $ENDPOINT \
- *     --file ../../data/spike6/wildchat_en_content.content.bin
+ *   python3 ../../scripts/krunch_cli.py submit \
+ *     --source s3://my-bucket/logs/data.jsonl \
+ *     --dest   s3://my-bucket/logs/data.krunch \
+ *     --workers 4
+ *
+ * Cold-start note:
+ *   First job on a fresh compute environment takes ~15 min (EC2 launch +
+ *   Docker image pull). Subsequent jobs on warm instances: ~1-2 min.
+ *   To eliminate cold pull time, bake the image into a custom AMI and
+ *   set the imageId on the compute environment.
  */
 export class KrunchStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: KrunchStackProps = {}) {
     super(scope, id, props);
 
-    const workerCount = props.workerCount ?? 2;
-    const workerType =
-      props.workerInstanceType ??
+    const maxWorkers = props.maxWorkers ?? 10;
+    const instanceType =
+      props.instanceType ??
       ec2.InstanceType.of(ec2.InstanceClass.G5, ec2.InstanceSize.XLARGE);
-    const useSpot = props.spot ?? true;
-    const workerImage = props.workerImage ?? "ghcr.io/dmatth1/krunch:v1";
-    const port = 8080;
+    const image = props.image ?? "ghcr.io/dmatth1/krunch:v1";
 
     // ---------------------------------------------------------------------------
-    // VPC — default VPC so a fresh account needs zero networking setup
+    // VPC — default VPC, no NAT gateway needed (Batch uses public subnets)
     // ---------------------------------------------------------------------------
     const vpc = ec2.Vpc.fromLookup(this, "Vpc", { isDefault: true });
 
     // ---------------------------------------------------------------------------
-    // IAM roles
+    // S3 bucket — temp parts + compressed output
     // ---------------------------------------------------------------------------
-    const basePolicy = [
-      iam.ManagedPolicy.fromAwsManagedPolicyName("AmazonSSMManagedInstanceCore"),
-    ];
+    const bucket = props.s3BucketName
+      ? s3.Bucket.fromBucketName(this, "Bucket", props.s3BucketName)
+      : new s3.Bucket(this, "KrunchBucket", {
+          removalPolicy: cdk.RemovalPolicy.RETAIN,
+          lifecycleRules: [{
+            // Auto-delete orphaned parts after 3 days
+            prefix: "*.parts/",
+            expiration: cdk.Duration.days(3),
+          }],
+        });
 
-    const workerRole = new iam.Role(this, "WorkerRole", {
-      assumedBy: new iam.ServicePrincipal("ec2.amazonaws.com"),
-      managedPolicies: basePolicy,
+    // ---------------------------------------------------------------------------
+    // IAM
+    // ---------------------------------------------------------------------------
+    const jobRole = new iam.Role(this, "JobRole", {
+      assumedBy: new iam.ServicePrincipal("ecs-tasks.amazonaws.com"),
+      inlinePolicies: {
+        S3Access: new iam.PolicyDocument({
+          statements: [new iam.PolicyStatement({
+            actions: ["s3:GetObject", "s3:PutObject", "s3:DeleteObject",
+                      "s3:HeadObject"],
+            resources: [`${bucket.bucketArn}/*`],
+          }), new iam.PolicyStatement({
+            actions: ["s3:ListBucket"],
+            resources: [bucket.bucketArn],
+          })],
+        }),
+      },
     });
 
-    const orchestratorRole = new iam.Role(this, "OrchestratorRole", {
+    const instanceRole = new iam.Role(this, "InstanceRole", {
       assumedBy: new iam.ServicePrincipal("ec2.amazonaws.com"),
-      managedPolicies: basePolicy,
+      managedPolicies: [
+        iam.ManagedPolicy.fromAwsManagedPolicyName(
+          "service-role/AmazonEC2ContainerServiceforEC2Role"
+        ),
+        iam.ManagedPolicy.fromAwsManagedPolicyName("AmazonSSMManagedInstanceCore"),
+      ],
     });
 
-    // Grant S3 access if a bucket is provided
-    if (props.s3BucketName) {
-      const s3Arn = `arn:aws:s3:::${props.s3BucketName}`;
-      const s3Policy = new iam.PolicyStatement({
-        actions: ["s3:GetObject", "s3:PutObject", "s3:DeleteObject",
-                  "s3:HeadObject", "s3:ListBucket"],
-        resources: [s3Arn, `${s3Arn}/*`],
-      });
-      workerRole.addToPolicy(s3Policy);
-      orchestratorRole.addToPolicy(s3Policy);
-    }
+    const instanceProfile = new iam.CfnInstanceProfile(this, "InstanceProfile", {
+      roles: [instanceRole.roleName],
+    });
 
     // ---------------------------------------------------------------------------
-    // Security groups
+    // Security group
     // ---------------------------------------------------------------------------
-    const workerSg = new ec2.SecurityGroup(this, "WorkerSg", {
+    const sg = new ec2.SecurityGroup(this, "BatchSg", {
       vpc,
-      description: "krunch GPU workers — inbound from orchestrator only",
+      description: "krunch Batch workers — outbound only",
       allowAllOutbound: true,
     });
 
-    const orchSg = new ec2.SecurityGroup(this, "OrchestratorSg", {
-      vpc,
-      description: "krunch orchestrator — public inbound on port 8080",
-      allowAllOutbound: true,
-    });
-
-    // Orchestrator reachable from internet
-    orchSg.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(port), "krunch API");
-
-    // Workers only reachable from orchestrator
-    workerSg.addIngressRule(orchSg, ec2.Port.tcp(port), "orchestrator fan-out");
-
-    if (props.sshAllowedCidr) {
-      orchSg.addIngressRule(
-        ec2.Peer.ipv4(props.sshAllowedCidr), ec2.Port.tcp(22), "SSH"
-      );
-    }
-
     // ---------------------------------------------------------------------------
-    // AMI — Deep Learning AMI: Docker + CUDA + nvidia-container-toolkit
+    // Batch compute environment — GPU spot fleet, scale to zero
     // ---------------------------------------------------------------------------
-    const dlAmi = ec2.MachineImage.lookup({
-      name: "Deep Learning OSS Nvidia Driver AMI GPU PyTorch * (Ubuntu 22.04) *",
-      owners: ["amazon"],
-    });
-
-    const ubuntuAmi = ec2.MachineImage.lookup({
-      name: "ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*",
-      owners: ["099720109477"], // Canonical
+    const computeEnv = new batch.CfnComputeEnvironment(this, "ComputeEnv", {
+      type: "MANAGED",
+      state: "ENABLED",
+      computeResources: {
+        type: "SPOT",
+        allocationStrategy: "SPOT_CAPACITY_OPTIMIZED",
+        instanceTypes: [instanceType.toString()],
+        minvCpus: 0,           // scale to zero when idle
+        maxvCpus: maxWorkers * 4, // g5.xlarge = 4 vCPUs
+        subnets: vpc.publicSubnets.map((s) => s.subnetId),
+        securityGroupIds: [sg.securityGroupId],
+        instanceRole: instanceProfile.attrArn,
+        bidPercentage: 60,
+        // Deep Learning AMI — Docker + CUDA + nvidia-container-toolkit preinstalled
+        // Override imageId here with a custom AMI (pre-pulled image) to cut cold-start
+        // imageId: "ami-0xxxxxxxxxxxxxxxxx",
+        tags: { Name: "krunch-batch-worker" },
+      },
     });
 
     // ---------------------------------------------------------------------------
-    // Workers
+    // Job queue
     // ---------------------------------------------------------------------------
-    const workerInstances: ec2.Instance[] = [];
-
-    for (let i = 0; i < workerCount; i++) {
-      const workerUserData = ec2.UserData.forLinux();
-      workerUserData.addCommands(
-        "set -euo pipefail",
-        `exec > /var/log/krunch-worker-${i}.log 2>&1`,
-        `echo "WORKER_${i}_START $(date -u +%Y-%m-%dT%H:%M:%SZ)"`,
-        "for j in $(seq 1 30); do docker info && break || sleep 5; done",
-        `docker pull ${workerImage}`,
-        `docker run -d --restart=unless-stopped \\`,
-        `  --gpus all --name krunch-worker \\`,
-        `  -p ${port}:${port} \\`,
-        `  -e RWKV_CUDA_ON=1 -e RWKV_JIT_ON=1 \\`,
-        `  ${workerImage}`,
-        `echo "WORKER_${i}_DONE $(date -u +%Y-%m-%dT%H:%M:%SZ)"`,
-      );
-
-      const worker = new ec2.Instance(this, `Worker${i}`, {
-        instanceType: workerType,
-        machineImage: dlAmi,
-        vpc,
-        securityGroup: workerSg,
-        role: workerRole,
-        userData: workerUserData,
-        blockDevices: [{
-          deviceName: "/dev/sda1",
-          volume: ec2.BlockDeviceVolume.ebs(100, {
-            volumeType: ec2.EbsDeviceVolumeType.GP3,
-          }),
-        }],
-      });
-
-      if (useSpot) {
-        (worker.node.defaultChild as ec2.CfnInstance).addPropertyOverride(
-          "InstanceMarketOptions",
-          { MarketType: "spot", SpotOptions: { SpotInstanceType: "one-time" } }
-        );
-      }
-
-      workerInstances.push(worker);
-    }
-
-    // ---------------------------------------------------------------------------
-    // Orchestrator (CPU — t3.medium, no GPU needed)
-    // ---------------------------------------------------------------------------
-    const workerUrls = workerInstances
-      .map((w) => `http://${w.instancePrivateIp}:${port}`)
-      .join(",");
-
-    const orchUserData = ec2.UserData.forLinux();
-    orchUserData.addCommands(
-      "set -euo pipefail",
-      "exec > /var/log/krunch-orchestrator.log 2>&1",
-      "echo 'ORCH_START'",
-
-      // Install deps (Ubuntu 22.04, no pre-installed Docker)
-      "apt-get update -q",
-      "apt-get install -y -q python3.11 python3-pip python3.11-venv curl",
-      "python3.11 -m venv /opt/krunch-venv",
-      "/opt/krunch-venv/bin/pip install -q fastapi uvicorn httpx boto3",
-
-      // Write orchestrator launch script
-      "mkdir -p /opt/krunch",
-      `cat > /opt/krunch/start.sh << 'SCRIPT'
-#!/bin/bash
-export KRUNCH_WORKERS="${workerUrls}"
-cd /opt/krunch
-exec /opt/krunch-venv/bin/python -m uvicorn server.orchestrator:app \\
-  --host 0.0.0.0 --port ${port} --workers 4
-SCRIPT`,
-      "chmod +x /opt/krunch/start.sh",
-
-      // Pull server code from the Docker image (reuse the Python modules)
-      "docker pull ghcr.io/dmatth1/krunch:v1 2>/dev/null || true",
-      "docker create --name krunch-tmp ghcr.io/dmatth1/krunch:v1 2>/dev/null && \
-       docker cp krunch-tmp:/app/server /opt/krunch/server && \
-       docker rm krunch-tmp || \
-       echo 'Docker not available, install server code manually'",
-
-      // Systemd service
-      `cat > /etc/systemd/system/krunch-orchestrator.service << 'UNIT'
-[Unit]
-Description=Krunch Orchestrator
-After=network.target
-
-[Service]
-ExecStart=/opt/krunch/start.sh
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-UNIT`,
-      "systemctl daemon-reload",
-      "systemctl enable --now krunch-orchestrator",
-
-      // Wait for readyz
-      `for i in $(seq 1 60); do curl -sf http://localhost:${port}/readyz && echo 'ORCH_READY' && break || sleep 5; done`,
-      "echo 'ORCH_DONE'",
-    );
-
-    const orchestrator = new ec2.Instance(this, "Orchestrator", {
-      instanceType: ec2.InstanceType.of(ec2.InstanceClass.T3, ec2.InstanceSize.MEDIUM),
-      machineImage: ubuntuAmi,
-      vpc,
-      securityGroup: orchSg,
-      role: orchestratorRole,
-      userData: orchUserData,
+    const jobQueue = new batch.CfnJobQueue(this, "JobQueue", {
+      state: "ENABLED",
+      priority: 10,
+      computeEnvironmentOrder: [{
+        order: 1,
+        computeEnvironment: computeEnv.ref,
+      }],
     });
 
-    // Orchestrator waits for workers to be running (CDK dependency, not a runtime wait)
-    workerInstances.forEach((w) => orchestrator.node.addDependency(w));
+    // ---------------------------------------------------------------------------
+    // Job definitions
+    // ---------------------------------------------------------------------------
+    const containerProps = {
+      image,
+      command: ["job"],             // entrypoint.sh job mode
+      jobRoleArn: jobRole.roleArn,
+      resourceRequirements: [
+        { type: "VCPU",   value: "4" },
+        { type: "MEMORY", value: "16384" },
+        { type: "GPU",    value: "1" },
+      ],
+      environment: [
+        { name: "RWKV_CUDA_ON", value: "1" },
+        { name: "RWKV_JIT_ON",  value: "1" },
+      ],
+      mountPoints: [],
+      volumes: [],
+    };
+
+    const compressJobDef = new batch.CfnJobDefinition(this, "CompressJobDef", {
+      type: "container",
+      containerProperties: containerProps,
+      retryStrategy: { attempts: 2 },  // retry once on spot interruption
+      timeout: { attemptDurationSeconds: 3600 },
+    });
+
+    // Assemble job: CPU only, no GPU needed
+    const assembleJobDef = new batch.CfnJobDefinition(this, "AssembleJobDef", {
+      type: "container",
+      containerProperties: {
+        ...containerProps,
+        resourceRequirements: [
+          { type: "VCPU",   value: "2" },
+          { type: "MEMORY", value: "8192" },
+          // no GPU
+        ],
+      },
+      retryStrategy: { attempts: 2 },
+      timeout: { attemptDurationSeconds: 1800 },
+    });
 
     // ---------------------------------------------------------------------------
-    // Outputs
+    // Outputs (read by krunch_cli.py)
     // ---------------------------------------------------------------------------
-    new cdk.CfnOutput(this, "KrunchEndpoint", {
-      value: `http://${orchestrator.instancePublicIp}:${port}`,
-      description: "Krunch API — POST /compress, /decompress",
+    new cdk.CfnOutput(this, "JobQueueArn", {
+      value: jobQueue.ref,
+      description: "Batch job queue — pass to krunch submit --job-queue",
     });
 
-    new cdk.CfnOutput(this, "OrchestratorInstanceId", {
-      value: orchestrator.instanceId,
-      description: "Orchestrator instance ID (SSM access)",
+    new cdk.CfnOutput(this, "CompressJobDef", {
+      value: compressJobDef.ref,
+      description: "Batch job definition for compress array tasks",
     });
 
-    new cdk.CfnOutput(this, "WorkerCount", {
-      value: String(workerCount),
-      description: "Number of GPU workers",
+    new cdk.CfnOutput(this, "AssembleJobDef", {
+      value: assembleJobDef.ref,
+      description: "Batch job definition for assemble task",
     });
 
-    new cdk.CfnOutput(this, "WatchOrchestratorLogs", {
-      value: `aws ssm start-session --target ${orchestrator.instanceId} --document-name AWS-StartInteractiveCommand --parameters command="journalctl -fu krunch-orchestrator"`,
+    new cdk.CfnOutput(this, "BucketName", {
+      value: bucket.bucketName,
+      description: "S3 bucket for compressed output and temp parts",
+    });
+
+    new cdk.CfnOutput(this, "SubmitExample", {
+      value: [
+        "python3 scripts/krunch_cli.py submit",
+        `  --source s3://${bucket.bucketName}/input/data.jsonl`,
+        `  --dest   s3://${bucket.bucketName}/output/data.krunch`,
+        "  --workers 4",
+      ].join(" \\\n"),
+      description: "Example krunch submit command",
     });
   }
 }
