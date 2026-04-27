@@ -1,7 +1,7 @@
-learned-archive
-Copyright 2025-2026 Dan Mattheiss and learned-archive contributors
+krunch
+Copyright 2025-2026 Dan Mattheiss and krunch contributors
 
-This product includes software developed by learned-archive
+This product includes software developed by krunch
 contributors. Licensed under the Apache License, Version 2.0 (the
 "License"); you may not use this file except in compliance with the
 License. A copy of the License is in the LICENSE file at the root of
@@ -13,21 +13,21 @@ Third-party components
 
 RWKV-LM (RWKV reference architecture)
   Upstream: https://github.com/BlinkDL/RWKV-LM
-  Used in:  our Rust inference runtime at l3tc-rust/src/rwkv.rs is a
+  Used in:  our Rust inference runtime at krunch-rust/src/rwkv.rs is a
             re-implementation of the RWKV-v4 forward pass from the
             published RWKV-v4 paper and reference implementation.
-            MSL kernels in l3tc-rust/src/backend/mtl.rs and the fused
+            MSL kernels in krunch-rust/src/backend/mtl.rs and the fused
             WKV kernel at scripts/metal_wkv/wkv.metal are clean-room
             ports of the reference CUDA implementation.
   License:  Apache-2.0.
 
-L3TC (AAAI 2025 paper reference implementation)
-  Upstream: https://github.com/jkooy/L3TC
-  Used in:  vendor/L3TC/ (reference Python implementation, not shipped
+Krunch (AAAI 2025 paper reference implementation)
+  Upstream: https://github.com/jkooy/Krunch
+  Used in:  vendor/Krunch/ (reference Python implementation, not shipped
             in service binaries). The initial Rust inference runtime
             was derived from this reference. Training pipeline
-            scripts (scripts/train_l3tc_phase11.py, related tooling)
-            follow the L3TC training recipe.
+            scripts (scripts/train_krunch_phase11.py, related tooling)
+            follow the Krunch training recipe.
   License:  Research use under Apache-2.0, consistent with the RWKV
             dependency.
 

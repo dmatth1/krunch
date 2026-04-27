@@ -5,8 +5,8 @@ on:
     - cron: '0 13 * * 1'  # Mondays 13:00 UTC
   push:
     paths:
-      - 'l3tc-rust/Cargo.toml'
-      - 'l3tc-rust/Cargo.lock'
+      - 'krunch-rust/Cargo.toml'
+      - 'krunch-rust/Cargo.lock'
       - '.github/workflows/audit.yml'
   workflow_dispatch:
 
@@ -23,7 +23,7 @@ jobs:
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          working-directory: l3tc-rust
+          working-directory: krunch-rust
 
   cargo-deny:
     name: cargo deny
@@ -32,7 +32,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
-          manifest-path: l3tc-rust/Cargo.toml
+          manifest-path: krunch-rust/Cargo.toml
           log-level: warn
           command: check
           arguments: --all-features

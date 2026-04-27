@@ -15,10 +15,10 @@ checkpoints-phase11/
 tokenizer_pile/
 tokenizer_balanced_32k/
 tokenizer_pile_32k/
-l3tc-rust/target/
-l3tc-rust/fuzz/
-vendor/L3TC/.venv/
-vendor/L3TC/checkpoints/
+krunch-rust/target/
+krunch-rust/fuzz/
+vendor/Krunch/.venv/
+vendor/Krunch/checkpoints/
 bench/corpora/
 bench/work/
 bench/work_traditional/

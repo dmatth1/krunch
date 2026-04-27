@@ -128,7 +128,7 @@
       "error": null
     },
     {
-      "compressor": "l3tc-rust-200k",
+      "compressor": "krunch-rust-200k",
       "corpus": "enwik6",
       "input_bytes": 1000000,
       "compressed_bytes": 206020,

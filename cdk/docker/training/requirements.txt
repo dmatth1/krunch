@@ -1,7 +1,0 @@
-# PyTorch is baked into the base image (pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime),
-# so we only add the rest of the training deps here.
-numpy==1.26.4
-sentencepiece==0.2.1
-boto3==1.35.0
-zstandard==0.23.0
-tqdm==4.66.5

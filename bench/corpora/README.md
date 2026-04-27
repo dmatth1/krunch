@@ -28,9 +28,9 @@ real-world distribution of data a general-purpose compressor sees:
 - CSV data
 - Binary blobs (small)
 
-This is deferred until after classical and L3TC measurements against
+This is deferred until after classical and Krunch measurements against
 the standard corpora are committed. We don't want to debug custom
-corpus issues at the same time as initial L3TC setup.
+corpus issues at the same time as initial Krunch setup.
 
 ## File naming
 

@@ -1,4 +1,4 @@
-# enwik8 — l3tc-rust (Phase 2.5)
+# enwik8 — krunch-rust (Phase 2.5)
 
 Full 100 MB enwik8 corpus, single measurement, binary built with
 `target-cpu=native` on Apple Silicon (aarch64). Round-trip verified

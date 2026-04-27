@@ -4,11 +4,11 @@ on:
   push:
     branches: [main]
     paths:
-      - 'l3tc-rust/**'
+      - 'krunch-rust/**'
       - '.github/workflows/ci.yml'
   pull_request:
     paths:
-      - 'l3tc-rust/**'
+      - 'krunch-rust/**'
       - '.github/workflows/ci.yml'
   workflow_dispatch:
 
@@ -22,7 +22,7 @@ env:
 
 defaults:
   run:
-    working-directory: l3tc-rust
+    working-directory: krunch-rust
 
 jobs:
   # rustfmt and clippy are blocking gates. The tree was cleaned up in
@@ -53,7 +53,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: l3tc-rust -> target
+          workspaces: krunch-rust -> target
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
   build-test:
@@ -92,7 +92,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: l3tc-rust -> target
+          workspaces: krunch-rust -> target
           key: ${{ matrix.target }}
 
       - name: Build (release)
@@ -105,7 +105,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "Hello world from ${{ matrix.name }} on $(date)" > /tmp/l3tc_ci_input.txt
-          ./target/${{ matrix.target }}/release/l3tc \
-            compress /tmp/l3tc_ci_input.txt \
-            -o /tmp/l3tc_ci.l3tc --verify
+          echo "Hello world from ${{ matrix.name }} on $(date)" > /tmp/krunch_ci_input.txt
+          ./target/${{ matrix.target }}/release/krunch \
+            compress /tmp/krunch_ci_input.txt \
+            -o /tmp/krunch_ci.krunch --verify

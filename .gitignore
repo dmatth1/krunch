@@ -16,15 +16,15 @@ cdk/cdk.out/
 cdk/dist/
 *.tsbuildinfo
 
-# Large archived artifacts from l3tc-prod era (not needed in Krunch)
+# Large archived artifacts from krunch era (not needed in Krunch)
 corpus_build/
 data/
 checkpoints-phase11/
 tokenizer_pile/
 tokenizer_balanced_32k/
 tokenizer_pile_32k/
-l3tc-rust/target/
-l3tc-rust/fuzz/
+krunch-rust/target/
+krunch-rust/fuzz/
 
 # Test corpora (downloaded via scripts/download_corpora.sh, too big for git)
 bench/corpora/*
@@ -37,7 +37,7 @@ bench/corpora/*
 *.xz
 *.zst
 *.zstd
-*.l3tc
+*.krunch
 bench/work/
 
 # Benchmark results (keep committed runs but gitignore scratch)
@@ -62,13 +62,13 @@ Cargo.lock.bak
 
 # Converted checkpoint binaries — regeneratable from the .pth files
 # via scripts/convert_checkpoint.py; too big for git (~13 MB each)
-l3tc-rust/checkpoints/*.bin
+krunch-rust/checkpoints/*.bin
 # Distillation fine-tuned checkpoints (Phase 4e) — produced by
-# scripts/distill_l3tc.py from the shipped L3TC checkpoint.
+# scripts/distill_krunch.py from the shipped Krunch checkpoint.
 # Regeneratable via the script, not worth storing in git.
-l3tc-rust/checkpoints/*_distilled.pth
-l3tc-rust/checkpoints/*_distilled.epoch*.pth
-l3tc-rust/checkpoints/l3tc_1l96h.bin
+krunch-rust/checkpoints/*_distilled.pth
+krunch-rust/checkpoints/*_distilled.epoch*.pth
+krunch-rust/checkpoints/krunch_1l96h.bin
 bench/corpora/eval_suite/
 corpus_build/
 cdk/outputs*.json

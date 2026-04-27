@@ -2,7 +2,7 @@
 
 > **Repo home:** [github.com/dmatth1/Krunch](https://github.com/dmatth1/Krunch) (private, pre-MVP)
 
-_Internal codename: learned-archive. AWS resources are named `archive-{env}-*`._
+_Internal codename: krunch. AWS resources are named `archive-{env}-*`._
 
 ## Thesis
 
@@ -56,10 +56,10 @@ training run on a real customer-shaped dataset (HDFS logs from Loghub,
 | [`TRAINING_FLOW.md`](TRAINING_FLOW.md) | End-to-end walkthrough of one training job: tokenizer → RWKV → ratio → metadata |
 | [`SPIKE_1_LOG.md`](SPIKE_1_LOG.md) | Running log of Spike 1 (HDFS on real service) |
 | [`PRODUCTION_TODO.md`](PRODUCTION_TODO.md) | 10-item gap list between "spike works" and "ready for customers" |
-| [`docs/ARCHIVE_l3tc.md`](docs/ARCHIVE_l3tc.md) | Historical context: what carries over from the archived l3tc-prod CLI project |
+| [`docs/ARCHIVE_krunch.md`](docs/ARCHIVE_krunch.md) | Historical context: what carries over from the archived krunch CLI project |
 | [`cdk/README.md`](cdk/README.md) | CDK stack inventory + deploy instructions |
-| [`l3tc-rust/README.md`](l3tc-rust/README.md) | Rust inference runtime (used at compression/decompression time) |
-| [`bench/`](bench/) | Historical L3TC CLI benchmarks (pre-pivot; kept as ratio evidence for the pitch) |
+| [`krunch-rust/README.md`](krunch-rust/README.md) | Rust inference runtime (used at compression/decompression time) |
+| [`bench/`](bench/) | Historical Krunch CLI benchmarks (pre-pivot; kept as ratio evidence for the pitch) |
 
 ## Tech stack
 
@@ -70,9 +70,9 @@ training run on a real customer-shaped dataset (HDFS logs from Loghub,
 - **Messaging:** SQS (pipeline decoupling), EventBridge (Batch
   completion).
 - **Training:** per-dataset 16 K-vocab SentencePiece unigram tokenizer
-  + L3TC-200K RWKV-v4 architecture (~200 K params, 2 layers, d=96).
+  + Krunch-200K RWKV-v4 architecture (~200 K params, 2 layers, d=96).
   bf16 mixed precision on g5.xlarge (A10G) via AWS Batch.
-- **Inference (Spike 2+):** Rust runtime in `l3tc-rust/` reads a `.bin`
+- **Inference (Spike 2+):** Rust runtime in `krunch-rust/` reads a `.bin`
   checkpoint. Spike 1 defers this — storage uses `zstd --long=27 -22`
   while the model's entropy-bound ratio is measured and recorded in
   metadata.
@@ -103,13 +103,13 @@ curl -X PUT \
 
 Apache-2.0. See [LICENSE](LICENSE).
 
-Compression technology derives from L3TC (AAAI 2025) and RWKV-LM
+Compression technology derives from Krunch (AAAI 2025) and RWKV-LM
 (Apache-2.0). See [NOTICE](NOTICE) for attribution.
 
 ## History
 
-Forked from `l3tc-prod` on 2026-04-21. The CLI compressor direction
+Forked from `krunch` on 2026-04-21. The CLI compressor direction
 was archived when it couldn't beat `zstd` on the dimensions that
 matter (speed, distribution, heterogeneous-text ratio). The
 compression tech carries over; see
-[`docs/ARCHIVE_l3tc.md`](docs/ARCHIVE_l3tc.md) for what's load-bearing.
+[`docs/ARCHIVE_krunch.md`](docs/ARCHIVE_krunch.md) for what's load-bearing.
