@@ -90,15 +90,32 @@ KB/s** on A10G fp16, byte-exact decompression.
 
 > *To be filled in. Need: compress + decompress KB/s for one g{5,6e}.xlarge
 > instance on a fixed 1 GB sample. Same image, same chunk size (1 MB).
-> Hardware differs.*
+> Hardware differs — more CUDA cores + faster memory bandwidth = more
+> KB/s per worker.*
 
-| GPU | compress (KB/s) | decompress (KB/s) | $/hr (spot us-east-1) |
-|---|---|---|---|
-| A10G (g5.xlarge) | _tbd_ | _tbd_ | ~$0.30 |
-| L4 (g6.xlarge) | _tbd_ | _tbd_ | ~$0.30 |
-| L40S (g6e.xlarge) | _tbd_ | _tbd_ | ~$0.90 |
-| A100 40GB (p4d.24xlarge, 1 GPU) | _tbd_ | _tbd_ | ~$3.40 |
-| H100 80GB (p5.48xlarge, 1 GPU) | _tbd_ | _tbd_ | ~$5.50 |
+| GPU | CUDA cores | compress (KB/s) | decompress (KB/s) | $/hr (spot us-east-1) |
+|---|---|---|---|---|
+| A10G (g5.xlarge) | 9,216 | _tbd_ | _tbd_ | ~$0.30 |
+| L4 (g6.xlarge) | 7,680 | _tbd_ | _tbd_ | ~$0.30 |
+| L40S (g6e.xlarge) | 18,176 | _tbd_ | _tbd_ | ~$0.90 |
+| A100 40GB (p4d.24xlarge, 1 GPU) | 6,912 + tensor | _tbd_ | _tbd_ | ~$3.40 |
+| H100 80GB (p5.48xlarge, 1 GPU) | 16,896 + tensor | _tbd_ | _tbd_ | ~$5.50 |
+
+### Single-GPU throughput vs batch size
+
+> *To be filled in. Need: decompress KB/s on a single A10G as we vary*
+> *the cross-chunk batch size (`KRUNCH_DECOMPRESS_BATCH ∈ {1, 4, 8, 16, 32}`).*
+> *Bigger batches keep more CUDA cores active per kernel launch — should*
+> *scale near-linearly until either GPU memory or per-batch state*
+> *bookkeeping overhead bites.*
+
+| batch | A10G decompress (KB/s) |
+|---|---|
+| 1 (current) | _tbd_ |
+| 4 | _tbd_ |
+| 8 | _tbd_ |
+| 16 | _tbd_ |
+| 32 | _tbd_ |
 
 ### Scaling across workers (`krunch submit --workers N`)
 
