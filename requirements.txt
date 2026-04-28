@@ -1,5 +1,6 @@
 # Core inference
 torch==2.3.1+cu124 --extra-index-url https://download.pytorch.org/whl/cu124
+rwkv==0.8.26
 tokenizers==0.19.1
 constriction==0.4.3
 
