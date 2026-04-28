@@ -1,115 +1,82 @@
 # Krunch
 
-> **Repo home:** [github.com/dmatth1/Krunch](https://github.com/dmatth1/Krunch) (private, pre-MVP)
+> **Distributed neural compression as an open-source framework.**
+> One Docker image. Any NVIDIA GPU. Beats zstd by 30-40% on
+> text-heavy data (logs, chat, support tickets, code).
 
-_Internal codename: krunch. AWS resources are named `archive-{env}-*`._
-
-## Thesis
-
-**We store your data cheaper than raw on S3 — and cheaper than the
-best classical compression (zstd) on S3. We do this by learning a
-compression model on *your specific data* and applying it
-automatically. You PUT data to our API; we handle model training,
-per-chunk codec selection, and storage. You GET it back decompressed
-on demand.**
-
-The core bet: the same AI techniques that let large language models
-predict the next word can be used, at small scale, to predict the
-next byte of *your* data. A compression model trained on one
-customer's logs / documents / records knows that customer's
-vocabulary, structure, and style in ways no off-the-shelf codec
-ever could. That knowledge shows up as bytes saved every month for
-the life of the archive.
-
-In practice it's a **hybrid dispatcher**: a small neural model for
-text-like content (prose, code, JSON with free-text fields, chat,
-medical / legal / audit records — where it beats zstd by 15–40%),
-with classical codecs (zstd with a trained dictionary, bzip3, CLP
-for templated logs, brotli for near-duplicate documents) dispatched
-per-chunk for the content types where classical still wins.
-
-See the full product positioning in
-[`STORAGE_SERVICE.md`](STORAGE_SERVICE.md), the evidence behind the
-ratio claims in [`CUSTOMER_PROFILE.md`](CUSTOMER_PROFILE.md), and the
-hybrid dispatcher design in
-[`HYBRID_CODEC_DESIGN.md`](HYBRID_CODEC_DESIGN.md).
-
-## Status (2026-04-21)
-
-Spike 1 in progress. AWS service is deployed end-to-end (6 CDK
-stacks: storage, queues, api, ingest, training, compression); first
-training run on a real customer-shaped dataset (HDFS logs from Loghub,
-1.39 GB NDJSON) is executing. The pass gate is
-`held_out_ratio < 0.98 × zstd_baseline_ratio` — must beat zstd-22 by
-≥2% on held-out data from the same distribution. Running log:
-[`SPIKE_1_LOG.md`](SPIKE_1_LOG.md).
-
-## Docs index
-
-| doc | purpose |
-|---|---|
-| [`STORAGE_SERVICE.md`](STORAGE_SERVICE.md) | Product spec: pitch, API, economics, risks, spike plan |
-| [`CUSTOMER_PROFILE.md`](CUSTOMER_PROFILE.md) | What realistic customer data looks like per vertical, why the codec design is shaped around it |
-| [`HYBRID_CODEC_DESIGN.md`](HYBRID_CODEC_DESIGN.md) | Dispatcher architecture: neural + classical codec menu, detector, metrics |
-| [`COMPETITIVE_LANDSCAPE.md`](COMPETITIVE_LANDSCAPE.md) | Who sells cheap compressed storage today, who claims AI-powered compression, where the defensible moat is |
-| [`docs/SERVICE_ARCHITECTURE.md`](docs/SERVICE_ARCHITECTURE.md) | AWS architecture reference: stacks, data flow, DDB schemas |
-| [`TRAINING_FLOW.md`](TRAINING_FLOW.md) | End-to-end walkthrough of one training job: tokenizer → RWKV → ratio → metadata |
-| [`SPIKE_1_LOG.md`](SPIKE_1_LOG.md) | Running log of Spike 1 (HDFS on real service) |
-| [`PRODUCTION_TODO.md`](PRODUCTION_TODO.md) | 10-item gap list between "spike works" and "ready for customers" |
-| [`docs/ARCHIVE_krunch.md`](docs/ARCHIVE_krunch.md) | Historical context: what carries over from the archived krunch CLI project |
-| [`cdk/README.md`](cdk/README.md) | CDK stack inventory + deploy instructions |
-| [`krunch-rust/README.md`](krunch-rust/README.md) | Rust inference runtime (used at compression/decompression time) |
-| [`bench/`](bench/) | Historical Krunch CLI benchmarks (pre-pivot; kept as ratio evidence for the pitch) |
-
-## Tech stack
-
-- **IaC:** AWS CDK v2, TypeScript.
-- **Compute:** Lambda (API + ingest), AWS Batch on EC2 (training), ECS
-  Fargate (compression worker).
-- **Storage:** S3 + DynamoDB on-demand.
-- **Messaging:** SQS (pipeline decoupling), EventBridge (Batch
-  completion).
-- **Training:** per-dataset 16 K-vocab SentencePiece unigram tokenizer
-  + Krunch-200K RWKV-v4 architecture (~200 K params, 2 layers, d=96).
-  bf16 mixed precision on g5.xlarge (A10G) via AWS Batch.
-- **Inference (Spike 2+):** Rust runtime in `krunch-rust/` reads a `.bin`
-  checkpoint. Spike 1 defers this — storage uses `zstd --long=27 -22`
-  while the model's entropy-bound ratio is measured and recorded in
-  metadata.
-- **Image builds:** AWS CodeBuild (triggered on git push) pushes to
-  ECR over the AWS backbone; `buildspec.yml` at the repo root.
+> Status: pre-launch (private repo). v1 launch target: 6 weeks.
+> See `V1_PLAN.md` for the roadmap.
 
 ## Quick start
 
 ```bash
-# Deploy everything to your own AWS account
-cd cdk
-npm install
-npx cdk bootstrap
-npx cdk deploy --all --context env=dev --require-approval never
+# Server mode — always-warm REST API, good for interactive / streaming
+docker run --gpus all -p 8080:8080 ghcr.io/dmatth1/krunch:v1
 
-# PUT a dataset via API (see STORAGE_SERVICE.md for endpoint shape)
-curl -X PUT \
-  -H "x-api-key: $API_KEY" \
-  -H "Content-Type: application/x-ndjson" \
-  --data-binary @events.ndjson \
-  "$API_ENDPOINT/v1/customers/acme/datasets/my-logs/events"
-
-# Poll pipeline state
-./scripts/spike_status.sh acme my-logs
+curl -X POST http://localhost:8080/compress   -T data.jsonl  > data.krunch
+curl -X POST http://localhost:8080/decompress -T data.krunch > data.jsonl
 ```
+
+For large files / archival workloads, use **job mode**: the same
+Docker image runs as an array job under any batch scheduler (AWS
+Batch, k8s Jobs, Spark, Dask, Ray). Workers read byte ranges
+directly from object storage and run in parallel.
+
+```bash
+# Reference deployer: AWS Batch
+cd deploy/aws-cdk && npm install && npx cdk deploy
+
+python3 scripts/krunch_cli.py submit \
+  --source s3://my-bucket/logs/data.jsonl \
+  --dest   s3://my-bucket/logs/data.krunch \
+  --workers 8
+```
+
+## What's inside the image
+
+- **RWKV-4-Pile-169M** pretrained language model (Apache-2.0,
+  BlinkDL) — the predictor.
+- **Custom WKV CUDA kernel** — fused recurrence op,
+  ~1000× faster than HF transformers' eval-mode fallback.
+- **constriction** arithmetic coder — encodes the next-token
+  distribution into a bitstream.
+- **64 KB chunks** — independent across chunks, parallelizable.
+- **Dispatcher** — neural vs zstd per-chunk, shortest output wins.
+  Ensures we never lose to classical on chunks where it does.
+
+Architecture validated in `SPIKE_6_LOG.md`: ratio 0.111 on
+WildChat-English (vs zstd 0.166), 330–430 KB/s compress on A10G fp16.
+
+## Why "distributed"
+
+Compression chunks are independent — N workers means ~N× throughput.
+Decompression is the same: token-step is sequential within a chunk
+(RNN), but chunks decode in parallel. A 10 TB backfill on 10 workers
+finishes in 1/10th the time, with no orchestration code on the
+customer's side.
+
+The compression task is map-only and embarrassingly parallel, so it
+ships as a generic "run this container with these env vars" contract
+that fits any batch framework.
+
+## What v1 ships
+
+```
+krunch/
+├── Dockerfile              # CUDA + PyTorch + RWKV-LM, server + job modes
+├── server/                 # FastAPI server, RWKV inference, AC codec, blob format
+├── scripts/                # entrypoint.sh, krunch_cli.py, smoke + roundtrip tests
+├── deploy/aws-cdk/         # AWS Batch deployer (compute envs, job queue, S3 bucket)
+├── deploy/docker-compose.yml  # local CPU-mode dev
+├── V1_PLAN.md, V2_PLAN.md, SPIKE_6_LOG.md, CLAUDE.md
+└── LICENSE                 # Apache-2.0
+```
+
+See `V1_PLAN.md` for the launch roadmap and `V2_PLAN.md` for the
+planned hosted offering + vertical LoRA adapter registry.
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE).
-
-Compression technology derives from Krunch (AAAI 2025) and RWKV-LM
-(Apache-2.0). See [NOTICE](NOTICE) for attribution.
-
-## History
-
-Forked from `krunch` on 2026-04-21. The CLI compressor direction
-was archived when it couldn't beat `zstd` on the dimensions that
-matter (speed, distribution, heterogeneous-text ratio). The
-compression tech carries over; see
-[`docs/ARCHIVE_krunch.md`](docs/ARCHIVE_krunch.md) for what's load-bearing.
+Apache-2.0. Maximum adoption, compatible with the planned v2 hosted
+offering, patent grant + attribution prevents trivial whitewash forks.
+See `NOTICE` for upstream attributions (RWKV-LM, constriction).
