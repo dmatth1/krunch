@@ -20,9 +20,16 @@ cd "$(dirname "$0")/.."
 # ---------------------------------------------------------------------------
 REGION="${AWS_REGION:-us-east-1}"
 INSTANCE_TYPE="g5.xlarge"
-KEY_NAME="${KRUNCH_KEY_PAIR:-swarm-ec2}"
-SECURITY_GROUP="${KRUNCH_SG:-bnn-training}"
-S3_BUCKET="${KRUNCH_S3_BUCKET:-dmatth1-bnn-checkpoints}"
+
+# These are author-specific by default — override via env to point at your
+# own AWS resources. Required: an SSH key pair, a security group, an S3
+# bucket the instance can read/write, and an IAM instance profile that
+# grants access to that bucket.
+KEY_NAME="${KRUNCH_KEY_PAIR:?KRUNCH_KEY_PAIR env var required (your EC2 key pair name)}"
+SECURITY_GROUP="${KRUNCH_SG:?KRUNCH_SG env var required (security group name)}"
+S3_BUCKET="${KRUNCH_S3_BUCKET:?KRUNCH_S3_BUCKET env var required (bucket the test reads/writes)}"
+INSTANCE_PROFILE="${KRUNCH_INSTANCE_PROFILE:?KRUNCH_INSTANCE_PROFILE env var required (IAM profile with S3 access to KRUNCH_S3_BUCKET)}"
+
 S3_PREFIX="krunch-tier3"
 SAMPLE_LOCAL="data/spike6/wildchat_en_content.content.bin"
 SAMPLE_LIMIT_MB=100
@@ -236,7 +243,6 @@ rm -f "${USER_DATA}.bak"
 # ---------------------------------------------------------------------------
 echo
 echo "[2/5] Launching ${INSTANCE_TYPE} spot instance..."
-INSTANCE_PROFILE="${KRUNCH_INSTANCE_PROFILE:-bnn-s3-access}"
 INSTANCE_ID=$(aws ec2 run-instances \
   --region "$REGION" \
   --image-id "$AMI_ID" \
