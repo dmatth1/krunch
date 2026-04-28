@@ -66,74 +66,93 @@ head -c "$SAMPLE_BYTES" "$SAMPLE_LOCAL" | aws s3 cp --quiet - "${S3_BASE}/sample
 echo "  uploaded $(du -sh "$REPO_TAR" | cut -f1) repo + ${SAMPLE_LIMIT_MB} MB sample"
 
 # ---------------------------------------------------------------------------
-# 2. Build user-data
+# 2. Build user-data — QUOTED heredoc (literal string, no Mac-side expansion)
+#    Then sed-substitute the few placeholders we want injected.
 # ---------------------------------------------------------------------------
 USER_DATA=$(mktemp)
-cat > "$USER_DATA" << USERDATA_EOF
+cat > "$USER_DATA" << 'USERDATA_EOF'
 #!/bin/bash
 set -e
 exec > /var/log/krunch-tier3.log 2>&1
-echo "TIER3_START \$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+echo "TIER3_START $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-S3_BASE="${S3_BASE}"
-MODEL_BUNDLE_S3="${MODEL_BUNDLE_S3}"
-INSTANCE_ID=\$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+S3_BASE="__S3_BASE__"
+MODEL_BUNDLE_S3="__MODEL_BUNDLE_S3__"
+TEST_TAG="__TEST_TAG__"
+REGION="__REGION__"
+INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
 
 cd /tmp
-echo "FETCH_START \$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-aws s3 cp "\${S3_BASE}/repo.tar.gz" repo.tar.gz
-aws s3 cp "\${S3_BASE}/sample.bin"  sample.bin
-aws s3 cp "\${MODEL_BUNDLE_S3}"     rwkv_bundle.tar.gz
+echo "FETCH_START $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+aws s3 cp "${S3_BASE}/repo.tar.gz" repo.tar.gz
+aws s3 cp "${S3_BASE}/sample.bin"  sample.bin
+aws s3 cp "${MODEL_BUNDLE_S3}"     rwkv_bundle.tar.gz
 
 mkdir -p /tmp/extract
 tar xzf repo.tar.gz
 tar xzf rwkv_bundle.tar.gz -C /tmp/extract
 
-KRUNCH_DIR=\$(find /tmp -maxdepth 2 -name 'krunch' -type d | head -1)
-mkdir -p "\${KRUNCH_DIR}/models"
-cp /tmp/extract/RWKV-4-Pile-169M-20220807-8023.pth "\${KRUNCH_DIR}/models/"
-cp /tmp/extract/RWKV-v4/20B_tokenizer.json          "\${KRUNCH_DIR}/models/"
-echo "FETCH_DONE \$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+KRUNCH_DIR=$(find /tmp -maxdepth 2 -name 'krunch' -type d | head -1)
+mkdir -p "${KRUNCH_DIR}/models"
+cp /tmp/extract/RWKV-4-Pile-169M-20220807-8023.pth "${KRUNCH_DIR}/models/"
+cp /tmp/extract/RWKV-v4/20B_tokenizer.json          "${KRUNCH_DIR}/models/"
+echo "FETCH_DONE $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-cd "\${KRUNCH_DIR}"
+cd "${KRUNCH_DIR}"
 
-echo "BUILD_START \$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+echo "BUILD_START $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 docker build -t krunch:tier3 . 2>&1 | tail -20
-echo "BUILD_DONE \$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+echo "BUILD_DONE $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-INPUT_BYTES=\$(wc -c < /tmp/sample.bin)
-echo "Input: \$INPUT_BYTES bytes"
+# Install the krunch CLI wrapper. After this point we use the documented
+# user UX (`krunch compress`, not raw `docker run`) — same bytes execute.
+# KRUNCH_IMAGE points at the locally-built image since ghcr.io publish
+# is a Week-4 task; the default is ghcr.io/dmatth1/krunch:v1.
+install -m 0755 scripts/krunch /usr/local/bin/krunch
+export KRUNCH_IMAGE=krunch:tier3
 
-echo "COMPRESS_START \$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-T0=\$(date +%s.%N)
-docker run --rm --gpus all -i krunch:tier3 compress < /tmp/sample.bin > /tmp/sample.krunch
-T1=\$(date +%s.%N)
-COMPRESS_S=\$(echo "\$T1 - \$T0" | bc)
-COMPRESSED_BYTES=\$(wc -c < /tmp/sample.krunch)
-echo "COMPRESS_DONE \$(date -u +%Y-%m-%dT%H:%M:%SZ) elapsed=\${COMPRESS_S}s out=\${COMPRESSED_BYTES}b"
+INPUT_BYTES=$(wc -c < /tmp/sample.bin)
+echo "Input: ${INPUT_BYTES} bytes"
 
-echo "DECOMPRESS_START \$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-T2=\$(date +%s.%N)
-docker run --rm --gpus all -i krunch:tier3 decompress < /tmp/sample.krunch > /tmp/sample.out
-T3=\$(date +%s.%N)
-DECOMPRESS_S=\$(echo "\$T3 - \$T2" | bc)
-RECOVERED_BYTES=\$(wc -c < /tmp/sample.out)
-echo "DECOMPRESS_DONE \$(date -u +%Y-%m-%dT%H:%M:%SZ) elapsed=\${DECOMPRESS_S}s out=\${RECOVERED_BYTES}b"
+echo "COMPRESS_START $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+T0=$(date +%s.%N)
+krunch compress < /tmp/sample.bin > /tmp/sample.krunch
+T1=$(date +%s.%N)
+COMPRESS_S=$(echo "$T1 - $T0" | bc)
+COMPRESSED_BYTES=$(wc -c < /tmp/sample.krunch)
+echo "COMPRESS_DONE $(date -u +%Y-%m-%dT%H:%M:%SZ) elapsed=${COMPRESS_S}s out=${COMPRESSED_BYTES}b"
+
+echo "DECOMPRESS_START $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+T2=$(date +%s.%N)
+krunch decompress < /tmp/sample.krunch > /tmp/sample.out
+T3=$(date +%s.%N)
+DECOMPRESS_S=$(echo "$T3 - $T2" | bc)
+RECOVERED_BYTES=$(wc -c < /tmp/sample.out)
+echo "DECOMPRESS_DONE $(date -u +%Y-%m-%dT%H:%M:%SZ) elapsed=${DECOMPRESS_S}s out=${RECOVERED_BYTES}b"
 
 if cmp -s /tmp/sample.bin /tmp/sample.out; then BYTE_EXACT="true"; else BYTE_EXACT="false"; fi
 
-python3 - << PY
-import json
-input_bytes = $(wc -c < /tmp/sample.bin)
-compressed = $COMPRESSED_BYTES
-recovered = $RECOVERED_BYTES
-compress_s = $COMPRESS_S
-decompress_s = $DECOMPRESS_S
+# Build result JSON via Python (avoids floating-point shell math issues)
+INPUT_BYTES=$INPUT_BYTES \
+COMPRESSED_BYTES=$COMPRESSED_BYTES \
+RECOVERED_BYTES=$RECOVERED_BYTES \
+COMPRESS_S=$COMPRESS_S \
+DECOMPRESS_S=$DECOMPRESS_S \
+BYTE_EXACT=$BYTE_EXACT \
+TEST_TAG=$TEST_TAG \
+python3 -c '
+import os, json
+input_bytes  = int(os.environ["INPUT_BYTES"])
+compressed   = int(os.environ["COMPRESSED_BYTES"])
+recovered    = int(os.environ["RECOVERED_BYTES"])
+compress_s   = float(os.environ["COMPRESS_S"])
+decompress_s = float(os.environ["DECOMPRESS_S"])
+byte_exact   = os.environ["BYTE_EXACT"] == "true"
 ratio = compressed / input_bytes
-ckb = input_bytes / 1024 / compress_s
-dkb = input_bytes / 1024 / decompress_s
+ckb   = input_bytes / 1024 / compress_s
+dkb   = input_bytes / 1024 / decompress_s
 result = {
-    "tag": "${TEST_TAG}",
+    "tag": os.environ["TEST_TAG"],
     "input_bytes": input_bytes,
     "compressed_bytes": compressed,
     "recovered_bytes": recovered,
@@ -142,24 +161,33 @@ result = {
     "decompress_seconds": round(decompress_s, 2),
     "compress_kb_s": round(ckb, 1),
     "decompress_kb_s": round(dkb, 1),
-    "byte_exact": "$BYTE_EXACT" == "true",
+    "byte_exact": byte_exact,
     "gates": {
         "ratio_lte_0_165": ratio <= 0.165,
         "compress_kb_s_gte_300": ckb >= 300,
-        "byte_exact": "$BYTE_EXACT" == "true",
+        "byte_exact": byte_exact,
     },
 }
 result["all_gates_pass"] = all(result["gates"].values())
 with open("/tmp/result.json", "w") as f: json.dump(result, f, indent=2)
 print(json.dumps(result, indent=2))
-PY
+'
 
-aws s3 cp /tmp/result.json "\${S3_BASE}/result.json"
-aws s3 cp /var/log/krunch-tier3.log "\${S3_BASE}/setup.log"
-echo "TIER3_DONE \$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+aws s3 cp /tmp/result.json "${S3_BASE}/result.json"
+aws s3 cp /var/log/krunch-tier3.log "${S3_BASE}/setup.log"
+echo "TIER3_DONE $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-aws ec2 terminate-instances --instance-ids "\$INSTANCE_ID" --region "${REGION}"
+aws ec2 terminate-instances --instance-ids "${INSTANCE_ID}" --region "${REGION}"
 USERDATA_EOF
+
+# Inject the four outer-shell vars
+sed -i.bak \
+  -e "s|__S3_BASE__|${S3_BASE}|g" \
+  -e "s|__MODEL_BUNDLE_S3__|${MODEL_BUNDLE_S3}|g" \
+  -e "s|__TEST_TAG__|${TEST_TAG}|g" \
+  -e "s|__REGION__|${REGION}|g" \
+  "$USER_DATA"
+rm -f "${USER_DATA}.bak"
 
 # ---------------------------------------------------------------------------
 # 3. Launch spot instance

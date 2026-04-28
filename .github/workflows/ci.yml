@@ -3,109 +3,55 @@ name: CI
 on:
   push:
     branches: [main]
-    paths:
-      - 'krunch-rust/**'
-      - '.github/workflows/ci.yml'
   pull_request:
-    paths:
-      - 'krunch-rust/**'
-      - '.github/workflows/ci.yml'
   workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  CARGO_TERM_COLOR: always
-  RUST_BACKTRACE: 1
-
-defaults:
-  run:
-    working-directory: krunch-rust
-
 jobs:
-  # rustfmt and clippy are blocking gates. The tree was cleaned up in
-  # task #24; new PRs that introduce unformatted code or clippy
-  # warnings fail CI. If a lint is genuinely wrong for this codebase
-  # (e.g., `too_many_arguments` on a NEON kernel) prefer a scoped
-  # `#[allow(...)]` with a load-bearing comment over silencing the
-  # category crate-wide.
-  fmt:
-    name: rustfmt
+  tier1:
+    name: Tier 1 — local checks
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          components: rustfmt
-      - run: cargo fmt --all -- --check
+          python-version: "3.11"
 
-  clippy:
-    name: clippy
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install SentencePiece
-        run: sudo apt-get update && sudo apt-get install -y libsentencepiece-dev pkg-config
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: krunch-rust -> target
-      - run: cargo clippy --all-targets --all-features -- -D warnings
-
-  build-test:
-    name: ${{ matrix.name }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: macos-arm64
-            os: macos-14
-            target: aarch64-apple-darwin
-            sp-install: brew install sentencepiece pkg-config
-          - name: macos-x86_64
-            os: macos-13
-            target: x86_64-apple-darwin
-            sp-install: brew install sentencepiece pkg-config
-          - name: linux-x86_64
-            os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            sp-install: sudo apt-get update && sudo apt-get install -y libsentencepiece-dev pkg-config
-          - name: linux-arm64
-            os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            sp-install: sudo apt-get update && sudo apt-get install -y libsentencepiece-dev pkg-config
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install SentencePiece
-        run: ${{ matrix.sp-install }}
-        working-directory: .
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: krunch-rust -> target
-          key: ${{ matrix.target }}
-
-      - name: Build (release)
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Unit tests (lib)
-        run: cargo test --release --target ${{ matrix.target }} --lib
-
-      - name: Smoke test — round-trip
-        shell: bash
+      - name: Install Python deps for smoke test
         run: |
-          set -euo pipefail
-          echo "Hello world from ${{ matrix.name }} on $(date)" > /tmp/krunch_ci_input.txt
-          ./target/${{ matrix.target }}/release/krunch \
-            compress /tmp/krunch_ci_input.txt \
-            -o /tmp/krunch_ci.krunch --verify
+          python -m pip install --upgrade pip
+          pip install constriction tokenizers zstandard numpy
+
+      - name: Smoke test (blob format, AC codec, chunking, CRC, tokenizer)
+        run: |
+          # The smoke test loads the GPT-NeoX BPE tokenizer from models/.
+          mkdir -p models
+          curl -sL https://github.com/BlinkDL/RWKV-LM/raw/main/RWKV-v4/20B_tokenizer.json \
+            -o models/20B_tokenizer.json
+          python scripts/smoke_test_local.py
+
+      - name: Set up Node for CDK
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: CDK type-check + synth
+        run: |
+          cd deploy/aws-cdk
+          npm install --silent
+          npx tsc --noEmit
+          # cdk synth needs creds for ec2.MachineImage.lookup; stub them
+          CDK_DEFAULT_ACCOUNT=000000000000 CDK_DEFAULT_REGION=us-east-1 \
+            npx cdk synth --quiet > /dev/null
+
+      - name: krunch submit --dry-run
+        run: |
+          pip install boto3
+          ./scripts/krunch submit \
+            --source s3://test/in --dest s3://test/out \
+            --workers 4 --dry-run | head -40
