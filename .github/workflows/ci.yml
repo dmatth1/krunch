@@ -40,14 +40,14 @@ jobs:
         with:
           node-version: "20"
 
-      - name: CDK type-check + synth
+      - name: CDK type-check
+        # `cdk synth` needs real AWS credentials (ec2.Vpc.fromLookup +
+        # MachineImage.lookup hit the AWS API). Skipped in CI; run locally
+        # via scripts/tier1_check.sh which authenticates against a real account.
         run: |
           cd deploy/aws-cdk
           npm install --silent
           npx tsc --noEmit
-          # cdk synth needs creds for ec2.MachineImage.lookup; stub them
-          CDK_DEFAULT_ACCOUNT=000000000000 CDK_DEFAULT_REGION=us-east-1 \
-            npx cdk synth --quiet > /dev/null
 
       - name: krunch submit --dry-run
         run: |
