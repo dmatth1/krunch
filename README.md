@@ -10,16 +10,14 @@
 ## Quick start
 
 ```bash
-# Server mode — always-warm REST API, good for interactive / streaming
-docker run --gpus all -p 8080:8080 ghcr.io/dmatth1/krunch:v1
-
-curl -X POST http://localhost:8080/compress   -T data.jsonl  > data.krunch
-curl -X POST http://localhost:8080/decompress -T data.krunch > data.jsonl
+# Single-shot: container starts, processes, exits
+docker run --gpus all -i ghcr.io/dmatth1/krunch:v1 compress   < data.jsonl  > data.krunch
+docker run --gpus all -i ghcr.io/dmatth1/krunch:v1 decompress < data.krunch > data.jsonl
 ```
 
-For large files / archival workloads, use **job mode**: the same
-Docker image runs as an array job under any batch scheduler (AWS
-Batch, k8s Jobs, Spark, Dask, Ray). Workers read byte ranges
+For large files / archival workloads, run as a distributed batch job.
+The same Docker image runs as an array job under any scheduler
+(AWS Batch, k8s Jobs, Spark, Dask, Ray) — workers read byte ranges
 directly from object storage and run in parallel.
 
 ```bash
@@ -63,11 +61,15 @@ that fits any batch framework.
 
 ```
 krunch/
-├── Dockerfile              # CUDA + PyTorch + RWKV-LM, server + job modes
-├── server/                 # FastAPI server, RWKV inference, AC codec, blob format
-├── scripts/                # entrypoint.sh, krunch_cli.py, smoke + roundtrip tests
+├── Dockerfile              # CUDA + PyTorch + RWKV-LM, single-shot + job entrypoints
+├── server/                 # core compression code
+│   ├── cli.py              # single-shot entrypoint: compress | decompress
+│   ├── inference.py        # RWKV-4-Pile-169M wrapper + AC coder + blob format
+│   ├── chunking.py         # 64KB chunk dispatcher (neural vs zstd, shortest wins)
+│   ├── job.py              # Batch job runner: compress (array) + assemble (single)
+│   └── url_io.py           # generic URL read/write (s3://, http://, file://)
+├── scripts/                # entrypoint.sh, krunch_cli.py (submit), test scripts
 ├── deploy/aws-cdk/         # AWS Batch deployer (compute envs, job queue, S3 bucket)
-├── deploy/docker-compose.yml  # local CPU-mode dev
 ├── V1_PLAN.md, V2_PLAN.md, SPIKE_6_LOG.md, CLAUDE.md
 └── LICENSE                 # Apache-2.0
 ```

@@ -50,13 +50,8 @@ m.forward([0], None); print('kernel warm-up ok') \
 COPY server/ /app/server/
 
 WORKDIR /app
-EXPOSE 8080
 
 COPY scripts/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-HEALTHCHECK --interval=10s --timeout=5s --start-period=30s --retries=3 \
-    CMD curl -f http://localhost:8080/healthz || exit 1
-
 ENTRYPOINT ["/entrypoint.sh"]
-CMD ["server"]
