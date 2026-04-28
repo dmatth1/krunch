@@ -98,46 +98,59 @@ def _softmax_np(logits: np.ndarray) -> np.ndarray:
 BOS_TOKEN = 0  # initial seed for both encode and decode — must match
 
 
-def _categorical_from_logits(logits_row: np.ndarray):
-    """Softmax → clip → renormalize → Categorical. Same numerical recipe
-    on encode and decode sides so the bitstream is byte-exact."""
-    probs = _softmax_np(logits_row.astype(np.float64))
-    probs = np.clip(probs, 1e-9, 1.0)
-    probs /= probs.sum()
-    return constriction.stream.model.Categorical(probs, perfect=False)
+def _softmax_clip_normalize(logits: np.ndarray) -> np.ndarray:
+    """Vectorized softmax → clip → renormalize. Works on (V,) or (N, V).
+    Returns float32 probabilities suitable for constriction's batched-params
+    `Categorical` model_family API. Same numerical recipe on encode + decode
+    sides so the bitstream is byte-exact."""
+    arr = logits.astype(np.float64, copy=False)
+    if arr.ndim == 1:
+        arr = arr - arr.max()
+        np.exp(arr, out=arr)
+        arr /= arr.sum()
+        np.clip(arr, 1e-9, 1.0, out=arr)
+        arr /= arr.sum()
+    else:
+        arr = arr - arr.max(axis=1, keepdims=True)
+        np.exp(arr, out=arr)
+        arr /= arr.sum(axis=1, keepdims=True)
+        np.clip(arr, 1e-9, 1.0, out=arr)
+        arr /= arr.sum(axis=1, keepdims=True)
+    return arr.astype(np.float32)
 
 
 def ac_encode(tokens: list[int], logits_seq: np.ndarray) -> bytes:
     """
     Range-encode tokens[0..N-1] using logits_seq[0..N-1] as distributions.
-    logits_seq[i] must be the model's prediction for tokens[i] given the prefix
-    [BOS, tokens[0], ..., tokens[i-1]]. Range coding is symmetric (encode and
-    decode both run in forward order), which lets compress_chunk stream:
-    forward batch i → range-encode immediately → free logits → next batch.
+    Uses constriction's Option-3 batched-params API: one Rust call for the
+    whole sequence, instead of per-token Python iterations.
     """
     assert len(tokens) == logits_seq.shape[0], \
         f"tokens ({len(tokens)}) vs logits ({logits_seq.shape[0]}) length mismatch"
     enc = constriction.stream.queue.RangeEncoder()
-    for t in range(len(tokens)):
-        enc.encode(np.array([tokens[t]], dtype=np.int32),
-                   _categorical_from_logits(logits_seq[t]))
+    model_family = constriction.stream.model.Categorical(perfect=False)
+    probs = _softmax_clip_normalize(logits_seq)  # (N, V) float32
+    enc.encode(np.asarray(tokens, dtype=np.int32), model_family, probs)
     return np.array(enc.get_compressed(), dtype=np.uint32).tobytes()
 
 
 def ac_decode(bitstream: bytes, n_tokens: int, logits_fn) -> list[int]:
     """
     Range-decode n_tokens. logits_fn(state, last_input) -> (logits, new_state)
-    is called n_tokens times: first with last_input=BOS_TOKEN, state=None;
-    subsequent calls feed the just-decoded token.
+    is called n_tokens times — autoregressive, so per-step (each step's
+    distribution depends on the previous decoded token). Uses model_family
+    + per-step probs to skip Categorical re-construction overhead.
     """
     compressed = np.frombuffer(bitstream, dtype=np.uint32)
     dec = constriction.stream.queue.RangeDecoder(compressed)
+    model_family = constriction.stream.model.Categorical(perfect=False)
     tokens = []
     state = None
     last_input = BOS_TOKEN
     for _ in range(n_tokens):
         logits, state = logits_fn(state, last_input)
-        tok = int(dec.decode(_categorical_from_logits(logits)))
+        probs = _softmax_clip_normalize(logits).reshape(1, -1)  # (1, V)
+        tok = int(dec.decode(model_family, probs)[0])
         tokens.append(tok)
         last_input = tok
     return tokens
@@ -191,10 +204,16 @@ class InferenceEngine:
         """
         Compress a single chunk to a range-coded bitstream + mini-header.
 
-        Streaming: each forward batch's logits are range-encoded immediately
-        and freed before the next forward call. Peak memory is O(SEQ_BATCH ×
-        vocab) ≈ 200 MB regardless of chunk size — the per-chunk memory
-        bound that was capping chunk size on small instances is gone.
+        Streaming + batched: each forward batch's logits are softmax'd in
+        a single numpy op (vectorized across all tokens in the batch) and
+        range-encoded with constriction's batched-params API in ONE call
+        per batch. The earlier per-token Python loop pegged a CPU core at
+        92 % while the GPU sat idle (Categorical() per-token was the cost);
+        batching collapses 1024 Python iterations into 2-3 numpy ops + 1
+        Rust call.
+
+        Peak memory: O(SEQ_BATCH × vocab) ≈ 200 MB, independent of chunk
+        size.
         """
         text = data.decode("utf-8", errors="replace")
         tokens = self._tokenizer.encode(text).ids
@@ -205,17 +224,23 @@ class InferenceEngine:
         full_input = [BOS_TOKEN] + tokens[:-1]  # length N
 
         enc = constriction.stream.queue.RangeEncoder()
+        # Model family without baked-in probs — params passed per encode call.
+        model_family = constriction.stream.model.Categorical(perfect=False)
+        tokens_arr = np.asarray(tokens, dtype=np.int32)
+
         state = None
         pos = 0  # next token index to encode
         for i in range(0, len(full_input), SEQ_BATCH):
             batch = full_input[i:i + SEQ_BATCH]
             logits, state = self._model.forward(batch, state, full_output=True)
-            np_logits = _to_numpy(logits)  # (B, vocab)
-            for row in np_logits:
-                enc.encode(np.array([tokens[pos]], dtype=np.int32),
-                           _categorical_from_logits(row))
-                pos += 1
-            del np_logits, logits  # release before the next forward call
+            np_logits = _to_numpy(logits)  # (B, vocab) float32
+            probs = _softmax_clip_normalize(np_logits)  # (B, V) float32
+
+            # Encode this batch's tokens — one Rust call, B tokens.
+            B = np_logits.shape[0]
+            enc.encode(tokens_arr[pos:pos + B], model_family, probs)
+            pos += B
+            del np_logits, logits, probs
 
         ac_bytes = np.array(enc.get_compressed(), dtype=np.uint32).tobytes()
 
