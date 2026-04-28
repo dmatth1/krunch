@@ -10,9 +10,11 @@ Usage:
 If --in is omitted, reads from stdin. If --out is omitted, writes to stdout.
 """
 
+import os
 import sys
 import zlib
 import argparse
+import contextlib
 import logging
 
 from .inference import engine, encode_header, decode_header, HEADER_SIZE
@@ -24,9 +26,30 @@ logging.basicConfig(level=logging.INFO,
 logger = logging.getLogger(__name__)
 
 
+@contextlib.contextmanager
+def _stdout_to_stderr():
+    """Redirect FD 1 → FD 2 for the duration of the block.
+
+    Needed when loading the model: the first runtime invocation triggers
+    torch.utils.cpp_extension.load() which compiles the WKV CUDA kernel via
+    ninja. ninja writes its progress (`[1/4] c++ -MMD ...`) to stdout, which
+    would pollute our binary blob output. Reassigning sys.stdout in Python
+    doesn't affect subprocesses — this dups the file descriptor at the OS
+    level so ninja inherits a stderr-pointing FD 1.
+    """
+    saved = os.dup(1)
+    try:
+        os.dup2(2, 1)
+        yield
+    finally:
+        os.dup2(saved, 1)
+        os.close(saved)
+
+
 def cmd_compress(args):
     raw = _read_input(args.input)
-    engine.load()
+    with _stdout_to_stderr():
+        engine.load()
     chunk_entries, n_chunks = compress_all(raw, engine.compress_chunk)
     crc = zlib.crc32(raw) & 0xFFFFFFFF
     blob = encode_header(len(raw), n_chunks, crc) + b"".join(chunk_entries)
@@ -38,7 +61,8 @@ def cmd_compress(args):
 
 def cmd_decompress(args):
     blob = _read_input(args.input)
-    engine.load()
+    with _stdout_to_stderr():
+        engine.load()
     hdr = decode_header(blob)
     entries_bytes = blob[HEADER_SIZE:]
     raw = decompress_all(entries_bytes, hdr["n_chunks"], engine.decompress_chunk)
