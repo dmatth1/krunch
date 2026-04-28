@@ -25,6 +25,12 @@ deploy/aws-cdk/cdk.context.json
 
 # WKV kernel build cache (compiled at runtime)
 server/kernel_cache/
+
+# Internal planning + working notes (not for public repo)
+CLAUDE.md
+V1_PLAN.md
+V2_PLAN.md
+SPIKE_6_LOG.md
 !bench/corpora/.gitkeep
 !bench/corpora/README.md
 

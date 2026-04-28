@@ -4,8 +4,7 @@
 > One Docker image. Any NVIDIA GPU. Beats zstd by 30-40% on
 > text-heavy data (logs, chat, support tickets, code).
 
-> Status: pre-launch (private repo). v1 launch target: 6 weeks.
-> See `V1_PLAN.md` for the roadmap.
+> Status: pre-launch. v1 launch target: 6 weeks.
 
 ## Install + compress
 
@@ -56,7 +55,7 @@ krunch submit \
 - **Dispatcher** — neural vs zstd per-chunk, shortest output wins.
   Ensures we never lose to classical on chunks where it does.
 
-Architecture validated in `SPIKE_6_LOG.md`: ratio 0.111 on
+Architecture validated on real GPU: ratio 0.111 on
 WildChat-English (vs zstd 0.166), 330–430 KB/s compress on A10G fp16.
 
 ## Why "distributed"
@@ -84,12 +83,8 @@ krunch/
 │   └── url_io.py           # generic URL read/write (s3://, http://, file://)
 ├── scripts/                # entrypoint.sh, krunch_cli.py (submit), test scripts
 ├── deploy/aws-cdk/         # AWS Batch deployer (compute envs, job queue, S3 bucket)
-├── V1_PLAN.md, V2_PLAN.md, SPIKE_6_LOG.md, CLAUDE.md
 └── LICENSE                 # Apache-2.0
 ```
-
-See `V1_PLAN.md` for the launch roadmap and `V2_PLAN.md` for the
-planned hosted offering + vertical LoRA adapter registry.
 
 ## License
 
