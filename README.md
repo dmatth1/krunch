@@ -84,30 +84,46 @@ KB/s** on A10G fp16, byte-exact decompression.
 | nginx logs | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
 | The Stack (Python) | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
 
-## Throughput scaling with `krunch submit --workers N`
+## Throughput
 
-> *To be filled in. Need: aggregate compress throughput on a fixed*
-> *corpus (~10 GB) at `--workers ∈ {1, 2, 4, 8, 16, 32}` on a g5.xlarge*
-> *Batch fleet. Expect a near-linear line (chunks are independent, no*
-> *coordination overhead until the assemble step).*
+### Single-worker absolute throughput by GPU type
+
+> *To be filled in. Need: compress + decompress KB/s for one g{5,6e}.xlarge
+> instance on a fixed 1 GB sample. Same image, same chunk size (1 MB).
+> Hardware differs.*
+
+| GPU | compress (KB/s) | decompress (KB/s) | $/hr (spot us-east-1) |
+|---|---|---|---|
+| A10G (g5.xlarge) | _tbd_ | _tbd_ | ~$0.30 |
+| L4 (g6.xlarge) | _tbd_ | _tbd_ | ~$0.30 |
+| L40S (g6e.xlarge) | _tbd_ | _tbd_ | ~$0.90 |
+| A100 40GB (p4d.24xlarge, 1 GPU) | _tbd_ | _tbd_ | ~$3.40 |
+| H100 80GB (p5.48xlarge, 1 GPU) | _tbd_ | _tbd_ | ~$5.50 |
+
+### Scaling across workers (`krunch submit --workers N`)
+
+> *To be filled in. Need: aggregate compress + decompress KB/s on a*
+> *fixed corpus (~10 GB) at `--workers ∈ {1, 2, 4, 8, 16, 32}` on a*
+> *g5.xlarge Batch fleet. Expect near-linear scaling for both — chunks*
+> *are independent, the only coordination is the final assemble step.*
 
 ```
-  aggregate compress KB/s
+  aggregate KB/s
     │
-    │
-    │                                                      ●  (tbd)
-    │
-    │                                          ●  (tbd)
-    │
-    │                              ●  (tbd)
-    │
-    │                  ●  (tbd)
-    │
-    │      ●  (tbd)
-    │  ●  (tbd)
+    │                                            compress  ●━━━━━━━●
+    │                                               ●━━━━━━━●
+    │                                       decompress ●━━━●
+    │                                ●━━━━━━━●
+    │                          ●━━━●
+    │                ●━━━●
+    │           ●━━━●
+    │      ●━━━●
+    │  ●━━━●
     └──┬──┬──┬──┬──┬──┬──→  workers
        1  2  4  8  16 32
 ```
+
+Each `●` is `_tbd_` until measured.
 
 ## When *not* to use krunch
 
