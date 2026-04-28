@@ -233,12 +233,17 @@ rm -f "${USER_DATA}.bak"
 #    (useful when spot capacity is unavailable in your AZ)
 # ---------------------------------------------------------------------------
 ON_DEMAND="${KRUNCH_ON_DEMAND:-0}"
-MARKET_OPTS=()
-[[ "$ON_DEMAND" != "1" ]] && \
-  MARKET_OPTS=(--instance-market-options 'MarketType=spot,SpotOptions={SpotInstanceType=one-time}')
+if [[ "$ON_DEMAND" == "1" ]]; then
+  MARKET_ARGS=""
+  MARKET_LABEL="on-demand"
+else
+  MARKET_ARGS='--instance-market-options MarketType=spot,SpotOptions={SpotInstanceType=one-time}'
+  MARKET_LABEL="spot"
+fi
 
 echo
-echo "[2/5] Launching ${INSTANCE_TYPE} ($([[ $ON_DEMAND == 1 ]] && echo "on-demand" || echo "spot")) instance..."
+echo "[2/5] Launching ${INSTANCE_TYPE} (${MARKET_LABEL}) instance..."
+# shellcheck disable=SC2086  -- intentional word-splitting on $MARKET_ARGS
 INSTANCE_ID=$(aws ec2 run-instances \
   --region "$REGION" \
   --image-id "$AMI_ID" \
@@ -246,7 +251,7 @@ INSTANCE_ID=$(aws ec2 run-instances \
   --key-name "$KEY_NAME" \
   --security-groups "$SECURITY_GROUP" \
   --iam-instance-profile "Name=${INSTANCE_PROFILE}" \
-  "${MARKET_OPTS[@]}" \
+  $MARKET_ARGS \
   --block-device-mappings 'DeviceName=/dev/sda1,Ebs={VolumeSize=120,VolumeType=gp3,DeleteOnTermination=true}' \
   --user-data "file://${USER_DATA}" \
   --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=krunch-tier3-${TEST_TAG}},{Key=Project,Value=krunch}]" \
