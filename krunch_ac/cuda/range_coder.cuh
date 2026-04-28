@@ -12,8 +12,12 @@ constexpr uint32_t QTR = 1u << (PRECISION - 2);   // 2^30
 constexpr uint32_t THREE_QTR = HALF + QTR;        // 3 * 2^30
 
 // CDF precision must match krunch_ac/cdf.py.
-constexpr int CDF_PRECISION = 16;
-constexpr uint32_t CDF_T = 1u << CDF_PRECISION;   // 65536
+// 24 bits: 32-bit range × 24-bit cdf = 56-bit intermediate, fits uint64.
+// Lower precision (16) caused ~50% ratio loss vs constriction's 24-bit
+// path on real LM data — the rare-symbol penalty (1/T floor) dominates
+// when V*MIN_PROB swallows 75% of the cumulative range at T=2^16.
+constexpr int CDF_PRECISION = 24;
+constexpr uint32_t CDF_T = 1u << CDF_PRECISION;   // 16777216
 
 // Range coder state passed across kernel launches (one chunk encodes
 // many forward-batches; AC state must persist).

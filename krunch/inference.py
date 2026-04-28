@@ -241,6 +241,15 @@ class InferenceEngine:
         state = torch.zeros(4, dtype=torch.uint32, device=self._device)
         state[1] = 0xFFFFFFFF
 
+        # Synchronous default-stream pipeline. Per-batch breakdown on
+        # A10G: forward ~10.8 ms, softmax 3.6 ms, cdf 4.4 ms, encode 0.7 ms
+        # = ~19.5 ms/batch ≈ 52K tok/s ≈ 200 KB/s steady-state. The forward
+        # pass is now the wall (56% of per-batch time). Side-stream AC
+        # pipelining was tried and gave ~7% gain on this hardware/torch
+        # version — not worth the complexity. The real next win is
+        # cross-chunk batched forward (v1.1 backlog "true batched RWKV
+        # decode"), which collapses 16 sequential per-token forwards
+        # into one launch and unblocks the 300+ KB/s tier.
         rwkv_state = None
         pos = 0
         for i in range(0, len(full_input), SEQ_BATCH):
@@ -249,14 +258,13 @@ class InferenceEngine:
                 batch, rwkv_state, full_output=True)
             if not isinstance(logits, torch.Tensor):
                 logits = torch.as_tensor(logits, device=self._device)
+            B = logits.size(0)
             with torch.no_grad():
                 probs = torch.softmax(logits.float(), dim=-1)
                 cdf = self._cdf_compiled(probs).contiguous()
-            B = cdf.size(0)
             sym_batch = tokens_arr_gpu[pos:pos + B].contiguous()
             krunch_ac_cuda.encode_step(cdf, sym_batch, output_buf, state)
             pos += B
-            del probs, cdf, logits
 
         krunch_ac_cuda.encode_finalize(output_buf, state)
         torch.cuda.synchronize()

@@ -15,8 +15,8 @@ vs uint32. Ratio loss vs T = 2^24 is small (~0.001 bits/symbol on
 
 import numpy as np
 
-CDF_PRECISION = 16
-T = 1 << CDF_PRECISION  # 65536
+CDF_PRECISION = 24
+T = 1 << CDF_PRECISION  # 16777216
 
 
 def probs_to_cdf(probs: np.ndarray) -> np.ndarray:
