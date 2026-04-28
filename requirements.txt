@@ -1,19 +1,14 @@
-# PyTorch CUDA 12.4 wheels live on a separate index; --extra-index-url
-# must be a top-level directive, not appended to the torch line (pip ignores
-# it there and falls back to PyPI, which doesn't have +cu124 wheels).
---extra-index-url https://download.pytorch.org/whl/cu124
+# Krunch Python deps. Torch is preinstalled in the
+# pytorch/pytorch:2.4.1-cuda12.4-cudnn9-devel base image — pip auto-skips it.
 
-# Core inference. PyTorch only publishes +cu124 wheels from 2.4.0 onward;
-# 2.3.x was cu121-only. Sticking with 2.4.1 (last 2.4.x patch) for stability.
-torch==2.4.1+cu124
 rwkv==0.8.26
 tokenizers==0.19.1
 constriction==0.4.3
 
-# Classical codecs
+# Classical codecs (per-chunk fallback dispatch)
 zstandard==0.22.0
 
-# Job mode + S3 I/O
+# Job mode + S3 I/O for `krunch submit`
 boto3==1.34.0
 
 # Utilities
