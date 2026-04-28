@@ -206,7 +206,7 @@ class InferenceEngine:
 
         def logits_fn(state, token):
             logits, new_state = self._model.forward([token], state)
-            return np.array(logits, dtype=np.float32), new_state
+            return _to_numpy(logits), new_state
 
         tokens = ac_decode(bitstream, n_tokens, logits_fn)
         text = self._tokenizer.decode(tokens)
@@ -226,9 +226,18 @@ class InferenceEngine:
         last_input = BOS_TOKEN
         for i in range(len(tokens)):
             logits, state = self._model.forward([last_input], state)
-            logits_list.append(np.array(logits, dtype=np.float32))
+            logits_list.append(_to_numpy(logits))
             last_input = tokens[i]
         return np.stack(logits_list, axis=0)  # shape (N, vocab)
+
+
+def _to_numpy(t) -> np.ndarray:
+    """Tensor → numpy fp32, regardless of device. CUDA tensors must be moved
+    to host memory first; the rwkv pkg returns CUDA tensors when the model
+    is loaded with `cuda fp16` strategy."""
+    if hasattr(t, "detach"):
+        return t.detach().cpu().float().numpy()
+    return np.asarray(t, dtype=np.float32)
 
 
 # Module-level singleton — imported by main.py
