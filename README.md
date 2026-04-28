@@ -7,24 +7,23 @@
 > Status: pre-launch (private repo). v1 launch target: 6 weeks.
 > See `V1_PLAN.md` for the roadmap.
 
-## Two commands and you're compressing
+## Install + compress
 
 On any host with an NVIDIA GPU + Docker:
 
 ```bash
-# 1. Install the krunch CLI (one-time)
-curl -fsSL https://raw.githubusercontent.com/dmatth1/krunch/main/scripts/krunch \
-  | sudo tee /usr/local/bin/krunch >/dev/null && sudo chmod +x /usr/local/bin/krunch
+# 1. Install (~5-10 min one-time — downloads CLI + pulls 3.5 GB image)
+curl -fsSL https://raw.githubusercontent.com/dmatth1/krunch/main/install.sh | sudo bash
 
-# 2. Use it — Docker auto-pulls the image on first call (~5 min, ~3.5 GB)
+# 2. Use it (instant — image is cached)
 krunch compress   < data.jsonl  > data.krunch
 krunch decompress < data.krunch > data.jsonl
 ```
 
-That's it. The CLI is a thin Python wrapper that shells out to
-`docker run --gpus all -i ghcr.io/dmatth1/krunch:v1 …` for you.
-First call does the auto-pull; every call after that starts in
-~30 seconds (model load + WKV kernel cache).
+That's it. The installer puts a thin Python wrapper at
+`/usr/local/bin/krunch` that shells out to
+`docker run --gpus all -i ghcr.io/dmatth1/krunch:v1 …`. After install
+every call starts in ~30 seconds (model load + WKV kernel cache).
 
 For large files / archival workloads, run as a distributed batch job.
 The same Docker image runs as an array job under any scheduler
