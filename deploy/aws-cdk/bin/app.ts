@@ -13,7 +13,7 @@ new KrunchStack(app, "KrunchStack", {
   },
   description: "Krunch v1 — distributed neural compression server",
 
-  // Defaults: g5.xlarge spot, port 8080, ghcr.io/dmatth1/krunch:v1
+  // Defaults: g5.xlarge spot, ghcr.io/dmatth1/krunch:latest
   // Override examples:
   //   instanceType: ec2.InstanceType.of(ec2.InstanceClass.G5, ec2.InstanceSize.X2LARGE),
   //   spot: false,

@@ -10,7 +10,7 @@ export interface KrunchStackProps extends cdk.StackProps {
   maxWorkers?: number;
   /** GPU instance type. Default: g5.xlarge (A10G, 16 GB VRAM) */
   instanceType?: ec2.InstanceType;
-  /** Docker image. Default: ghcr.io/dmatth1/krunch:v1 */
+  /** Docker image. Default: ghcr.io/dmatth1/krunch:latest */
   image?: string;
   /**
    * S3 bucket for temp parts + compressed output.
@@ -39,7 +39,7 @@ export interface KrunchStackProps extends cdk.StackProps {
  * Quickstart:
  *   npm install && npx cdk bootstrap && npx cdk deploy
  *
- *   python3 ../../scripts/krunch_cli.py submit \
+ *   krunch submit \
  *     --source s3://my-bucket/logs/data.jsonl \
  *     --dest   s3://my-bucket/logs/data.krunch \
  *     --workers 4
@@ -58,7 +58,7 @@ export class KrunchStack extends cdk.Stack {
     const instanceType =
       props.instanceType ??
       ec2.InstanceType.of(ec2.InstanceClass.G5, ec2.InstanceSize.XLARGE);
-    const image = props.image ?? "ghcr.io/dmatth1/krunch:v1";
+    const image = props.image ?? "ghcr.io/dmatth1/krunch:latest";
     const preferSpot = props.spot ?? true;
 
     // ---------------------------------------------------------------------------
@@ -221,7 +221,7 @@ export class KrunchStack extends cdk.Stack {
     });
 
     // ---------------------------------------------------------------------------
-    // Outputs (read by krunch_cli.py)
+    // Outputs (read by `krunch submit` to resolve job queue + definitions)
     // ---------------------------------------------------------------------------
     new cdk.CfnOutput(this, "JobQueueArn", {
       value: jobQueue.ref,
@@ -245,7 +245,7 @@ export class KrunchStack extends cdk.Stack {
 
     new cdk.CfnOutput(this, "SubmitExample", {
       value: [
-        "python3 scripts/krunch_cli.py submit",
+        "krunch submit",
         `  --source s3://${bucket.bucketName}/input/data.jsonl`,
         `  --dest   s3://${bucket.bucketName}/output/data.krunch`,
         "  --workers 4",

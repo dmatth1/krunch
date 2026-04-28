@@ -7,13 +7,13 @@
 #
 # Environment overrides:
 #   KRUNCH_VERSION  — git ref to install from (default: main)
-#   KRUNCH_IMAGE    — Docker image to pre-pull (default: ghcr.io/dmatth1/krunch:v1)
+#   KRUNCH_IMAGE    — Docker image to pre-pull (default: ghcr.io/dmatth1/krunch:latest)
 #   INSTALL_DIR     — where to put the krunch wrapper (default: /usr/local/bin)
 
 set -euo pipefail
 
 KRUNCH_VERSION="${KRUNCH_VERSION:-main}"
-KRUNCH_IMAGE="${KRUNCH_IMAGE:-ghcr.io/dmatth1/krunch:v1}"
+KRUNCH_IMAGE="${KRUNCH_IMAGE:-ghcr.io/dmatth1/krunch:latest}"
 INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
 # Override where the CLI wrapper is fetched from. Default is the public
 # GitHub raw URL; testing/local builds can point at any HTTP URL or a

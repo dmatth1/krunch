@@ -1,10 +1,10 @@
 # Krunch
 
 > **Distributed neural compression as an open-source framework.**
-> One Docker image. Any NVIDIA GPU. Beats zstd by 30-40% on
+> One Docker image. Any NVIDIA GPU. Beats zstd-22 by ~33% on
 > text-heavy data (logs, chat, support tickets, code).
 
-> Status: pre-launch. v1 launch target: 6 weeks.
+> Status: pre-launch.
 
 ## Install + compress
 
@@ -19,18 +19,20 @@ krunch compress   < data.jsonl  > data.krunch
 krunch decompress < data.krunch > data.jsonl
 ```
 
-That's it. The installer puts a thin Python wrapper at
-`/usr/local/bin/krunch` that shells out to
-`docker run --gpus all -i ghcr.io/dmatth1/krunch:v1 …`. After install
+That's it. The installer puts a thin wrapper at `/usr/local/bin/krunch`
+that shells out to
+`docker run --gpus all -i ghcr.io/dmatth1/krunch:latest …`. After install
 every call starts in ~30 seconds (model load + WKV kernel cache).
 
-For large files / archival workloads, run as a distributed batch job.
-The same Docker image runs as an array job under any scheduler
-(AWS Batch, k8s Jobs, Spark, Dask, Ray) — workers read byte ranges
-directly from object storage and run in parallel.
+## Distributed batch jobs
+
+For large files / archival workloads, run the same image as an array job
+under any batch scheduler (AWS Batch, k8s Jobs, Spark, Dask, Ray) —
+workers read byte ranges directly from object storage and process them
+in parallel.
 
 ```bash
-# One-time setup: deploy the AWS Batch infra
+# One-time AWS setup: deploy the Batch infra
 cd deploy/aws-cdk && npm install && npx cdk deploy
 
 # Submit a distributed job
@@ -40,23 +42,34 @@ krunch submit \
   --workers 8
 ```
 
-> Override the Docker image for `compress` / `decompress` via
-> `KRUNCH_IMAGE=ghcr.io/me/krunch:dev krunch compress < in > out`.
+See `deploy/aws-cdk/README.md` for the AWS-specific setup. The job
+contract (read byte range from URL, compress, write partial blob) is
+generic — the same Docker image runs under any scheduler that can pass
+env vars and grant S3 access.
 
 ## What's inside the image
 
-- **RWKV-4-Pile-169M** pretrained language model (Apache-2.0,
-  BlinkDL) — the predictor.
-- **Custom WKV CUDA kernel** — fused recurrence op,
-  ~1000× faster than HF transformers' eval-mode fallback.
-- **constriction** arithmetic coder — encodes the next-token
-  distribution into a bitstream.
-- **64 KB chunks** — independent across chunks, parallelizable.
-- **Dispatcher** — neural vs zstd per-chunk, shortest output wins.
-  Ensures we never lose to classical on chunks where it does.
+- **RWKV-4-Pile-169M** pretrained language model (Apache-2.0, BlinkDL) —
+  the next-byte predictor.
+- **Custom WKV CUDA kernel** — fused recurrence op, ~1000× faster than
+  HF transformers' eval-mode fallback.
+- **constriction** arithmetic coder — turns the model's
+  next-token distribution into a bitstream.
+- **1 MB chunks** — independent across chunks, parallelizable; large
+  enough to amortize per-chunk overhead and give the model useful
+  context.
 
-Architecture validated on real GPU: ratio 0.111 on
-WildChat-English (vs zstd 0.166), 330–430 KB/s compress on A10G fp16.
+Architecture validated on real GPU: ratio **0.111** on WildChat-English
+(vs zstd-22's 0.167 — a 33% reduction), compress throughput **≥ 800
+KB/s** on A10G fp16, byte-exact decompression.
+
+## When *not* to use krunch
+
+Krunch is a neural compressor for text. There is no classical fallback:
+if your data isn't text-heavy enough that the language model can
+predict it, krunch will produce *larger* output than the input. For
+arbitrary binary data, mixed media, or already-compressed payloads, use
+`zstd` directly.
 
 ## Why "distributed"
 
@@ -70,24 +83,26 @@ The compression task is map-only and embarrassingly parallel, so it
 ships as a generic "run this container with these env vars" contract
 that fits any batch framework.
 
-## What v1 ships
+## Repo layout
 
 ```
 krunch/
-├── Dockerfile              # CUDA + PyTorch + RWKV-LM, single-shot + job entrypoints
+├── Dockerfile              # CUDA + PyTorch + RWKV + WKV kernel + model weights
+├── install.sh              # one-line installer (used by the curl install)
 ├── server/                 # core compression code
-│   ├── cli.py              # single-shot entrypoint: compress | decompress
+│   ├── cli.py              # single-shot CLI entrypoint
 │   ├── inference.py        # RWKV-4-Pile-169M wrapper + AC coder + blob format
-│   ├── chunking.py         # 64KB chunk dispatcher (neural vs zstd, shortest wins)
-│   ├── job.py              # Batch job runner: compress (array) + assemble (single)
+│   ├── chunking.py         # 1 MB chunk splitter (neural-only, no fallback)
+│   ├── job.py              # Batch job runner: compress (array) + assemble
 │   └── url_io.py           # generic URL read/write (s3://, http://, file://)
-├── scripts/                # entrypoint.sh, krunch_cli.py (submit), test scripts
-├── deploy/aws-cdk/         # AWS Batch deployer (compute envs, job queue, S3 bucket)
+├── scripts/
+│   ├── krunch              # the user-facing CLI wrapper (Python)
+│   ├── entrypoint.sh       # container entrypoint (compress | decompress | job)
+│   └── tier{1,2,3}_check.sh # local + cloud validation tests
+├── deploy/aws-cdk/         # AWS Batch deployer (compute envs, job queue, S3)
 └── LICENSE                 # Apache-2.0
 ```
 
 ## License
 
-Apache-2.0. Maximum adoption, compatible with the planned v2 hosted
-offering, patent grant + attribution prevents trivial whitewash forks.
-See `NOTICE` for upstream attributions (RWKV-LM, constriction).
+Apache-2.0. See `NOTICE` for upstream attributions (RWKV-LM, constriction).

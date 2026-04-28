@@ -1,49 +1,31 @@
 krunch
 Copyright 2025-2026 Dan Mattheiss and krunch contributors
 
-This product includes software developed by krunch
-contributors. Licensed under the Apache License, Version 2.0 (the
-"License"); you may not use this file except in compliance with the
-License. A copy of the License is in the LICENSE file at the root of
-this repository and at <http://www.apache.org/licenses/LICENSE-2.0>.
+This product includes software developed by krunch contributors.
+Licensed under the Apache License, Version 2.0 (the "License"); you may
+not use this file except in compliance with the License. A copy of the
+License is in the LICENSE file at the root of this repository and at
+<http://www.apache.org/licenses/LICENSE-2.0>.
 
 ================================================================================
 Third-party components
 ================================================================================
 
-RWKV-LM (RWKV reference architecture)
+RWKV-LM and the RWKV-4-Pile-169M weights
   Upstream: https://github.com/BlinkDL/RWKV-LM
-  Used in:  our Rust inference runtime at krunch-rust/src/rwkv.rs is a
-            re-implementation of the RWKV-v4 forward pass from the
-            published RWKV-v4 paper and reference implementation.
-            MSL kernels in krunch-rust/src/backend/mtl.rs and the fused
-            WKV kernel at scripts/metal_wkv/wkv.metal are clean-room
-            ports of the reference CUDA implementation.
+  Used:     The pretrained RWKV-4-Pile-169M model weights are baked into
+            the Docker image and distributed unmodified. Inference uses
+            the `rwkv` pip package from the same author, which provides
+            the fast WKV CUDA kernel that our compression pipeline depends
+            on.
   License:  Apache-2.0.
 
-Krunch (AAAI 2025 paper reference implementation)
-  Upstream: https://github.com/jkooy/Krunch
-  Used in:  vendor/Krunch/ (reference Python implementation, not shipped
-            in service binaries). The initial Rust inference runtime
-            was derived from this reference. Training pipeline
-            scripts (scripts/train_krunch_phase11.py, related tooling)
-            follow the Krunch training recipe.
-  License:  Research use under Apache-2.0, consistent with the RWKV
-            dependency.
-
-SentencePiece (optional runtime dependency)
-  Upstream: https://github.com/google/sentencepiece
-  Used in:  dynamically linked via the `sentencepiece` Rust crate for
-            tokenization. Not statically bundled in default service
-            binaries.
-  License:  Apache-2.0.
-
-Rust crate dependencies
-  All direct and transitive Rust crate dependencies are permissive
-  (Apache-2.0 / MIT / BSD / ISC / Unicode / CC0 / Zlib / MPL-2.0).
-  Audited via `cargo deny check licenses` when a release configuration
-  is set up.
-
-MLX (Apple) — referenced in archived exploration
-  Upstream: https://github.com/ml-explore/mlx
+constriction
+  Upstream: https://github.com/bamler-lab/constriction
+  Used:     Range / ANS arithmetic coding of next-token distributions.
+            Loaded via the `constriction` pip package.
   License:  MIT.
+
+PyTorch + Hugging Face tokenizers
+  Standard transitive Python dependencies of the inference path.
+  Licenses: BSD-3-Clause (PyTorch), Apache-2.0 (tokenizers).

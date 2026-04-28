@@ -21,11 +21,11 @@ case "$MODE" in
 Krunch — neural compression. Usage:
 
   Single-shot:
-    docker run --gpus all -i ghcr.io/dmatth1/krunch:v1 compress   < input > output
-    docker run --gpus all -i ghcr.io/dmatth1/krunch:v1 decompress < input > output
+    docker run --gpus all -i ghcr.io/dmatth1/krunch:latest compress   < input > output
+    docker run --gpus all -i ghcr.io/dmatth1/krunch:latest decompress < input > output
 
   Batch job (run by AWS Batch / k8s / etc; uses env vars):
-    docker run --gpus all -e KRUNCH_JOB_TYPE=compress ... ghcr.io/dmatth1/krunch:v1 job
+    docker run --gpus all -e KRUNCH_JOB_TYPE=compress ... ghcr.io/dmatth1/krunch:latest job
 
 USAGE
     exit 1
