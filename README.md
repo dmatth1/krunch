@@ -55,10 +55,9 @@ env vars and grant S3 access.
   HF transformers' eval-mode fallback.
 - **constriction** arithmetic coder — turns the model's
   next-token distribution into a bitstream.
-- **1 MB chunks (default)** — independent across chunks, parallelizable;
-  large enough to amortize per-chunk overhead and give the model useful
-  context. Override via `KRUNCH_CHUNK_SIZE` env var
-  (e.g. `KRUNCH_CHUNK_SIZE=4194304 krunch compress …` for 4 MB).
+- **1 MB chunks (default)** — independent across chunks, parallelizable; large
+  enough to amortize per-chunk overhead and give the model useful
+  context.
 
 Architecture validated on real GPU: ratio **0.111** on WildChat-English
 (vs zstd-22's 0.167 — a 33% reduction), compress throughput **≥ 800
@@ -66,11 +65,11 @@ KB/s** on A10G fp16, byte-exact decompression.
 
 ## When *not* to use krunch
 
-Krunch is a neural compressor for text. There is no classical fallback:
-if your data isn't text-heavy enough that the language model can
-predict it, krunch will produce *larger* output than the input. For
-arbitrary binary data, mixed media, or already-compressed payloads, use
-`zstd` directly.
+Krunch is a neural compressor for text. 
+If your data isn't text-heavy enough that the language model can
+predict it, krunch can produce *larger* output than the input. For
+arbitrary binary data, mixed media, or already-compressed payloads, use 
+a different compressor.
 
 ## Why "distributed"
 
@@ -80,7 +79,7 @@ Decompression is the same: token-step is sequential within a chunk
 finishes in 1/10th the time, with no orchestration code on the
 customer's side.
 
-The compression task is map-only and embarrassingly parallel, so it
+The compression task is map-only and parallel, so it
 ships as a generic "run this container with these env vars" contract
 that fits any batch framework.
 

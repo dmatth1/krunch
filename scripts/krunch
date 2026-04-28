@@ -71,24 +71,33 @@ def cmd_submit(args):
     job_tag = f"job-{int(time.time())}"
     parts_prefix = f"{args.dest}.parts/{job_tag}"
 
+    compress_env = [
+        {"name": "KRUNCH_JOB_TYPE",    "value": "compress"},
+        {"name": "KRUNCH_SOURCE",      "value": args.source},
+        {"name": "KRUNCH_TOTAL_TASKS", "value": str(args.workers)},
+        {"name": "KRUNCH_PARTS_PREFIX","value": parts_prefix},
+    ]
+    assemble_env = [
+        {"name": "KRUNCH_JOB_TYPE",     "value": "assemble"},
+        {"name": "KRUNCH_PARTS_PREFIX", "value": parts_prefix},
+        {"name": "KRUNCH_N_PARTS",      "value": str(args.workers)},
+        {"name": "KRUNCH_DEST",         "value": args.dest},
+    ]
+    if args.chunk_size:
+        # Override the default 1 MB chunk size on both jobs (assemble must
+        # see the same value to stitch entries correctly).
+        cs = {"name": "KRUNCH_CHUNK_SIZE", "value": str(args.chunk_size)}
+        compress_env.append(cs)
+        assemble_env.append(cs)
+
     compress_payload = {
         "jobName": f"krunch-compress-{job_tag}",
         "arrayProperties": {"size": args.workers},
-        "containerOverrides": {"environment": [
-            {"name": "KRUNCH_JOB_TYPE",    "value": "compress"},
-            {"name": "KRUNCH_SOURCE",      "value": args.source},
-            {"name": "KRUNCH_TOTAL_TASKS", "value": str(args.workers)},
-            {"name": "KRUNCH_PARTS_PREFIX","value": parts_prefix},
-        ]},
+        "containerOverrides": {"environment": compress_env},
     }
     assemble_payload = {
         "jobName": f"krunch-assemble-{job_tag}",
-        "containerOverrides": {"environment": [
-            {"name": "KRUNCH_JOB_TYPE",     "value": "assemble"},
-            {"name": "KRUNCH_PARTS_PREFIX", "value": parts_prefix},
-            {"name": "KRUNCH_N_PARTS",      "value": str(args.workers)},
-            {"name": "KRUNCH_DEST",         "value": args.dest},
-        ]},
+        "containerOverrides": {"environment": assemble_env},
     }
 
     if args.dry_run:
@@ -289,6 +298,11 @@ def main():
                           help="Destination URL for compressed output")
     p_submit.add_argument("--workers", type=int, default=1,
                           help="Number of parallel compress tasks (default: 1)")
+    p_submit.add_argument("--chunk-size", type=int, default=None,
+                          metavar="BYTES",
+                          help="Chunk size in bytes (default: 1 MB / 1048576). "
+                               "Larger chunks → better ratio + amortized model "
+                               "load, but worse parallelism and higher VRAM.")
     p_submit.add_argument("--spot", action=argparse.BooleanOptionalAction,
                           default=True,
                           help="Use spot instances (default: --spot)")
