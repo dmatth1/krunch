@@ -3,8 +3,9 @@
 # it there and falls back to PyPI, which doesn't have +cu124 wheels).
 --extra-index-url https://download.pytorch.org/whl/cu124
 
-# Core inference
-torch==2.3.1+cu124
+# Core inference. PyTorch only publishes +cu124 wheels from 2.4.0 onward;
+# 2.3.x was cu121-only. Sticking with 2.4.1 (last 2.4.x patch) for stability.
+torch==2.4.1+cu124
 rwkv==0.8.26
 tokenizers==0.19.1
 constriction==0.4.3
