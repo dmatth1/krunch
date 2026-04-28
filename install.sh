@@ -40,9 +40,26 @@ echo "      ✓ ${INSTALL_DIR}/krunch"
 
 # 3. Pre-pull the Docker image (~3.5 GB)
 echo
-echo "[2/2] Pulling ${KRUNCH_IMAGE} (~3.5 GB, ~5-10 min on typical broadband)..."
+echo "[2/3] Pulling ${KRUNCH_IMAGE} (~3.5 GB, ~5-10 min on typical broadband)..."
 docker pull "${KRUNCH_IMAGE}"
 echo "      ✓ image cached"
+
+# 4. Warm up: build the WKV CUDA kernel + torch.compile graph trace into a
+#    persistent docker volume, so the first real `krunch compress` doesn't
+#    pay ~60s of one-time costs. Skipped if no NVIDIA GPU is detected (the
+#    user can re-run `krunch warmup` later from a GPU host).
+echo
+echo "[3/3] Warming up local cache (one-time, ~60-90 s)..."
+if docker info --format '{{.Runtimes}}' 2>/dev/null | grep -q nvidia; then
+  if "${INSTALL_DIR}/krunch" warmup; then
+    echo "      ✓ cache primed"
+  else
+    echo "      ⚠ warmup failed — first compress will pay the kernel-build cost"
+  fi
+else
+  echo "      ⚠ no NVIDIA runtime detected — skipping warmup"
+  echo "        run \`krunch warmup\` later from a GPU host"
+fi
 
 echo
 echo "=== Ready ==="

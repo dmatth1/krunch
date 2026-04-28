@@ -285,39 +285,41 @@ class InferenceEngine:
     def decompress_chunk(self, encoded: bytes) -> bytes:
         """Decompress a single AC-encoded chunk produced by compress_chunk.
 
-        v1.1 GPU encoder writes a custom range-coded bitstream (NOT
-        constriction's), so this side uses our matching CPU reference
-        decoder with per-step CDFs derived via probs_to_cdf_gpu+cpu_view.
-        For the encoder/decoder to agree, the per-step CDF must be
-        byte-identical to the encoder's — that's why we run probs_to_cdf
-        on the SAME GPU code path (then transfer the CDF to CPU for the
-        decoder). Decompression is autoregressive (token-by-token model
-        forward) so per-step transfer is unavoidable here.
-
-        Decode TODO: a GPU range-decode kernel would let us avoid the
-        per-step CDF transfer; v1.2 work.
+        GPU decode path: state (low/high/value/bit_offset) lives in a
+        4-uint32 GPU tensor across calls; per-step CDF stays on GPU; only
+        the decoded symbol (one int) crosses to CPU each token (required
+        because rwkv's `m.forward([last_input])` takes a Python int).
+        Roughly 2-3× faster than the pure-Python reference on real LM data —
+        the floor is the autoregressive forward+sync latency, not the AC
+        path.
         """
         import torch
+        import krunch_ac_cuda
         from krunch_ac.gpu_encode import probs_to_cdf_gpu
-        from krunch_ac.cpu_reference import RangeDecoder
 
         orig_len, n_tokens = struct.unpack(">II", encoded[:8])
         bitstream = encoded[8:]
 
-        dec = RangeDecoder(bitstream)
+        # Pad the bitstream so over-reads at the last-token renorm don't
+        # walk off the end. PRECISION extra bits is safe.
+        bs_padded = bitstream + b"\x00" * 64
+        input_buf = torch.frombuffer(bytearray(bs_padded), dtype=torch.uint8).to(self._device)
+        ac_state = torch.zeros(4, dtype=torch.uint32, device=self._device)
+        out_sym = torch.empty(1, dtype=torch.int32, device=self._device)
+        krunch_ac_cuda.decode_init(input_buf, ac_state)
+
         tokens: list[int] = []
-        state = None
+        rwkv_state = None
         last_input = BOS_TOKEN
         for _ in range(n_tokens):
-            logits, state = self._model.forward([last_input], state)
+            logits, rwkv_state = self._model.forward([last_input], rwkv_state)
             if not isinstance(logits, torch.Tensor):
                 logits = torch.as_tensor(logits, device=self._device)
             with torch.no_grad():
                 probs = torch.softmax(logits.float().reshape(1, -1), dim=-1)
-                cdf_gpu = probs_to_cdf_gpu(probs)
-            cdf_row = cdf_gpu[0].cpu().numpy().astype(np.uint32)
-            del probs, cdf_gpu, logits
-            tok = dec.decode_symbol(cdf_row)
+                cdf_row = probs_to_cdf_gpu(probs)[0].contiguous()
+            krunch_ac_cuda.decode_step(cdf_row, input_buf, ac_state, out_sym)
+            tok = int(out_sym.item())  # forces sync; required to feed next forward
             tokens.append(tok)
             last_input = tok
 

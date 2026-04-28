@@ -36,12 +36,66 @@ def cmd_decompress(args):
     return _run_local("decompress", args)
 
 
+def cmd_warmup(args):
+    """Materialize first-call costs (WKV `ninja` build, torch.compile graph
+    trace) into a persistent docker volume so subsequent compress/decompress
+    runs don't pay them. Without this, every cold-container run pays
+    ~30-45 s of WKV kernel build + ~10-30 s of torch.compile trace.
+    """
+    if not _has_docker():
+        print("Error: docker not found on PATH", file=sys.stderr)
+        return 1
+
+    cache_volume = "krunch-cache"
+    # Ensure the volume exists (idempotent).
+    subprocess.run(["docker", "volume", "create", cache_volume],
+                   check=False, capture_output=True)
+
+    # Compress a tiny synthetic input to force WKV build + torch.compile
+    # trace + model load into the cache. The volume mounts /root/.cache,
+    # which is where torch_extensions and inductor stash artifacts.
+    cmd = [
+        "docker", "run", "--rm", "--gpus", "all", "-i",
+        "-v", f"{cache_volume}:/root/.cache",
+        DEFAULT_IMAGE, "compress",
+    ]
+    if args.dry_run:
+        print(f"docker volume create {cache_volume}")
+        print(" ".join(cmd) + "  # stdin=<256 bytes synthetic>, stdout=/dev/null")
+        return 0
+
+    print(f"krunch warmup: priming '{cache_volume}' "
+          f"(one-time, ~60-90 s) ...", file=sys.stderr)
+    payload = (b"warmup " * 32)[:256]
+    try:
+        result = subprocess.run(
+            cmd, input=payload, capture_output=True, timeout=300)
+    except subprocess.TimeoutExpired:
+        print("Error: warmup timed out after 5 min", file=sys.stderr)
+        return 1
+    if result.returncode != 0:
+        print(f"Error: warmup compress exited {result.returncode}", file=sys.stderr)
+        sys.stderr.buffer.write(result.stderr)
+        return result.returncode
+    print(f"krunch warmup: done. ({len(result.stdout)} compressed bytes "
+          f"discarded)", file=sys.stderr)
+    return 0
+
+
 def _run_local(action: str, args) -> int:
     if not _has_docker():
         print("Error: docker not found on PATH", file=sys.stderr)
         return 1
 
-    cmd = ["docker", "run", "--rm", "--gpus", "all", "-i", DEFAULT_IMAGE, action]
+    # Mount the warmup cache volume if it exists, so cold containers reuse
+    # the WKV-kernel `.so` and torch.compile artifacts written by
+    # `krunch warmup`. If the volume doesn't exist yet, docker auto-creates
+    # an empty one — same as no warmup, just slower first run.
+    cmd = [
+        "docker", "run", "--rm", "--gpus", "all", "-i",
+        "-v", "krunch-cache:/root/.cache",
+        DEFAULT_IMAGE, action,
+    ]
 
     # Pass file handles to subprocess only when explicit file args are
     # provided. Otherwise let subprocess inherit the parent's stdin/stdout
@@ -358,6 +412,14 @@ def main():
     p_submit.add_argument("--dry-run", action="store_true",
                           help="Print job submission payloads as JSON; don't call AWS")
 
+    # warmup
+    p_warmup = sub.add_parser(
+        "warmup",
+        help="Prime the local cache volume (one-time, ~60-90s post-install). "
+             "Removes ~60s of cold-container costs from later compress/decompress runs.")
+    p_warmup.add_argument("--dry-run", action="store_true",
+                          help="Print the docker command instead of running it")
+
     # status
     p_status = sub.add_parser("status", help="Check job status")
     p_status.add_argument("--job-id", required=True)
@@ -366,6 +428,7 @@ def main():
     handlers = {
         "compress":   cmd_compress,
         "decompress": cmd_decompress,
+        "warmup":     cmd_warmup,
         "submit":     cmd_submit,
         "status":     cmd_status,
     }

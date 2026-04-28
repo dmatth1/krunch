@@ -27,3 +27,14 @@ struct RangeState {
     uint32_t pending;     // # of E3 underflow bits pending
     uint32_t bit_offset;  // current write position in output_buf, in BITS
 };
+
+// Decoder state — persists across decode_step calls within a chunk.
+// Layout: 4 × uint32 = 16 bytes. Same physical layout as RangeState
+// fields but `pending` is unused on decode and replaced with `value`
+// (the precision-bit register holding bits read from the stream).
+struct DecodeState {
+    uint32_t low;
+    uint32_t high;
+    uint32_t value;       // PRECISION-bit window into the bitstream
+    uint32_t bit_offset;  // current READ position in input_buf, in BITS
+};

@@ -17,7 +17,7 @@
 #include <c10/cuda/CUDAStream.h>
 #include "range_coder.cuh"
 
-// Defined in encode_kernel.cu — kernel launches via <<<>>> live there.
+// Defined in encode_kernel.cu / decode_kernel.cu — kernel launches via <<<>>> live there.
 void launch_encode_step(
     const int32_t* cdf, int cdf_stride,
     const int32_t* symbols, int N,
@@ -25,6 +25,15 @@ void launch_encode_step(
     cudaStream_t stream);
 void launch_encode_finalize(
     uint8_t* output_buf, RangeState* state,
+    cudaStream_t stream);
+void launch_decode_init(
+    const uint8_t* input_buf, DecodeState* state,
+    cudaStream_t stream);
+void launch_decode_step(
+    const int32_t* cdf, int V,
+    const uint8_t* input_buf,
+    DecodeState* state,
+    int32_t* out_sym,
     cudaStream_t stream);
 
 #define CHECK_CUDA(x) TORCH_CHECK((x).is_cuda(), #x " must be a CUDA tensor")
@@ -74,9 +83,54 @@ void encode_finalize(at::Tensor output_buf, at::Tensor state)
         stream);
 }
 
+void decode_init(at::Tensor input_buf, at::Tensor state)
+{
+    CHECK_CUDA(input_buf); CHECK_CONTIG(input_buf);
+    CHECK_CUDA(state); CHECK_CONTIG(state);
+    TORCH_CHECK(input_buf.dtype() == at::kByte, "input_buf must be uint8");
+    TORCH_CHECK(state.dtype() == at::kUInt32, "state must be uint32");
+    TORCH_CHECK(state.numel() == 4, "state must have 4 elements (low,high,value,bit_offset)");
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    launch_decode_init(
+        input_buf.data_ptr<uint8_t>(),
+        reinterpret_cast<DecodeState*>(state.data_ptr<uint32_t>()),
+        stream);
+}
+
+void decode_step(at::Tensor cdf, at::Tensor input_buf,
+                 at::Tensor state, at::Tensor out_sym)
+{
+    CHECK_CUDA(cdf); CHECK_CONTIG(cdf);
+    CHECK_CUDA(input_buf); CHECK_CONTIG(input_buf);
+    CHECK_CUDA(state); CHECK_CONTIG(state);
+    CHECK_CUDA(out_sym); CHECK_CONTIG(out_sym);
+
+    TORCH_CHECK(cdf.dtype() == at::kInt, "cdf must be int32");
+    TORCH_CHECK(input_buf.dtype() == at::kByte, "input_buf must be uint8");
+    TORCH_CHECK(state.dtype() == at::kUInt32, "state must be uint32");
+    TORCH_CHECK(state.numel() == 4, "state must have 4 elements");
+    TORCH_CHECK(out_sym.dtype() == at::kInt, "out_sym must be int32");
+    TORCH_CHECK(out_sym.numel() == 1, "out_sym must be a single int");
+    TORCH_CHECK(cdf.dim() == 1, "cdf must be 1D (single row, V+1 entries)");
+
+    const int V = (int)cdf.size(0) - 1;
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    launch_decode_step(
+        cdf.data_ptr<int32_t>(), V,
+        input_buf.data_ptr<uint8_t>(),
+        reinterpret_cast<DecodeState*>(state.data_ptr<uint32_t>()),
+        out_sym.data_ptr<int32_t>(),
+        stream);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("encode_step", &encode_step,
           "Range-encode a batch of symbols on GPU; mutates state in place.");
     m.def("encode_finalize", &encode_finalize,
           "Final-flush the range coder; mutates state.bit_offset.");
+    m.def("decode_init", &decode_init,
+          "Initialize decoder state by reading first 32 bits.");
+    m.def("decode_step", &decode_step,
+          "Decode one symbol given current CDF; mutates state, writes out_sym.");
 }

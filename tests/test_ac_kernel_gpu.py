@@ -107,3 +107,48 @@ def test_multi_step_state_persists():
     bs_ref = cpu_encode(cdf_all, s_all)
 
     assert bs_ref == bs_gpu, "multi-step GPU encode diverges from one-shot CPU on same CDFs"
+
+
+# ---------------------------------------------------------------------------
+# Decode kernel: round-trip via GPU encode -> GPU decode
+# ---------------------------------------------------------------------------
+
+def _gpu_decode_one_chunk(bs, cdfs_np):
+    """Decode N symbols on GPU using the same CDFs as the encoder.
+    cdfs_np: (N, V+1) uint32 numpy. Returns (N,) int32 numpy of decoded
+    symbols."""
+    device = "cuda"
+    N, Vp1 = cdfs_np.shape
+    # Pad bitstream to allow over-read on the last token's renorm.
+    bs_padded = bs + b"\x00" * 64
+    input_buf = torch.from_numpy(np.frombuffer(bs_padded, dtype=np.uint8).copy()).to(device)
+    state = torch.zeros(4, dtype=torch.uint32, device=device)
+    out_sym = torch.empty(1, dtype=torch.int32, device=device)
+
+    krunch_ac_cuda.decode_init(input_buf, state)
+    cdfs_gpu = torch.from_numpy(cdfs_np.astype(np.int32)).to(device)
+
+    decoded = np.empty(N, dtype=np.int32)
+    for i in range(N):
+        cdf_row = cdfs_gpu[i].contiguous()
+        krunch_ac_cuda.decode_step(cdf_row, input_buf, state, out_sym)
+        decoded[i] = int(out_sym.item())
+    return decoded
+
+
+@pytest.mark.parametrize("N,V,seed", [
+    (1, 4, 0), (8, 32, 1), (256, 256, 2), (1024, 1024, 3), (256, 50277, 4),
+])
+def test_decode_kernel_roundtrip(N, V, seed):
+    p = _rand_probs(N, V, seed=seed)
+    rng = np.random.default_rng(seed + 100)
+    cum = np.cumsum(p, axis=1)
+    u = rng.random((N, 1)).astype(np.float32)
+    sym = (u < cum).argmax(axis=1).astype(np.int32)
+
+    bs_gpu, cdf_np = _gpu_encode_single_batch(p, sym)
+    decoded = _gpu_decode_one_chunk(bs_gpu, cdf_np)
+    assert (decoded == sym).all(), (
+        f"GPU decode diverges from input symbols at N={N},V={V},seed={seed}\n"
+        f"first mismatch: idx={(decoded != sym).argmax()} "
+        f"expected={sym[(decoded != sym).argmax()]} got={decoded[(decoded != sym).argmax()]}")
