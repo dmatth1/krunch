@@ -22,11 +22,13 @@ from typing import Callable
 
 logger = logging.getLogger(__name__)
 
-# 1 MB matches Spike 6's measured tradeoff. Smaller chunks amplify per-chunk
-# header overhead and shrink the model's effective context; larger chunks
-# delay parallelism wins and risk OOM during the neural sequence-forward
-# pass. Override with KRUNCH_CHUNK_SIZE for experiments.
-CHUNK_SIZE = int(os.environ.get("KRUNCH_CHUNK_SIZE", 1048576))  # 1 MB
+# 256 KB chosen for v1 to bound peak memory at ~1.6 GB/chunk on a 16 GB
+# host (g5.xlarge). The compress path allocates `tokens × vocab × 4 bytes`
+# of logits per chunk: at 1 MB chunks (16K tokens × 50K vocab) that's
+# 3.2 GB just for the logits tensor — doubled by np.concatenate, plus
+# torch's CUDA cache, plus the raw input — pushed past 15 GB on Tier 3.
+# Override via KRUNCH_CHUNK_SIZE; 1 MB+ works on instances with ≥32 GB RAM.
+CHUNK_SIZE = int(os.environ.get("KRUNCH_CHUNK_SIZE", 262144))  # 256 KB
 
 # Number of chunks decompressed concurrently on a single worker. Each
 # concurrent stream maintains its own RNN state and AC decoder; threads

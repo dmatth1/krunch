@@ -194,6 +194,18 @@ class InferenceEngine:
 
         logits_seq = self._forward_logits(tokens)
         ac_bytes = ac_encode(tokens, logits_seq)
+        del logits_seq  # free ~tokens × vocab × 4 bytes immediately
+
+        # Force the torch CUDA allocator to release cached memory back to the
+        # OS. Without this, the cache grows monotonically across chunks and
+        # the host eventually OOM-kills us — observed on g5.xlarge (16 GB) at
+        # the 100-chunk mark.
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
 
         # Mini-header: original byte length (4) + token count (4)
         mini_header = struct.pack(">II", len(data), len(tokens))
