@@ -72,32 +72,21 @@ def test_ac_roundtrip():
 def test_chunking_roundtrip():
     from server.chunking import compress_all, decompress_all, CHUNK_SIZE
 
-    # Mock neural codec: just reverses bytes (clearly distinguishable from zstd)
-    # but we make it very efficient to ensure neural wins over zstd
-    def mock_neural_compress(chunk: bytes) -> bytes:
-        # Return highly compressible data so neural wins
-        return b"\x00" * (len(chunk) // 10 + 1)
-
-    def mock_neural_decompress(encoded: bytes) -> bytes:
-        # Recover original from the mini-header in the encoded bytes
-        orig_len, n_tok = struct.unpack(">II", encoded[:8])
-        return original_chunk[:orig_len]  # closure over outer scope
-
-    # Test with data slightly larger than one chunk
     raw = b"Hello, Krunch! " * (CHUNK_SIZE // 15 + 500)
     print(f"  Input: {len(raw):,} bytes, chunk size: {CHUNK_SIZE:,}")
 
-    # We'll use a simpler approach: zstd-only (no mock neural that needs closure)
-    def no_neural(chunk):
-        raise RuntimeError("neural disabled")
+    # Mock neural codec: identity. Lets us verify the chunking machinery
+    # (entry packing/unpacking) without needing the real model.
+    def passthrough(chunk: bytes) -> bytes:
+        return chunk
 
-    entries, n_chunks = compress_all(raw, no_neural)
+    entries, n_chunks = compress_all(raw, passthrough)
     entries_bytes = b"".join(entries)
     print(f"  Chunks: {n_chunks}, entries total: {len(entries_bytes):,} bytes")
 
-    recovered = decompress_all(entries_bytes, n_chunks, no_neural)
+    recovered = decompress_all(entries_bytes, n_chunks, passthrough)
     assert recovered == raw, f"chunking roundtrip mismatch (len {len(recovered)} vs {len(raw)})"
-    print(f"  PASS chunking roundtrip ({n_chunks} chunks, zstd fallback)")
+    print(f"  PASS chunking roundtrip ({n_chunks} chunks)")
 
 
 # ---------------------------------------------------------------------------
