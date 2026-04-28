@@ -22,13 +22,41 @@ from typing import Callable
 
 logger = logging.getLogger(__name__)
 
-# 256 KB chosen for v1 to bound peak memory at ~1.6 GB/chunk on a 16 GB
-# host (g5.xlarge). The compress path allocates `tokens × vocab × 4 bytes`
-# of logits per chunk: at 1 MB chunks (16K tokens × 50K vocab) that's
-# 3.2 GB just for the logits tensor — doubled by np.concatenate, plus
-# torch's CUDA cache, plus the raw input — pushed past 15 GB on Tier 3.
-# Override via KRUNCH_CHUNK_SIZE; 1 MB+ works on instances with ≥32 GB RAM.
-CHUNK_SIZE = int(os.environ.get("KRUNCH_CHUNK_SIZE", 262144))  # 256 KB
+# Per-chunk peak memory during compress is dominated by the logits buffer:
+# `tokens × vocab × 4 bytes`. For RWKV-4-Pile-169M that's tokens × ~200KB.
+# A 1 MB chunk of English text ≈ 256K tokens → ~50 GB of logits. We auto-
+# tune the chunk size at import time to fit comfortably on the host's RAM.
+# Override via KRUNCH_CHUNK_SIZE for explicit control.
+_VOCAB = 50277          # RWKV-4-Pile-169M
+_BYTES_PER_TOKEN = 4    # English chat / code, GPT-NeoX BPE — conservative
+_LOGITS_BYTES_PER_TOKEN = _VOCAB * 4
+_OVERHEAD_BYTES = 4 * 1024 ** 3  # model + raw input + torch allocator + python
+
+
+def _autotune_chunk_size() -> int:
+    """Pick the largest chunk size that fits comfortably in available RAM.
+    Capped at 4 MB (parallelism), floored at 64 KB (chunk-header overhead)."""
+    avail = _available_ram_bytes()
+    budget_for_logits = max(int((avail - _OVERHEAD_BYTES) * 0.6), 256 * 1024 * 1024)
+    max_tokens = budget_for_logits // _LOGITS_BYTES_PER_TOKEN
+    max_chunk_bytes = max_tokens * _BYTES_PER_TOKEN
+    return max(64 * 1024, min(4 * 1024 * 1024, int(max_chunk_bytes)))
+
+
+def _available_ram_bytes() -> int:
+    """Read MemAvailable from /proc/meminfo (Linux). Fallback: 8 GB."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return 8 * 1024 ** 3
+
+
+CHUNK_SIZE = int(os.environ.get("KRUNCH_CHUNK_SIZE", _autotune_chunk_size()))
+logger.info("CHUNK_SIZE = %d bytes (autotuned from /proc/meminfo)", CHUNK_SIZE)
 
 # Number of chunks decompressed concurrently on a single worker. Each
 # concurrent stream maintains its own RNN state and AC decoder; threads

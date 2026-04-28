@@ -230,26 +230,29 @@ class InferenceEngine:
         Compute logits[i] = prediction for tokens[i] given prefix
         [BOS, tokens[0], ..., tokens[i-1]].
 
-        Sequence-forward (batched) instead of token-by-token: input is
-        [BOS, tokens[0], ..., tokens[N-2]] (length N). The rwkv package's
-        forward() accepts a token list with `full_output=True` and returns
-        all logits in one shot — ~1000× faster than calling forward() once
-        per token (which keeps Python+kernel-launch overhead per token and
-        runs the GPU at ~20% utilization).
-
-        We chunk at SEQ_BATCH because RWKV's WKV CUDA kernel has a baked-in
-        T_MAX (1024 in Spike 6's build); state carries across chunks so the
-        result is identical to a single big call.
+        Sequence-forward (batched within the WKV kernel's T_MAX = 1024)
+        with a pre-allocated destination so we don't pay the np.concatenate
+        doubling — at 50K vocab × float32 each chunk's logits is already
+        large; concatenating would peak at 2× before the source list goes
+        out of scope.
         """
         SEQ_BATCH = int(os.environ.get("KRUNCH_FORWARD_BATCH", 1024))
         full_input = [BOS_TOKEN] + tokens[:-1]  # length N
+        n = len(full_input)
         state = None
-        chunks = []
-        for i in range(0, len(full_input), SEQ_BATCH):
+        result: Optional[np.ndarray] = None  # lazy-allocated on first batch
+        written = 0
+        for i in range(0, n, SEQ_BATCH):
             batch = full_input[i:i + SEQ_BATCH]
             logits, state = self._model.forward(batch, state, full_output=True)
-            chunks.append(_to_numpy(logits))
-        return np.concatenate(chunks, axis=0)  # shape (N, vocab)
+            chunk_np = _to_numpy(logits)  # (B, vocab)
+            if result is None:
+                result = np.empty((n, chunk_np.shape[1]), dtype=np.float32)
+            result[written:written + chunk_np.shape[0]] = chunk_np
+            written += chunk_np.shape[0]
+            del chunk_np, logits  # release fp16/fp32 temporaries promptly
+        assert result is not None and written == n
+        return result
 
 
 def _to_numpy(t) -> np.ndarray:
