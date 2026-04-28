@@ -60,7 +60,7 @@ echo "Running compress (model load + forward pass on CPU, ~30-90s)..."
 RWKV_CUDA_ON=0 RWKV_JIT_ON=1 \
   KRUNCH_MODEL_DIR="$MODELS_DIR" \
   PYTHONPATH="$(pwd)" \
-  $VENV_PY -m server.cli compress \
+  $VENV_PY -m krunch.cli compress \
   < "$SAMPLE_TXT" > "$SAMPLE_KRUNCH" 2>"$COMPRESS_LOG" || {
     echo "FAIL compress errored"
     cat "$COMPRESS_LOG"
@@ -75,7 +75,7 @@ echo "Running decompress (sequential token-step on CPU, ~30-90s)..."
 RWKV_CUDA_ON=0 RWKV_JIT_ON=1 \
   KRUNCH_MODEL_DIR="$MODELS_DIR" \
   PYTHONPATH="$(pwd)" \
-  $VENV_PY -m server.cli decompress \
+  $VENV_PY -m krunch.cli decompress \
   < "$SAMPLE_KRUNCH" > "$SAMPLE_OUT" 2>"$DECOMPRESS_LOG" || {
     echo "FAIL decompress errored"
     cat "$DECOMPRESS_LOG"

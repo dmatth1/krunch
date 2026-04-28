@@ -1,9 +1,9 @@
 """
-RWKV-4-Pile-169M inference server core.
+RWKV-4-Pile-169M inference core.
 
-Uses BlinkDL/RWKV-LM directly (NOT HF transformers — see CLAUDE.md).
-The WKV CUDA kernel only engages when the model is in training mode;
-HF's eval() path silently falls back to a ~1000x slower Python loop.
+Uses BlinkDL's `rwkv` pip package (NOT HF transformers): the WKV CUDA
+kernel only engages from BlinkDL's path; HF's RWKV implementation
+silently falls back to a ~1000× slower Python loop in eval mode.
 """
 
 import os

@@ -89,7 +89,7 @@ that fits any batch framework.
 krunch/
 ├── Dockerfile              # CUDA + PyTorch + RWKV + WKV kernel + model weights
 ├── install.sh              # one-line installer (used by the curl install)
-├── server/                 # core compression code
+├── krunch/                 # the Python package — core compression code
 │   ├── cli.py              # single-shot CLI entrypoint
 │   ├── inference.py        # RWKV-4-Pile-169M wrapper + AC coder + blob format
 │   ├── chunking.py         # 1 MB chunk splitter (neural-only, no fallback)

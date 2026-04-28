@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 # ---------------------------------------------------------------------------
 
 def test_blob_header():
-    from server.inference import encode_header, decode_header, HEADER_SIZE, BLOB_MAGIC
+    from krunch.inference import encode_header, decode_header, HEADER_SIZE, BLOB_MAGIC
 
     hdr = encode_header(original_len=123456, n_chunks=7, crc32=0xDEADBEEF)
     assert len(hdr) == HEADER_SIZE, f"header size mismatch: {len(hdr)} != {HEADER_SIZE}"
@@ -41,7 +41,7 @@ def test_blob_header():
 # ---------------------------------------------------------------------------
 
 def test_ac_roundtrip():
-    from server.inference import ac_encode, ac_decode, _softmax_np
+    from krunch.inference import ac_encode, ac_decode, _softmax_np
 
     rng = random.Random(42)
     vocab = 256
@@ -70,7 +70,7 @@ def test_ac_roundtrip():
 # ---------------------------------------------------------------------------
 
 def test_chunking_roundtrip():
-    from server.chunking import compress_all, decompress_all, CHUNK_SIZE
+    from krunch.chunking import compress_all, decompress_all, CHUNK_SIZE
 
     raw = b"Hello, Krunch! " * (CHUNK_SIZE // 15 + 500)
     print(f"  Input: {len(raw):,} bytes, chunk size: {CHUNK_SIZE:,}")

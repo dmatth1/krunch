@@ -35,7 +35,7 @@ m.forward([0], None); print('kernel warm-up ok') \
 " || echo "kernel warm-up skipped (no GPU at build time — will compile on first request)"
 
 # Application code
-COPY server/ /app/server/
+COPY krunch/ /app/krunch/
 
 WORKDIR /app
 

@@ -11,10 +11,10 @@ MODE="${1:-}"
 
 case "$MODE" in
   compress|decompress)
-    exec python3 -m server.cli "$@"
+    exec python3 -m krunch.cli "$@"
     ;;
   job)
-    exec python3 -c "from server.job import run; run()"
+    exec python3 -c "from krunch.job import run; run()"
     ;;
   "")
     cat << 'USAGE' >&2
