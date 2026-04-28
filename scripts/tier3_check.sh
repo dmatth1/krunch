@@ -1,14 +1,16 @@
 #!/bin/bash
-# Tier 3 — single-shot Docker roundtrip on a g5.xlarge spot instance.
+# Tier 3 — single-shot roundtrip on a g5.xlarge spot.
 #
-# Validates the SHIPPED ARTIFACT — the Docker image with model + tokenizer +
-# WKV kernel + AC coder all baked in. End-to-end:
-#   docker run --gpus all -i krunch:tier3 compress   < sample > sample.krunch
-#   docker run --gpus all -i krunch:tier3 decompress < sample.krunch > sample.out
+# Validates the shipped artifact: pulls ghcr.io/dmatth1/krunch:latest,
+# installs the krunch CLI, runs `krunch compress` + `krunch decompress`
+# on a 100 MB WildChat sample. Same exact path as a real user, just
+# automated end-to-end.
 #
 # Gates: ratio ≤ 0.165, compress ≥ 300 KB/s, byte-exact roundtrip.
 #
-# Cost: ~$0.30/hr g5.xlarge spot × ~25 min ≈ $0.13. Bounded < $0.30.
+# Cost: ~$0.30/hr × ~10 min ≈ $0.05 (image pull + run, no build).
+# Set KRUNCH_LOCAL_BUILD=1 to build from source instead of pulling
+# (useful before ghcr.io publish exists, or to test a local diff).
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -22,9 +24,10 @@ KEY_NAME="${KRUNCH_KEY_PAIR:-swarm-ec2}"
 SECURITY_GROUP="${KRUNCH_SG:-bnn-training}"
 S3_BUCKET="${KRUNCH_S3_BUCKET:-dmatth1-bnn-checkpoints}"
 S3_PREFIX="krunch-tier3"
-MODEL_BUNDLE_S3="s3://${S3_BUCKET}/krunch/rwkv_bundle.tar.gz"
 SAMPLE_LOCAL="data/spike6/wildchat_en_content.content.bin"
 SAMPLE_LIMIT_MB=100
+LOCAL_BUILD="${KRUNCH_LOCAL_BUILD:-0}"
+KRUNCH_IMAGE_TAG="${KRUNCH_IMAGE:-ghcr.io/dmatth1/krunch:latest}"
 TEST_TAG="$(date +%Y%m%d-%H%M%S)"
 S3_BASE="s3://${S3_BUCKET}/${S3_PREFIX}/${TEST_TAG}"
 RESULT_LOCAL="/tmp/krunch-tier3-result-${TEST_TAG}.json"
@@ -33,14 +36,13 @@ echo "=== Tier 3 single-shot Docker roundtrip — ${TEST_TAG} ==="
 echo "  region:       ${REGION}"
 echo "  instance:     ${INSTANCE_TYPE} spot"
 echo "  S3 base:      ${S3_BASE}"
-echo "  model bundle: ${MODEL_BUNDLE_S3}"
+echo "  image:        ${KRUNCH_IMAGE_TAG}  (build locally: ${LOCAL_BUILD})"
 echo "  sample limit: ${SAMPLE_LIMIT_MB} MB"
 
 # ---------------------------------------------------------------------------
 # Pre-flight
 # ---------------------------------------------------------------------------
 [[ -f $SAMPLE_LOCAL ]] || { echo "FAIL sample missing: $SAMPLE_LOCAL"; exit 1; }
-aws s3 ls "$MODEL_BUNDLE_S3" >/dev/null || { echo "FAIL model bundle missing at $MODEL_BUNDLE_S3"; exit 1; }
 
 AMI_ID=$(aws ec2 describe-images --region "$REGION" --owners amazon \
   --filters "Name=name,Values=Deep Learning OSS Nvidia Driver AMI GPU PyTorch * (Ubuntu 22.04) *" \
@@ -54,16 +56,24 @@ echo "  AMI:          $AMI_ID"
 echo
 echo "[1/5] Uploading repo + sample to S3..."
 
-REPO_TAR=/tmp/krunch-repo-${TEST_TAG}.tar.gz
-tar czf "$REPO_TAR" \
-  --exclude=models --exclude=data --exclude=.git --exclude=node_modules \
-  --exclude=__pycache__ --exclude=cdk.out \
-  -C "$(pwd)/.." "$(basename "$(pwd)")"
-aws s3 cp --quiet "$REPO_TAR" "${S3_BASE}/repo.tar.gz"
-
 SAMPLE_BYTES=$(( SAMPLE_LIMIT_MB * 1024 * 1024 ))
 head -c "$SAMPLE_BYTES" "$SAMPLE_LOCAL" | aws s3 cp --quiet - "${S3_BASE}/sample.bin"
-echo "  uploaded $(du -sh "$REPO_TAR" | cut -f1) repo + ${SAMPLE_LIMIT_MB} MB sample"
+echo "  uploaded ${SAMPLE_LIMIT_MB} MB sample"
+
+# If local-build mode requested, also upload the repo tarball + ensure the
+# model bundle is present (used by the user-data fallback path below).
+REPO_TAR=""
+if [[ $LOCAL_BUILD == 1 ]]; then
+  REPO_TAR=/tmp/krunch-repo-${TEST_TAG}.tar.gz
+  tar czf "$REPO_TAR" \
+    --exclude=models --exclude=data --exclude=.git --exclude=node_modules \
+    --exclude=__pycache__ --exclude=cdk.out \
+    -C "$(pwd)/.." "$(basename "$(pwd)")"
+  aws s3 cp --quiet "$REPO_TAR" "${S3_BASE}/repo.tar.gz"
+  aws s3 ls "s3://${S3_BUCKET}/krunch/rwkv_bundle.tar.gz" >/dev/null \
+    || { echo "FAIL model bundle missing for local-build"; exit 1; }
+  echo "  + repo.tar.gz $(du -sh "$REPO_TAR" | cut -f1) (LOCAL_BUILD=1)"
+fi
 
 # ---------------------------------------------------------------------------
 # 2. Build user-data — QUOTED heredoc (literal string, no Mac-side expansion)
@@ -77,51 +87,61 @@ exec > /var/log/krunch-tier3.log 2>&1
 echo "TIER3_START $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 S3_BASE="__S3_BASE__"
-MODEL_BUNDLE_S3="__MODEL_BUNDLE_S3__"
 TEST_TAG="__TEST_TAG__"
 REGION="__REGION__"
+LOCAL_BUILD="__LOCAL_BUILD__"
+KRUNCH_IMAGE_TAG="__KRUNCH_IMAGE_TAG__"
 INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
 
 cd /tmp
 echo "FETCH_START $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-aws s3 cp "${S3_BASE}/repo.tar.gz" repo.tar.gz
-aws s3 cp "${S3_BASE}/sample.bin"  sample.bin
-aws s3 cp "${MODEL_BUNDLE_S3}"     rwkv_bundle.tar.gz
+aws s3 cp "${S3_BASE}/sample.bin" sample.bin
 
-mkdir -p /tmp/extract
-tar xzf repo.tar.gz
-tar xzf rwkv_bundle.tar.gz -C /tmp/extract
+if [[ "$LOCAL_BUILD" == "1" ]]; then
+  # Build path — pull repo + model bundle, build image locally
+  aws s3 cp "${S3_BASE}/repo.tar.gz"                                  repo.tar.gz
+  aws s3 cp "s3://__S3_BUCKET__/krunch/rwkv_bundle.tar.gz"            rwkv_bundle.tar.gz
+  mkdir -p /tmp/extract
+  tar xzf repo.tar.gz
+  tar xzf rwkv_bundle.tar.gz -C /tmp/extract
+  KRUNCH_DIR=$(find /tmp -maxdepth 2 -name 'krunch' -type d | head -1)
+  mkdir -p "${KRUNCH_DIR}/models"
+  cp /tmp/extract/RWKV-4-Pile-169M-20220807-8023.pth "${KRUNCH_DIR}/models/"
+  cp /tmp/extract/RWKV-v4/20B_tokenizer.json          "${KRUNCH_DIR}/models/"
+  echo "FETCH_DONE $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-KRUNCH_DIR=$(find /tmp -maxdepth 2 -name 'krunch' -type d | head -1)
-mkdir -p "${KRUNCH_DIR}/models"
-cp /tmp/extract/RWKV-4-Pile-169M-20220807-8023.pth "${KRUNCH_DIR}/models/"
-cp /tmp/extract/RWKV-v4/20B_tokenizer.json          "${KRUNCH_DIR}/models/"
-echo "FETCH_DONE $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-
-cd "${KRUNCH_DIR}"
-
-echo "BUILD_START $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-# Capture build output but fail fast if build fails (set -o pipefail).
-set -o pipefail
-docker build -t krunch:tier3 . 2>&1 | tee /tmp/docker-build.log | tail -40
-BUILD_RC=${PIPESTATUS[0]}
-if [[ $BUILD_RC -ne 0 ]]; then
-  echo "BUILD_FAILED $(date -u +%Y-%m-%dT%H:%M:%SZ) rc=$BUILD_RC"
-  aws s3 cp /tmp/docker-build.log "${S3_BASE}/build.log"
-  aws s3 cp /var/log/krunch-tier3.log "${S3_BASE}/setup.log"
-  python3 -c 'import json; json.dump({"all_gates_pass": False, "error": "docker build failed"}, open("/tmp/result.json", "w"))'
-  aws s3 cp /tmp/result.json "${S3_BASE}/result.json"
-  aws ec2 terminate-instances --instance-ids "${INSTANCE_ID}" --region "${REGION}"
-  exit $BUILD_RC
+  cd "${KRUNCH_DIR}"
+  echo "BUILD_START $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  set -o pipefail
+  docker build -t "${KRUNCH_IMAGE_TAG}" . 2>&1 | tee /tmp/docker-build.log | tail -40
+  BUILD_RC=${PIPESTATUS[0]}
+  if [[ $BUILD_RC -ne 0 ]]; then
+    echo "BUILD_FAILED $(date -u +%Y-%m-%dT%H:%M:%SZ) rc=$BUILD_RC"
+    aws s3 cp /tmp/docker-build.log "${S3_BASE}/build.log"
+    aws s3 cp /var/log/krunch-tier3.log "${S3_BASE}/setup.log"
+    python3 -c 'import json; json.dump({"all_gates_pass": False, "error": "docker build failed"}, open("/tmp/result.json", "w"))'
+    aws s3 cp /tmp/result.json "${S3_BASE}/result.json"
+    aws ec2 terminate-instances --instance-ids "${INSTANCE_ID}" --region "${REGION}"
+    exit $BUILD_RC
+  fi
+  echo "BUILD_DONE $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  KRUNCH_WRAPPER_SRC="${KRUNCH_DIR}/scripts/krunch"
+else
+  # Pull path — production user UX
+  echo "PULL_START $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  docker pull "${KRUNCH_IMAGE_TAG}"
+  echo "PULL_DONE $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  # Pull just the wrapper from the image (avoids needing the repo on disk)
+  docker create --name kw "${KRUNCH_IMAGE_TAG}" >/dev/null 2>&1 || true
+  KRUNCH_WRAPPER_SRC=/tmp/krunch-wrapper
+  curl -fsSL "https://raw.githubusercontent.com/dmatth1/krunch/main/scripts/krunch" \
+    -o "$KRUNCH_WRAPPER_SRC"
+  docker rm kw >/dev/null 2>&1 || true
+  echo "FETCH_DONE $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 fi
-echo "BUILD_DONE $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-# Install the krunch CLI wrapper. After this point we use the documented
-# user UX (`krunch compress`, not raw `docker run`) — same bytes execute.
-# KRUNCH_IMAGE points at the locally-built image since ghcr.io publish
-# is a Week-4 task; the default is ghcr.io/dmatth1/krunch:v1.
-install -m 0755 scripts/krunch /usr/local/bin/krunch
-export KRUNCH_IMAGE=krunch:tier3
+install -m 0755 "$KRUNCH_WRAPPER_SRC" /usr/local/bin/krunch
+export KRUNCH_IMAGE="${KRUNCH_IMAGE_TAG}"
 
 INPUT_BYTES=$(wc -c < /tmp/sample.bin)
 echo "Input: ${INPUT_BYTES} bytes"
@@ -192,12 +212,13 @@ echo "TIER3_DONE $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 aws ec2 terminate-instances --instance-ids "${INSTANCE_ID}" --region "${REGION}"
 USERDATA_EOF
 
-# Inject the four outer-shell vars
 sed -i.bak \
   -e "s|__S3_BASE__|${S3_BASE}|g" \
-  -e "s|__MODEL_BUNDLE_S3__|${MODEL_BUNDLE_S3}|g" \
+  -e "s|__S3_BUCKET__|${S3_BUCKET}|g" \
   -e "s|__TEST_TAG__|${TEST_TAG}|g" \
   -e "s|__REGION__|${REGION}|g" \
+  -e "s|__LOCAL_BUILD__|${LOCAL_BUILD}|g" \
+  -e "s|__KRUNCH_IMAGE_TAG__|${KRUNCH_IMAGE_TAG}|g" \
   "$USER_DATA"
 rm -f "${USER_DATA}.bak"
 
