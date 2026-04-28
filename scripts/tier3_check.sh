@@ -65,12 +65,7 @@ echo "[1/5] Uploading repo + sample to S3..."
 
 SAMPLE_BYTES=$(( SAMPLE_LIMIT_MB * 1024 * 1024 ))
 head -c "$SAMPLE_BYTES" "$SAMPLE_LOCAL" | aws s3 cp --quiet - "${S3_BASE}/sample.bin"
-
-# Upload install.sh + the krunch wrapper so the user-data can invoke
-# install.sh literally (the same path a real user follows).
-aws s3 cp --quiet install.sh      "${S3_BASE}/install.sh"
-aws s3 cp --quiet scripts/krunch  "${S3_BASE}/krunch"
-echo "  uploaded ${SAMPLE_LIMIT_MB} MB sample + install.sh + krunch wrapper"
+echo "  uploaded ${SAMPLE_LIMIT_MB} MB sample (install.sh + wrapper come from public repo)"
 
 # If local-build mode requested, also upload the repo tarball + ensure the
 # model bundle is present (used by the user-data fallback path below).
@@ -139,16 +134,11 @@ if [[ "$LOCAL_BUILD" == "1" ]]; then
   echo "BUILD_DONE $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   KRUNCH_WRAPPER_SRC="${KRUNCH_DIR}/scripts/krunch"
 else
-  # Pull path — runs the user's actual install path (curl install.sh | bash),
-  # but with KRUNCH_WRAPPER_URL pointed at the test S3 bucket so we don't
-  # depend on the repo being public. Same install.sh code, same end state.
-  aws s3 cp "${S3_BASE}/install.sh" /tmp/install.sh
-  aws s3 cp "${S3_BASE}/krunch"     /tmp/krunch-wrapper
-  chmod +x /tmp/install.sh
+  # Pull path — exactly the user UX: curl install.sh from the public repo
+  # and pipe to bash. install.sh handles the docker pull + wrapper install.
   echo "INSTALL_START $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   KRUNCH_IMAGE="${KRUNCH_IMAGE_TAG}" \
-    KRUNCH_WRAPPER_URL="file:///tmp/krunch-wrapper" \
-    bash /tmp/install.sh
+    bash -c "curl -fsSL https://raw.githubusercontent.com/dmatth1/krunch/main/install.sh | bash"
   echo "INSTALL_DONE $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 fi
 
