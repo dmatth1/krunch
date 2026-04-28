@@ -204,80 +204,69 @@ class InferenceEngine:
         """
         Compress a single chunk to a range-coded bitstream + mini-header.
 
-        Pipelined: a background thread does GPU forward + softmax + transfer;
-        the main thread does CPU clip+renormalize + range-encode. With a
-        bounded queue between them, GPU and CPU work overlap — per-batch
-        wall-clock becomes max(GPU_time, CPU_time) instead of sum. On A10G
-        with SEQ_BATCH=1024, this collapses ~160ms sequential per-batch to
-        ~60-80ms (whichever side is slower), so ~3× compress speedup over
-        the unpipelined GPU-softmax version.
+        v1.1 GPU path: probs stay on GPU, CDF is computed via
+        torch.compile-d probs_to_cdf_gpu, then our custom CUDA range
+        coder kernel encodes batch-by-batch. AC state persists across
+        batches in a (4,) uint32 GPU tensor. No prob transfer to CPU
+        per batch (was the v1 bottleneck — 200 MB/batch × ~25K batches
+        = 5 TB cross-PCIe).
 
-        Peak memory: O(SEQ_BATCH × vocab) ≈ 200 MB × queue_depth (= ~600 MB
-        with default depth=2).
+        Peak memory: O(SEQ_BATCH × vocab) for probs + ~200 MB for CDF.
         """
-        import threading
-        import queue
+        import torch
+        import krunch_ac_cuda
+        from krunch_ac.gpu_encode import probs_to_cdf_gpu
+
         text = data.decode("utf-8", errors="replace")
         tokens = self._tokenizer.encode(text).ids
         if len(tokens) < 1:
             raise ValueError("chunk has no tokens after tokenization")
 
         SEQ_BATCH = int(os.environ.get("KRUNCH_FORWARD_BATCH", 1024))
-        full_input = [BOS_TOKEN] + tokens[:-1]  # length N
+        full_input = [BOS_TOKEN] + tokens[:-1]
+        tokens_arr_gpu = torch.as_tensor(tokens, dtype=torch.int32, device=self._device)
 
-        enc = constriction.stream.queue.RangeEncoder()
-        model_family = constriction.stream.model.Categorical(perfect=False)
-        tokens_arr = np.asarray(tokens, dtype=np.int32)
+        # Compile-and-cache probs_to_cdf_gpu once per process. Default mode
+        # (not reduce-overhead) — last batch in a chunk has variable shape,
+        # which is incompatible with reduce-overhead's CUDA graphs. Default
+        # mode still gets ~2× over eager. reduce-overhead is a v1.2 win
+        # if we add a static-shape padded path for the tail.
+        if not hasattr(self, "_cdf_compiled"):
+            self._cdf_compiled = torch.compile(probs_to_cdf_gpu)
 
-        # Bounded producer-consumer queue. Producer (background thread) runs
-        # forward+softmax+transfer on GPU; consumer (this thread) does CPU
-        # encode. Depth=2 = 1 batch in flight on GPU + 1 ready for encode.
-        SENTINEL = object()
-        probs_q: "queue.Queue" = queue.Queue(maxsize=2)
-        producer_exc: list = []
+        # Output buffer + state on GPU. Worst case AC output ~= input
+        # (zstd-equivalent uniform encoding); allocate len(data) + slack.
+        cap = max(len(data) * 2, 64 << 10)
+        output_buf = torch.zeros(cap, dtype=torch.uint8, device=self._device)
+        state = torch.zeros(4, dtype=torch.uint32, device=self._device)
+        state[1] = 0xFFFFFFFF
 
-        def gpu_producer():
-            try:
-                state = None
-                for i in range(0, len(full_input), SEQ_BATCH):
-                    batch = full_input[i:i + SEQ_BATCH]
-                    logits, state = self._model.forward(
-                        batch, state, full_output=True)
-                    probs = _gpu_softmax_to_numpy(logits)  # (B, V) float32 on CPU
-                    del logits
-                    probs_q.put(probs)
-            except Exception as e:
-                producer_exc.append(e)
-            finally:
-                probs_q.put(SENTINEL)
-
-        producer = threading.Thread(target=gpu_producer, daemon=True)
-        producer.start()
-
+        rwkv_state = None
         pos = 0
-        while True:
-            probs = probs_q.get()
-            if probs is SENTINEL:
-                break
-            np.clip(probs, 1e-9, 1.0, out=probs)
-            probs /= probs.sum(axis=1, keepdims=True)
-            B = probs.shape[0]
-            enc.encode(tokens_arr[pos:pos + B], model_family, probs)
+        for i in range(0, len(full_input), SEQ_BATCH):
+            batch = full_input[i:i + SEQ_BATCH]
+            logits, rwkv_state = self._model.forward(
+                batch, rwkv_state, full_output=True)
+            if not isinstance(logits, torch.Tensor):
+                logits = torch.as_tensor(logits, device=self._device)
+            with torch.no_grad():
+                probs = torch.softmax(logits.float(), dim=-1)
+                cdf = self._cdf_compiled(probs).contiguous()
+            B = cdf.size(0)
+            sym_batch = tokens_arr_gpu[pos:pos + B].contiguous()
+            krunch_ac_cuda.encode_step(cdf, sym_batch, output_buf, state)
             pos += B
-            del probs
+            del probs, cdf, logits
 
-        producer.join()
-        if producer_exc:
-            raise producer_exc[0]
+        krunch_ac_cuda.encode_finalize(output_buf, state)
+        torch.cuda.synchronize()
 
-        ac_bytes = np.array(enc.get_compressed(), dtype=np.uint32).tobytes()
+        bit_offset = int(state[3].item())
+        n_bytes = (bit_offset + 7) // 8
+        ac_bytes = bytes(output_buf[:n_bytes].cpu().numpy())
 
-        # Force the torch CUDA allocator to return cached memory across chunks
-        # (otherwise the cache drifts upward over a long compress run).
         try:
-            import torch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            torch.cuda.empty_cache()
         except Exception:
             pass
 
@@ -288,33 +277,41 @@ class InferenceEngine:
     def decompress_chunk(self, encoded: bytes) -> bytes:
         """Decompress a single AC-encoded chunk produced by compress_chunk.
 
-        Uses the same GPU-softmax recipe as compress_chunk so the per-step
-        probabilities match bit-for-bit. CPU softmax on encode + CPU softmax
-        on decode would also work but introduces a precision trap (float32
-        vs float64 paths can disagree in the last bits, breaking the AC
-        decoder). Always softmaxing on GPU keeps the recipe identical.
+        v1.1 GPU encoder writes a custom range-coded bitstream (NOT
+        constriction's), so this side uses our matching CPU reference
+        decoder with per-step CDFs derived via probs_to_cdf_gpu+cpu_view.
+        For the encoder/decoder to agree, the per-step CDF must be
+        byte-identical to the encoder's — that's why we run probs_to_cdf
+        on the SAME GPU code path (then transfer the CDF to CPU for the
+        decoder). Decompression is autoregressive (token-by-token model
+        forward) so per-step transfer is unavoidable here.
+
+        Decode TODO: a GPU range-decode kernel would let us avoid the
+        per-step CDF transfer; v1.2 work.
         """
         import torch
+        from krunch_ac.gpu_encode import probs_to_cdf_gpu
+        from krunch_ac.cpu_reference import RangeDecoder
+
         orig_len, n_tokens = struct.unpack(">II", encoded[:8])
         bitstream = encoded[8:]
 
-        compressed = np.frombuffer(bitstream, dtype=np.uint32)
-        dec = constriction.stream.queue.RangeDecoder(compressed)
-        model_family = constriction.stream.model.Categorical(perfect=False)
-
+        dec = RangeDecoder(bitstream)
         tokens: list[int] = []
         state = None
         last_input = BOS_TOKEN
         for _ in range(n_tokens):
             logits, state = self._model.forward([last_input], state)
-            probs = _gpu_softmax_to_numpy(logits).reshape(1, -1)  # (1, V)
-            del logits
-            np.clip(probs, 1e-9, 1.0, out=probs)
-            probs /= probs.sum(axis=1, keepdims=True)
-            tok = int(dec.decode(model_family, probs)[0])
+            if not isinstance(logits, torch.Tensor):
+                logits = torch.as_tensor(logits, device=self._device)
+            with torch.no_grad():
+                probs = torch.softmax(logits.float().reshape(1, -1), dim=-1)
+                cdf_gpu = probs_to_cdf_gpu(probs)
+            cdf_row = cdf_gpu[0].cpu().numpy().astype(np.uint32)
+            del probs, cdf_gpu, logits
+            tok = dec.decode_symbol(cdf_row)
             tokens.append(tok)
             last_input = tok
-            del probs
 
         text = self._tokenizer.decode(tokens)
         return text.encode("utf-8")[:orig_len]

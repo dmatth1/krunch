@@ -36,6 +36,16 @@ m.forward([0], None); print('kernel warm-up ok') \
 
 # Application code
 COPY krunch/ /app/krunch/
+COPY krunch_ac/ /app/krunch_ac/
+
+# Build the GPU AC kernel (nvcc + ninja). Devel base has nvcc; ninja
+# is already installed above. No GPU needed at build time — nvcc only
+# compiles, doesn't run, and TORCH_CUDA_ARCH_LIST hints at expected SMs.
+ENV TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;8.9;9.0"
+RUN cd /app/krunch_ac/cuda && python setup.py build_ext --inplace && \
+    cp krunch_ac_cuda*.so /app/
+
+ENV PYTHONPATH=/app:/app/krunch_ac/cuda
 
 WORKDIR /app
 
