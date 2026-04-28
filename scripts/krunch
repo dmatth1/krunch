@@ -42,33 +42,36 @@ def _run_local(action: str, args) -> int:
         return 1
 
     cmd = ["docker", "run", "--rm", "--gpus", "all", "-i", DEFAULT_IMAGE, action]
-    stdin_src = sys.stdin
-    stdout_dst = sys.stdout
+
+    # Pass file handles to subprocess only when explicit file args are
+    # provided. Otherwise let subprocess inherit the parent's stdin/stdout
+    # (the OS-level FDs from the shell's `< in > out` redirects). Passing
+    # sys.stdin/sys.stdout explicitly created subtle stdio-buffering
+    # corruption on large binary streams; inheriting just works.
+    kwargs: dict = {}
     in_handle = None
     out_handle = None
 
-    # Optional positional input file: `krunch compress data.jsonl`
     if args.input:
         try:
             in_handle = open(args.input, "rb")
-            stdin_src = in_handle
+            kwargs["stdin"] = in_handle
         except OSError as e:
             print(f"Error: cannot open input '{args.input}': {e}", file=sys.stderr)
             return 1
 
-    # Optional -o output file: `krunch compress data.jsonl -o data.krunch`
     if args.out:
         try:
             out_handle = open(args.out, "wb")
-            stdout_dst = out_handle
+            kwargs["stdout"] = out_handle
         except OSError as e:
             print(f"Error: cannot open output '{args.out}': {e}", file=sys.stderr)
             if in_handle: in_handle.close()
             return 1
 
     if args.dry_run:
-        in_label = args.input or "<stdin>"
-        out_label = args.out or "<stdout>"
+        in_label = args.input or "<inherit stdin>"
+        out_label = args.out or "<inherit stdout>"
         print(f"docker run --rm --gpus all -i {DEFAULT_IMAGE} {action}  "
               f"# stdin={in_label}, stdout={out_label}")
         if in_handle: in_handle.close()
@@ -76,7 +79,7 @@ def _run_local(action: str, args) -> int:
         return 0
 
     try:
-        return subprocess.run(cmd, stdin=stdin_src, stdout=stdout_dst).returncode
+        return subprocess.run(cmd, **kwargs).returncode
     except KeyboardInterrupt:
         return 130
     finally:
