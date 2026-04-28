@@ -7,13 +7,17 @@ There is no per-chunk classical fallback: if your data isn't text-heavy
 enough that the language model can compress it, krunch isn't the right
 tool — use zstd instead.
 
-Chunking still serves a purpose: parallelism (workers can compress chunks
-independently) and bounded memory (each forward pass is sized to one
-chunk, not the whole input).
+Chunking serves three purposes: cross-worker parallelism (each Batch
+worker takes a byte range), bounded memory per forward pass, and
+cross-chunk parallelism on a single GPU during decompress (RNN decode
+is inherently sequential within a chunk; running B chunks concurrently
+keeps the GPU busy and overlaps Python + AC + kernel-launch latency).
 """
 
+import os
 import struct
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable
 
 logger = logging.getLogger(__name__)
@@ -22,7 +26,13 @@ logger = logging.getLogger(__name__)
 # header overhead and shrink the model's effective context; larger chunks
 # delay parallelism wins and risk OOM during the neural sequence-forward
 # pass. Override with KRUNCH_CHUNK_SIZE for experiments.
-CHUNK_SIZE = int(__import__("os").environ.get("KRUNCH_CHUNK_SIZE", 1048576))  # 1 MB
+CHUNK_SIZE = int(os.environ.get("KRUNCH_CHUNK_SIZE", 1048576))  # 1 MB
+
+# Number of chunks decompressed concurrently on a single worker. Each
+# concurrent stream maintains its own RNN state and AC decoder; threads
+# overlap their forward calls so the GPU isn't idle between Python steps.
+# Larger = more GPU utilization but more memory for state + logits.
+DECOMPRESS_BATCH = int(os.environ.get("KRUNCH_DECOMPRESS_BATCH", 16))
 
 # Per-chunk entry: orig_len(4) + comp_len(4) + neural_compressed_data
 
@@ -49,13 +59,36 @@ def _compress_chunk(chunk: bytes,
 
 def decompress_all(entries_bytes: bytes, n_chunks: int,
                    neural_fn: Callable[[bytes], bytes]) -> bytes:
-    """Decompress all chunks from the packed entries bytes."""
+    """
+    Decompress all chunks. Up to DECOMPRESS_BATCH chunks run concurrently
+    via a ThreadPoolExecutor — each thread runs its own AC decoder + RNN
+    forward loop. The rwkv package's forward() releases the GIL during
+    CUDA work, so threads overlap Python (AC + bookkeeping) and CUDA
+    (kernel launches) latency across chunks. Output is byte-identical
+    to the sequential path.
+    """
+    # Pre-parse all chunks (cheap — just slicing + 8 bytes per entry)
     pos = 0
-    parts = []
+    chunks: list[tuple[int, bytes]] = []  # (orig_len, encoded)
     for _ in range(n_chunks):
         orig_len, comp_len = struct.unpack(">II", entries_bytes[pos:pos + 8])
         pos += 8
-        compressed = entries_bytes[pos:pos + comp_len]
+        chunks.append((orig_len, entries_bytes[pos:pos + comp_len]))
         pos += comp_len
-        parts.append(neural_fn(compressed)[:orig_len])
-    return b"".join(parts)
+
+    if DECOMPRESS_BATCH <= 1 or len(chunks) <= 1:
+        # Sequential path — used for tiny inputs and for tests that mock
+        # neural_fn (no real model = no GIL release = threading just
+        # adds overhead).
+        return b"".join(neural_fn(enc)[:orig_len] for orig_len, enc in chunks)
+
+    workers = min(DECOMPRESS_BATCH, len(chunks))
+    logger.debug("decompress: %d chunks across %d threads", len(chunks), workers)
+
+    def _one(item: tuple[int, bytes]) -> bytes:
+        orig_len, enc = item
+        return neural_fn(enc)[:orig_len]
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        decoded = list(ex.map(_one, chunks))
+    return b"".join(decoded)

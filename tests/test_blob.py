@@ -90,6 +90,53 @@ def test_chunking_roundtrip():
 
 
 # ---------------------------------------------------------------------------
+# 3b. Threaded decompress: byte-identical to sequential
+# ---------------------------------------------------------------------------
+
+def test_threaded_decompress_byte_identical():
+    """Verify the threaded decompress path produces byte-identical output
+    to the sequential one. Uses a fake stateful neural_fn (xor with a
+    counter-assigned chunk index) to detect any thread state leakage —
+    if state crossed threads the output would scramble."""
+    import threading
+    import struct as _struct
+    import importlib
+    import krunch.chunking
+    from krunch.chunking import compress_all, CHUNK_SIZE
+
+    # 5+ chunks so the threading path actually engages
+    raw = (b"abcdefghijklmnopqrstuvwxyz" * 250_000)[:5 * CHUNK_SIZE + 12345]
+    counter = [0]
+    lock = threading.Lock()
+
+    def encode(chunk: bytes) -> bytes:
+        with lock:
+            idx = counter[0]
+            counter[0] += 1
+        return _struct.pack(">I", idx) + bytes(b ^ (idx & 0xFF) for b in chunk)
+
+    def decode(encoded: bytes) -> bytes:
+        idx = _struct.unpack(">I", encoded[:4])[0]
+        return bytes(b ^ (idx & 0xFF) for b in encoded[4:])
+
+    entries, n = compress_all(raw, encode)
+    entries_bytes = b"".join(entries)
+
+    os.environ["KRUNCH_DECOMPRESS_BATCH"] = "1"
+    importlib.reload(krunch.chunking)
+    seq = krunch.chunking.decompress_all(entries_bytes, n, decode)
+
+    os.environ["KRUNCH_DECOMPRESS_BATCH"] = "8"
+    importlib.reload(krunch.chunking)
+    par = krunch.chunking.decompress_all(entries_bytes, n, decode)
+
+    assert seq == raw, f"sequential broken (len {len(seq)} vs {len(raw)})"
+    assert par == seq, "threaded path produced different bytes than sequential"
+    print(f"  PASS threaded decompress byte-identical ({n} chunks, "
+          f"sequential vs 8-thread agree)")
+
+
+# ---------------------------------------------------------------------------
 # 4. CRC32 integrity check
 # ---------------------------------------------------------------------------
 
@@ -131,6 +178,7 @@ def main():
         test_blob_header,
         test_ac_roundtrip,
         test_chunking_roundtrip,
+        test_threaded_decompress_byte_identical,
         test_crc,
         test_tokenizer,
     ]
