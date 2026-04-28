@@ -101,7 +101,19 @@ echo "FETCH_DONE $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 cd "${KRUNCH_DIR}"
 
 echo "BUILD_START $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-docker build -t krunch:tier3 . 2>&1 | tail -20
+# Capture build output but fail fast if build fails (set -o pipefail).
+set -o pipefail
+docker build -t krunch:tier3 . 2>&1 | tee /tmp/docker-build.log | tail -40
+BUILD_RC=${PIPESTATUS[0]}
+if [[ $BUILD_RC -ne 0 ]]; then
+  echo "BUILD_FAILED $(date -u +%Y-%m-%dT%H:%M:%SZ) rc=$BUILD_RC"
+  aws s3 cp /tmp/docker-build.log "${S3_BASE}/build.log"
+  aws s3 cp /var/log/krunch-tier3.log "${S3_BASE}/setup.log"
+  python3 -c 'import json; json.dump({"all_gates_pass": False, "error": "docker build failed"}, open("/tmp/result.json", "w"))'
+  aws s3 cp /tmp/result.json "${S3_BASE}/result.json"
+  aws ec2 terminate-instances --instance-ids "${INSTANCE_ID}" --region "${REGION}"
+  exit $BUILD_RC
+fi
 echo "BUILD_DONE $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 # Install the krunch CLI wrapper. After this point we use the documented
