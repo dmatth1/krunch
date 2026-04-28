@@ -1,14 +1,14 @@
 # Krunch
 
-> **Distributed neural compression as an open-source framework.**
-> One Docker image. Any NVIDIA GPU. Beats zstd-22 by ~33% on
+> **Krunch is a distributed neural compression framework.**
+> It works on any NVIDIA GPU and beats traditional compression algorithms (like zstd-22) by 20-40% on
 > text-heavy data (logs, chat, support tickets, code).
 
 > Status: pre-launch.
 
 ## Install + compress
 
-On any host with an NVIDIA GPU + Docker:
+Run on any host with an NVIDIA GPU + Docker:
 
 ```bash
 # 1. Install (~5-10 min one-time — downloads CLI + pulls 3.5 GB image)
@@ -19,7 +19,7 @@ krunch compress   < data.jsonl  > data.krunch
 krunch decompress < data.krunch > data.jsonl
 ```
 
-That's it. The installer puts a thin wrapper at `/usr/local/bin/krunch`
+The installer puts a thin wrapper at `/usr/local/bin/krunch`
 that shells out to
 `docker run --gpus all -i ghcr.io/dmatth1/krunch:latest …`. After install
 every call starts in ~30 seconds (model load + WKV kernel cache).
@@ -47,7 +47,7 @@ contract (read byte range from URL, compress, write partial blob) is
 generic — the same Docker image runs under any scheduler that can pass
 env vars and grant S3 access.
 
-## What's inside the image
+## What's inside the Docker image
 
 - **RWKV-4-Pile-169M** pretrained language model (Apache-2.0, BlinkDL) —
   the next-byte predictor.
@@ -55,9 +55,10 @@ env vars and grant S3 access.
   HF transformers' eval-mode fallback.
 - **constriction** arithmetic coder — turns the model's
   next-token distribution into a bitstream.
-- **1 MB chunks** — independent across chunks, parallelizable; large
-  enough to amortize per-chunk overhead and give the model useful
-  context.
+- **1 MB chunks (default)** — independent across chunks, parallelizable;
+  large enough to amortize per-chunk overhead and give the model useful
+  context. Override via `KRUNCH_CHUNK_SIZE` env var
+  (e.g. `KRUNCH_CHUNK_SIZE=4194304 krunch compress …` for 4 MB).
 
 Architecture validated on real GPU: ratio **0.111** on WildChat-English
 (vs zstd-22's 0.167 — a 33% reduction), compress throughput **≥ 800
