@@ -229,10 +229,16 @@ sed -i.bak \
 rm -f "${USER_DATA}.bak"
 
 # ---------------------------------------------------------------------------
-# 3. Launch spot instance
+# 3. Launch instance — spot by default, on-demand if KRUNCH_ON_DEMAND=1
+#    (useful when spot capacity is unavailable in your AZ)
 # ---------------------------------------------------------------------------
+ON_DEMAND="${KRUNCH_ON_DEMAND:-0}"
+MARKET_OPTS=()
+[[ "$ON_DEMAND" != "1" ]] && \
+  MARKET_OPTS=(--instance-market-options 'MarketType=spot,SpotOptions={SpotInstanceType=one-time}')
+
 echo
-echo "[2/5] Launching ${INSTANCE_TYPE} spot instance..."
+echo "[2/5] Launching ${INSTANCE_TYPE} ($([[ $ON_DEMAND == 1 ]] && echo "on-demand" || echo "spot")) instance..."
 INSTANCE_ID=$(aws ec2 run-instances \
   --region "$REGION" \
   --image-id "$AMI_ID" \
@@ -240,7 +246,7 @@ INSTANCE_ID=$(aws ec2 run-instances \
   --key-name "$KEY_NAME" \
   --security-groups "$SECURITY_GROUP" \
   --iam-instance-profile "Name=${INSTANCE_PROFILE}" \
-  --instance-market-options 'MarketType=spot,SpotOptions={SpotInstanceType=one-time}' \
+  "${MARKET_OPTS[@]}" \
   --block-device-mappings 'DeviceName=/dev/sda1,Ebs={VolumeSize=120,VolumeType=gp3,DeleteOnTermination=true}' \
   --user-data "file://${USER_DATA}" \
   --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=krunch-tier3-${TEST_TAG}},{Key=Project,Value=krunch}]" \
