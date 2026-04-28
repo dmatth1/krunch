@@ -3,7 +3,7 @@
 
 rwkv==0.8.26
 tokenizers==0.19.1
-constriction==0.4.3
+constriction==0.4.2
 
 # Classical codecs (per-chunk fallback dispatch)
 zstandard==0.22.0
