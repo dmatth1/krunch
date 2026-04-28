@@ -58,7 +58,12 @@ echo "[1/5] Uploading repo + sample to S3..."
 
 SAMPLE_BYTES=$(( SAMPLE_LIMIT_MB * 1024 * 1024 ))
 head -c "$SAMPLE_BYTES" "$SAMPLE_LOCAL" | aws s3 cp --quiet - "${S3_BASE}/sample.bin"
-echo "  uploaded ${SAMPLE_LIMIT_MB} MB sample"
+
+# Upload install.sh + the krunch wrapper so the user-data can invoke
+# install.sh literally (the same path a real user follows).
+aws s3 cp --quiet install.sh      "${S3_BASE}/install.sh"
+aws s3 cp --quiet scripts/krunch  "${S3_BASE}/krunch"
+echo "  uploaded ${SAMPLE_LIMIT_MB} MB sample + install.sh + krunch wrapper"
 
 # If local-build mode requested, also upload the repo tarball + ensure the
 # model bundle is present (used by the user-data fallback path below).
@@ -127,20 +132,24 @@ if [[ "$LOCAL_BUILD" == "1" ]]; then
   echo "BUILD_DONE $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   KRUNCH_WRAPPER_SRC="${KRUNCH_DIR}/scripts/krunch"
 else
-  # Pull path — production user UX
-  echo "PULL_START $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  docker pull "${KRUNCH_IMAGE_TAG}"
-  echo "PULL_DONE $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  # Pull just the wrapper from the image (avoids needing the repo on disk)
-  docker create --name kw "${KRUNCH_IMAGE_TAG}" >/dev/null 2>&1 || true
-  KRUNCH_WRAPPER_SRC=/tmp/krunch-wrapper
-  curl -fsSL "https://raw.githubusercontent.com/dmatth1/krunch/main/scripts/krunch" \
-    -o "$KRUNCH_WRAPPER_SRC"
-  docker rm kw >/dev/null 2>&1 || true
-  echo "FETCH_DONE $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  # Pull path — runs the user's actual install path (curl install.sh | bash),
+  # but with KRUNCH_WRAPPER_URL pointed at the test S3 bucket so we don't
+  # depend on the repo being public. Same install.sh code, same end state.
+  aws s3 cp "${S3_BASE}/install.sh" /tmp/install.sh
+  aws s3 cp "${S3_BASE}/krunch"     /tmp/krunch-wrapper
+  chmod +x /tmp/install.sh
+  echo "INSTALL_START $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  KRUNCH_IMAGE="${KRUNCH_IMAGE_TAG}" \
+    KRUNCH_WRAPPER_URL="file:///tmp/krunch-wrapper" \
+    bash /tmp/install.sh
+  echo "INSTALL_DONE $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 fi
 
-install -m 0755 "$KRUNCH_WRAPPER_SRC" /usr/local/bin/krunch
+# install.sh already put the wrapper at /usr/local/bin/krunch. For the
+# local-build path we install it manually here.
+if [[ "$LOCAL_BUILD" == "1" ]]; then
+  install -m 0755 "$KRUNCH_WRAPPER_SRC" /usr/local/bin/krunch
+fi
 export KRUNCH_IMAGE="${KRUNCH_IMAGE_TAG}"
 
 INPUT_BYTES=$(wc -c < /tmp/sample.bin)
