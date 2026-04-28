@@ -52,14 +52,15 @@ def test_ac_roundtrip():
 
     encoded = ac_encode(tokens, logits_seq)
 
-    # Decode: reproduce logits from same seed
+    # Decode: replay the same logits in order — logits_fn ignores its inputs
+    # because the test logits aren't actually conditional on prior tokens.
     logits_iter = iter(logits_seq)
 
     def logits_fn(state, token):
         logits = next(logits_iter)
         return logits, state
 
-    decoded = ac_decode(encoded, len(tokens), logits_fn, initial_token=tokens[0])
+    decoded = ac_decode(encoded, len(tokens), logits_fn)
     assert decoded == tokens, f"AC decode mismatch:\n  got {decoded[:10]}\n  want {tokens[:10]}"
     print(f"  PASS AC encode/decode ({len(tokens)} tokens, {len(encoded)} bytes)")
 

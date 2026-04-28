@@ -228,12 +228,12 @@ export class KrunchStack extends cdk.Stack {
       description: "Batch job queue — pass to krunch submit --job-queue",
     });
 
-    new cdk.CfnOutput(this, "CompressJobDef", {
+    new cdk.CfnOutput(this, "CompressJobDefOutput", {
       value: compressJobDef.ref,
       description: "Batch job definition for compress array tasks",
     });
 
-    new cdk.CfnOutput(this, "AssembleJobDef", {
+    new cdk.CfnOutput(this, "AssembleJobDefOutput", {
       value: assembleJobDef.ref,
       description: "Batch job definition for assemble task",
     });

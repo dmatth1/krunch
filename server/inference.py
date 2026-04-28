@@ -31,15 +31,13 @@ TOKENIZER_PATH = MODEL_DIR / "20B_tokenizer.json"
 # Lazy RWKV-LM import (BlinkDL's model_run.py, vendored in /opt/rwkv-lm)
 # ---------------------------------------------------------------------------
 
-_rwkv_lm_path = Path(os.environ.get("RWKV_LM_PATH", "/opt/rwkv-lm/RWKV-v4/src"))
-
-
-def _load_rwkv_lm():
-    import sys
-    sys.path.insert(0, str(_rwkv_lm_path))
-    import model_run  # noqa: F401 — side-effect: registers RWKV ops
-    from model_run import RWKV_RNN
-    return RWKV_RNN
+def _load_rwkv():
+    """Load BlinkDL's RWKV (pip install rwkv).
+    The package's RWKV class accepts a strategy string ('cpu fp32', 'cuda fp16')
+    and uses the custom WKV CUDA kernel automatically when 'cuda' is in the strategy.
+    """
+    from rwkv.model import RWKV
+    return RWKV
 
 
 # ---------------------------------------------------------------------------
@@ -97,16 +95,20 @@ def _softmax_np(logits: np.ndarray) -> np.ndarray:
     return e / e.sum()
 
 
+BOS_TOKEN = 0  # initial seed for both encode and decode — must match
+
+
 def ac_encode(tokens: list[int], logits_seq: np.ndarray) -> bytes:
     """
-    Arithmetic-encode tokens[1:] using logits_seq[:-1] as distributions.
-    logits_seq shape: (T, vocab). Returns raw AC bitstream bytes.
-    ANS requires encoding in reverse order; decode reads forward.
+    Arithmetic-encode tokens[0..N-1] using logits_seq[0..N-1] as distributions.
+    logits_seq[i] must be the model's prediction for tokens[i] given the prefix
+    [BOS, tokens[0], ..., tokens[i-1]]. ANS encodes in reverse.
     """
+    assert len(tokens) == logits_seq.shape[0], \
+        f"tokens ({len(tokens)}) vs logits ({logits_seq.shape[0]}) length mismatch"
     codec = constriction.stream.stack.AnsCoder()
-    # Encode symbols in reverse (ANS stack property)
-    for t in range(len(tokens) - 1, 0, -1):
-        probs = _softmax_np(logits_seq[t - 1].astype(np.float64))
+    for t in range(len(tokens) - 1, -1, -1):
+        probs = _softmax_np(logits_seq[t].astype(np.float64))
         probs = np.clip(probs, 1e-9, 1.0)
         probs /= probs.sum()
         model = constriction.stream.model.Categorical(probs, perfect=False)
@@ -114,24 +116,26 @@ def ac_encode(tokens: list[int], logits_seq: np.ndarray) -> bytes:
     return np.array(codec.get_compressed(), dtype=np.uint32).tobytes()
 
 
-def ac_decode(bitstream: bytes, n_tokens: int,
-              logits_fn, initial_token: int) -> list[int]:
+def ac_decode(bitstream: bytes, n_tokens: int, logits_fn) -> list[int]:
     """
-    Arithmetic-decode n_tokens using logits_fn(state, token) -> (logits, state).
-    Returns decoded token list (length n_tokens, including initial_token).
+    Arithmetic-decode n_tokens. logits_fn(state, last_input) -> (logits, new_state)
+    is called n_tokens times: first with last_input=BOS_TOKEN, state=None;
+    subsequent calls feed the just-decoded token.
     """
     compressed = np.frombuffer(bitstream, dtype=np.uint32)
     codec = constriction.stream.stack.AnsCoder(compressed)
-    tokens = [initial_token]
+    tokens = []
     state = None
-    for _ in range(n_tokens - 1):
-        logits, state = logits_fn(state, tokens[-1])
+    last_input = BOS_TOKEN
+    for _ in range(n_tokens):
+        logits, state = logits_fn(state, last_input)
         probs = _softmax_np(logits.astype(np.float64))
         probs = np.clip(probs, 1e-9, 1.0)
         probs /= probs.sum()
         model = constriction.stream.model.Categorical(probs, perfect=False)
         tok = int(codec.decode(model))
         tokens.append(tok)
+        last_input = tok
     return tokens
 
 
@@ -157,18 +161,20 @@ class InferenceEngine:
 
         logger.info("Loading RWKV-4-Pile-169M from %s (device=%s)",
                     MODEL_PATH, self._device)
-        RWKV_RNN = _load_rwkv_lm()
+        RWKV = _load_rwkv()
 
-        # BlinkDL's RWKV_RNN constructor: (model_path, strategy)
-        # strategy controls dtype + device. fp16 on CUDA, fp32 on CPU.
-        strategy = (
-            f"cuda fp16" if self._device == "cuda"
-            else "cpu fp32"
-        )
+        # rwkv.model.RWKV(model_path_without_ext, strategy)
+        # strategy: 'cpu fp32' for CPU, 'cuda fp16' for GPU with WKV kernel
+        strategy = "cuda fp16" if self._device == "cuda" else "cpu fp32"
         os.environ["RWKV_JIT_ON"] = "1"
         os.environ["RWKV_CUDA_ON"] = "1" if self._device == "cuda" else "0"
 
-        self._model = RWKV_RNN(str(MODEL_PATH), strategy)
+        # rwkv expects the path without .pth extension. verbose=False keeps
+        # the layer table off stdout — important because CLI mode writes the
+        # binary blob to stdout.
+        model_path_no_ext = str(MODEL_PATH).removesuffix(".pth")
+        self._model = RWKV(model=model_path_no_ext, strategy=strategy,
+                           verbose=False)
         self._ready = True
         elapsed = time.time() - self._load_start
         logger.info("Model loaded in %.1fs", elapsed)
@@ -180,17 +186,13 @@ class InferenceEngine:
     def compress_chunk(self, data: bytes) -> bytes:
         """
         Compress a single chunk to AC bitstream + mini-header.
-        Returns raw encoded bytes (no blob header — chunking.py wraps these).
         """
         text = data.decode("utf-8", errors="replace")
-        enc = self._tokenizer.encode(text)
-        tokens = enc.ids
-        if len(tokens) < 2:
-            raise ValueError("chunk too short to compress (< 2 tokens)")
+        tokens = self._tokenizer.encode(text).ids
+        if len(tokens) < 1:
+            raise ValueError("chunk has no tokens after tokenization")
 
-        # Full-sequence forward pass: (T, vocab) logits in one shot
-        logits_seq = self._forward_sequence(tokens)
-
+        logits_seq = self._forward_logits(tokens)
         ac_bytes = ac_encode(tokens, logits_seq)
 
         # Mini-header: original byte length (4) + token count (4)
@@ -206,26 +208,27 @@ class InferenceEngine:
             logits, new_state = self._model.forward([token], state)
             return np.array(logits, dtype=np.float32), new_state
 
-        # BOS token (0) as initial context; decode n_tokens
-        tokens = ac_decode(bitstream, n_tokens, logits_fn, initial_token=0)
-        text = self._tokenizer.decode(tokens[1:])  # drop BOS
+        tokens = ac_decode(bitstream, n_tokens, logits_fn)
+        text = self._tokenizer.decode(tokens)
         result = text.encode("utf-8")
-        # Trim/pad to original length for byte-exactness on UTF-8 boundaries
         return result[:orig_len]
 
-    def _forward_sequence(self, tokens: list[int]) -> np.ndarray:
+    def _forward_logits(self, tokens: list[int]) -> np.ndarray:
         """
-        Run a full sequence forward pass.
-        Returns logits array of shape (T, vocab).
+        Run forward passes seeded by BOS_TOKEN, returning logits[i] = prediction
+        for tokens[i] given prefix [BOS, tokens[0], ..., tokens[i-1]].
+
+        Symmetric with ac_decode's loop: same BOS seed, same N forward calls,
+        same input-feeding pattern. This is what makes encode/decode byte-exact.
         """
-        # Prepend BOS (token 0) so each position t has a valid context
-        full_tokens = [0] + tokens
         logits_list = []
         state = None
-        for tok in full_tokens[:-1]:
-            logits, state = self._model.forward([tok], state)
+        last_input = BOS_TOKEN
+        for i in range(len(tokens)):
+            logits, state = self._model.forward([last_input], state)
             logits_list.append(np.array(logits, dtype=np.float32))
-        return np.stack(logits_list, axis=0)  # (T, vocab)
+            last_input = tokens[i]
+        return np.stack(logits_list, axis=0)  # shape (N, vocab)
 
 
 # Module-level singleton — imported by main.py

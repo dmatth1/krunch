@@ -63,12 +63,47 @@ def _has_docker() -> bool:
 # ---------------------------------------------------------------------------
 
 def cmd_submit(args):
-    import boto3
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).parent.parent))
     from server import url_io
 
-    # Resolve job queue + job definitions from stack outputs if not provided
+    # Build the two job-submission payloads
+    job_tag = f"job-{int(time.time())}"
+    parts_prefix = f"{args.dest}.parts/{job_tag}"
+
+    compress_payload = {
+        "jobName": f"krunch-compress-{job_tag}",
+        "arrayProperties": {"size": args.workers},
+        "containerOverrides": {"environment": [
+            {"name": "KRUNCH_JOB_TYPE",    "value": "compress"},
+            {"name": "KRUNCH_SOURCE",      "value": args.source},
+            {"name": "KRUNCH_TOTAL_TASKS", "value": str(args.workers)},
+            {"name": "KRUNCH_PARTS_PREFIX","value": parts_prefix},
+        ]},
+    }
+    assemble_payload = {
+        "jobName": f"krunch-assemble-{job_tag}",
+        "containerOverrides": {"environment": [
+            {"name": "KRUNCH_JOB_TYPE",     "value": "assemble"},
+            {"name": "KRUNCH_PARTS_PREFIX", "value": parts_prefix},
+            {"name": "KRUNCH_N_PARTS",      "value": str(args.workers)},
+            {"name": "KRUNCH_DEST",         "value": args.dest},
+        ]},
+    }
+
+    if args.dry_run:
+        print(json.dumps({
+            "stack": args.stack,
+            "source": args.source,
+            "dest": args.dest,
+            "workers": args.workers,
+            "spot": args.spot,
+            "compress_job": compress_payload,
+            "assemble_job": assemble_payload,
+        }, indent=2))
+        return 0
+
+    import boto3
     job_queue, compress_jd, assemble_jd = _resolve_resources(
         args.stack, args.job_queue, args.compress_job_def, args.assemble_job_def
     )
@@ -78,35 +113,25 @@ def cmd_submit(args):
     print(f"Workers:     {args.workers}")
     print(f"Job queue:   {job_queue}")
 
-    # Get file size
     print("Getting file size...", end=" ", flush=True)
     total_size = url_io.size(args.source)
     print(f"{total_size:,} bytes ({total_size / 1024**3:.2f} GB)")
 
-    # Parts prefix: dest + ".parts/" + job-<timestamp>/
-    job_tag = f"job-{int(time.time())}"
-    parts_prefix = f"{args.dest}.parts/{job_tag}"
-
     batch = boto3.client("batch")
 
-    # ---------------------------------------------------------------------------
-    # Submit compress array job
-    # ---------------------------------------------------------------------------
+    # Add the resolved size + queue/def references to the payloads
+    compress_payload["containerOverrides"]["environment"].append(
+        {"name": "KRUNCH_TOTAL_SIZE", "value": str(total_size)}
+    )
+    assemble_payload["containerOverrides"]["environment"].append(
+        {"name": "KRUNCH_ORIGINAL_LEN", "value": str(total_size)}
+    )
+
     print(f"\nSubmitting compress array job ({args.workers} tasks)...")
     compress_resp = batch.submit_job(
-        jobName=f"krunch-compress-{job_tag}",
         jobQueue=job_queue,
         jobDefinition=compress_jd,
-        arrayProperties={"size": args.workers},
-        containerOverrides={
-            "environment": [
-                {"name": "KRUNCH_JOB_TYPE",     "value": "compress"},
-                {"name": "KRUNCH_SOURCE",        "value": args.source},
-                {"name": "KRUNCH_TOTAL_SIZE",    "value": str(total_size)},
-                {"name": "KRUNCH_TOTAL_TASKS",   "value": str(args.workers)},
-                {"name": "KRUNCH_PARTS_PREFIX",  "value": parts_prefix},
-            ]
-        },
+        **compress_payload,
     )
     compress_job_id = compress_resp["jobId"]
     print(f"Compress job ID: {compress_job_id}")
@@ -126,19 +151,10 @@ def cmd_submit(args):
     # ---------------------------------------------------------------------------
     print("\nSubmitting assemble job...")
     assemble_resp = batch.submit_job(
-        jobName=f"krunch-assemble-{job_tag}",
         jobQueue=job_queue,
         jobDefinition=assemble_jd,
         dependsOn=[{"jobId": compress_job_id, "type": "SEQUENTIAL"}],
-        containerOverrides={
-            "environment": [
-                {"name": "KRUNCH_JOB_TYPE",      "value": "assemble"},
-                {"name": "KRUNCH_PARTS_PREFIX",  "value": parts_prefix},
-                {"name": "KRUNCH_N_PARTS",       "value": str(args.workers)},
-                {"name": "KRUNCH_DEST",          "value": args.dest},
-                {"name": "KRUNCH_ORIGINAL_LEN",  "value": str(total_size)},
-            ]
-        },
+        **assemble_payload,
     )
     assemble_job_id = assemble_resp["jobId"]
     print(f"Assemble job ID: {assemble_job_id}")
@@ -236,9 +252,9 @@ def _resolve_resources(stack_name, job_queue, compress_jd, assemble_jd):
                for o in resp["Stacks"][0].get("Outputs", [])}
 
     return (
-        job_queue   or outputs.get("JobQueueArn")   or _fail("--job-queue or --stack required"),
-        compress_jd or outputs.get("CompressJobDef") or _fail("--compress-job-def or --stack required"),
-        assemble_jd or outputs.get("AssembleJobDef") or _fail("--assemble-job-def or --stack required"),
+        job_queue   or outputs.get("JobQueueArn")          or _fail("--job-queue or --stack required"),
+        compress_jd or outputs.get("CompressJobDefOutput") or _fail("--compress-job-def or --stack required"),
+        assemble_jd or outputs.get("AssembleJobDefOutput") or _fail("--assemble-job-def or --stack required"),
     )
 
 
@@ -284,6 +300,8 @@ def main():
                           help="Batch job definition for compress tasks")
     p_submit.add_argument("--assemble-job-def",
                           help="Batch job definition for assemble task")
+    p_submit.add_argument("--dry-run", action="store_true",
+                          help="Print job submission payloads as JSON; don't call AWS")
 
     # status
     p_status = sub.add_parser("status", help="Check job status")
