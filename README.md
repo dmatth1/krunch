@@ -65,19 +65,20 @@ KB/s** on A10G fp16, byte-exact decompression.
 
 ## Ratio comparisons
 
-> *To be filled in. Need: krunch vs zstd-22 vs bzip3 on at least —*
-> *WildChat-English (chat / dialogue), enwik8 / enwik9 (Wikipedia), a*
-> *log corpus (e.g. nginx or HDFS), and a code corpus (e.g. The Stack*
-> *Python subset). All numbers from a single g5.xlarge run with the*
-> *published `:latest` image, sample size ≥ 100 MB per corpus.*
+> *To be filled in. Need: krunch vs zstd-22 vs bzip3 vs ts_zip on at*
+> *least — WildChat-English (chat / dialogue), enwik8 / enwik9*
+> *(Wikipedia), a log corpus (e.g. nginx or HDFS), and a code corpus*
+> *(e.g. The Stack Python subset). All numbers from a single g5.xlarge*
+> *run with the published `:latest` image, sample size ≥ 100 MB per*
+> *corpus. ts_zip uses its published `1B5-v3` model.*
 
-| corpus | krunch | zstd-22 | bzip3 | krunch vs zstd |
-|---|---|---|---|---|
-| WildChat-English | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
-| enwik8 | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
-| enwik9 | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
-| nginx logs | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
-| The Stack (Python) | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
+| corpus | krunch | ts_zip | zstd-22 | bzip3 | krunch vs zstd |
+|---|---|---|---|---|---|
+| WildChat-English | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
+| enwik8 | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
+| enwik9 | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
+| nginx logs | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
+| The Stack (Python) | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
 
 ## Throughput scaling with `krunch submit --workers N`
 
