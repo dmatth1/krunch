@@ -27,13 +27,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install constriction tokenizers zstandard numpy
 
-      - name: Smoke test (blob format, AC codec, chunking, CRC, tokenizer)
+      - name: Unit tests (blob format, AC codec, chunking, CRC, tokenizer)
         run: |
-          # The smoke test loads the GPT-NeoX BPE tokenizer from models/.
+          # The blob test loads the GPT-NeoX BPE tokenizer from models/.
           mkdir -p models
           curl -sL https://github.com/BlinkDL/RWKV-LM/raw/main/RWKV-v4/20B_tokenizer.json \
             -o models/20B_tokenizer.json
-          python scripts/smoke_test_local.py
+          python tests/test_blob.py
 
       - name: Set up Node for CDK
         uses: actions/setup-node@v4
@@ -43,7 +43,7 @@ jobs:
       - name: CDK type-check
         # `cdk synth` needs real AWS credentials (ec2.Vpc.fromLookup +
         # MachineImage.lookup hit the AWS API). Skipped in CI; run locally
-        # via scripts/tier1_check.sh which authenticates against a real account.
+        # via tests/quick.sh which authenticates against a real account.
         run: |
           cd deploy/aws-cdk
           npm install --silent

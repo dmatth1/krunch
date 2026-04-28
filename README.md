@@ -97,8 +97,12 @@ krunch/
 │   └── url_io.py           # generic URL read/write (s3://, http://, file://)
 ├── scripts/
 │   ├── krunch              # the user-facing CLI wrapper (Python)
-│   ├── entrypoint.sh       # container entrypoint (compress | decompress | job)
-│   └── tier{1,2,3}_check.sh # local + cloud validation tests
+│   └── entrypoint.sh       # container entrypoint (compress | decompress | job)
+├── tests/                  # see tests/README.md
+│   ├── test_blob.py        # unit tests (blob format, AC codec, chunking, CRC)
+│   ├── quick.sh            # CI-equivalent local checks (free, seconds)
+│   ├── integration.sh      # CPU end-to-end with the real model (free, ~30s)
+│   └── gpu.sh              # GPU smoke on a g5.xlarge spot (~$0.15)
 ├── deploy/aws-cdk/         # AWS Batch deployer (compute envs, job queue, S3)
 └── LICENSE                 # Apache-2.0
 ```

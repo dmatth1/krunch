@@ -1,7 +1,7 @@
 #!/bin/bash
-# Tier 1 — free, runs in seconds. Validates everything that doesn't need a GPU.
+# Free, runs in seconds. Validates everything that doesn't need a GPU.
 #
-#   1. server smoke test (header, AC codec, chunking, CRC, tokenizer)
+#   1. unit tests (header, AC codec, chunking, CRC, tokenizer)
 #   2. CDK TypeScript type-check
 #   3. CDK CloudFormation synth (proves the stack generates valid templates)
 #   4. krunch submit --dry-run (proves the CLI builds correct Batch payloads)
@@ -18,13 +18,13 @@ report() {
   else echo "FAIL $2"; FAIL=$((FAIL+1)); fi
 }
 
-echo "=== Tier 1 local checks ==="
+echo "=== Krunch quick checks ==="
 
-# 1. Smoke test
-echo "[1/4] Server smoke test"
+# 1. Unit tests
+echo "[1/4] Unit tests"
 if [[ -x /tmp/krunch-venv/bin/python ]]; then
-  /tmp/krunch-venv/bin/python scripts/smoke_test_local.py >/dev/null
-  report $? "smoke test (5/5)"
+  /tmp/krunch-venv/bin/python tests/test_blob.py >/dev/null
+  report $? "unit tests (5/5)"
 else
   report 99 "smoke test — /tmp/krunch-venv missing (run: python3 -m venv /tmp/krunch-venv && /tmp/krunch-venv/bin/pip install constriction tokenizers zstandard numpy httpx boto3)"
 fi
