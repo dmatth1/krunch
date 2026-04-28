@@ -215,20 +215,29 @@ class InferenceEngine:
 
     def _forward_logits(self, tokens: list[int]) -> np.ndarray:
         """
-        Run forward passes seeded by BOS_TOKEN, returning logits[i] = prediction
-        for tokens[i] given prefix [BOS, tokens[0], ..., tokens[i-1]].
+        Compute logits[i] = prediction for tokens[i] given prefix
+        [BOS, tokens[0], ..., tokens[i-1]].
 
-        Symmetric with ac_decode's loop: same BOS seed, same N forward calls,
-        same input-feeding pattern. This is what makes encode/decode byte-exact.
+        Sequence-forward (batched) instead of token-by-token: input is
+        [BOS, tokens[0], ..., tokens[N-2]] (length N). The rwkv package's
+        forward() accepts a token list with `full_output=True` and returns
+        all logits in one shot — ~1000× faster than calling forward() once
+        per token (which keeps Python+kernel-launch overhead per token and
+        runs the GPU at ~20% utilization).
+
+        We chunk at SEQ_BATCH because RWKV's WKV CUDA kernel has a baked-in
+        T_MAX (1024 in Spike 6's build); state carries across chunks so the
+        result is identical to a single big call.
         """
-        logits_list = []
+        SEQ_BATCH = int(os.environ.get("KRUNCH_FORWARD_BATCH", 1024))
+        full_input = [BOS_TOKEN] + tokens[:-1]  # length N
         state = None
-        last_input = BOS_TOKEN
-        for i in range(len(tokens)):
-            logits, state = self._model.forward([last_input], state)
-            logits_list.append(_to_numpy(logits))
-            last_input = tokens[i]
-        return np.stack(logits_list, axis=0)  # shape (N, vocab)
+        chunks = []
+        for i in range(0, len(full_input), SEQ_BATCH):
+            batch = full_input[i:i + SEQ_BATCH]
+            logits, state = self._model.forward(batch, state, full_output=True)
+            chunks.append(_to_numpy(logits))
+        return np.concatenate(chunks, axis=0)  # shape (N, vocab)
 
 
 def _to_numpy(t) -> np.ndarray:
