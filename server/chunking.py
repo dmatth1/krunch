@@ -10,7 +10,11 @@ from typing import Callable
 
 logger = logging.getLogger(__name__)
 
-CHUNK_SIZE = int(__import__("os").environ.get("KRUNCH_CHUNK_SIZE", 65536))  # 64 KB
+# 1 MB matches Spike 6's measured tradeoff. Smaller chunks shrink zstd's
+# effective window and amplify per-chunk header overhead; larger chunks
+# delay parallelism wins and risk OOM during the neural sequence-forward
+# pass. Override with KRUNCH_CHUNK_SIZE for experiments.
+CHUNK_SIZE = int(__import__("os").environ.get("KRUNCH_CHUNK_SIZE", 1048576))  # 1 MB
 
 # Chunk entry in blob: codec_tag(1) + compressed_len(4) + data
 CODEC_NEURAL = 0x01
