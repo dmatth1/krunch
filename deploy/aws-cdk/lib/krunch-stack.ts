@@ -17,6 +17,12 @@ export interface KrunchStackProps extends cdk.StackProps {
    * Created fresh if not provided.
    */
   s3BucketName?: string;
+  /**
+   * Use spot instances. Default: true.
+   * Set to false for on-demand (higher cost, no interruption risk).
+   * Both queues are always created; this controls the default priority.
+   */
+  spot?: boolean;
 }
 
 /**
@@ -53,6 +59,7 @@ export class KrunchStack extends cdk.Stack {
       props.instanceType ??
       ec2.InstanceType.of(ec2.InstanceClass.G5, ec2.InstanceSize.XLARGE);
     const image = props.image ?? "ghcr.io/dmatth1/krunch:v1";
+    const preferSpot = props.spot ?? true;
 
     // ---------------------------------------------------------------------------
     // VPC — default VPC, no NAT gateway needed (Batch uses public subnets)
@@ -115,39 +122,60 @@ export class KrunchStack extends cdk.Stack {
       allowAllOutbound: true,
     });
 
-    // ---------------------------------------------------------------------------
-    // Batch compute environment — GPU spot fleet, scale to zero
-    // ---------------------------------------------------------------------------
-    const computeEnv = new batch.CfnComputeEnvironment(this, "ComputeEnv", {
-      type: "MANAGED",
+    const sharedComputeProps = {
+      type: "MANAGED" as const,
       state: "ENABLED",
+    };
+    const sharedResources = {
+      instanceTypes: [instanceType.toString()],
+      minvCpus: 0,
+      maxvCpus: maxWorkers * 4, // g5.xlarge = 4 vCPUs
+      subnets: vpc.publicSubnets.map((s) => s.subnetId),
+      securityGroupIds: [sg.securityGroupId],
+      instanceRole: instanceProfile.attrArn,
+      // Override imageId with a custom AMI (pre-pulled image) to eliminate cold-pull time
+      // imageId: "ami-0xxxxxxxxxxxxxxxxx",
+    };
+
+    // ---------------------------------------------------------------------------
+    // Batch compute environments — spot (cheap) + on-demand (reliable)
+    // Both created; job queue prefers whichever `spot` prop selects.
+    // ---------------------------------------------------------------------------
+    const spotEnv = new batch.CfnComputeEnvironment(this, "SpotEnv", {
+      ...sharedComputeProps,
       computeResources: {
+        ...sharedResources,
         type: "SPOT",
         allocationStrategy: "SPOT_CAPACITY_OPTIMIZED",
-        instanceTypes: [instanceType.toString()],
-        minvCpus: 0,           // scale to zero when idle
-        maxvCpus: maxWorkers * 4, // g5.xlarge = 4 vCPUs
-        subnets: vpc.publicSubnets.map((s) => s.subnetId),
-        securityGroupIds: [sg.securityGroupId],
-        instanceRole: instanceProfile.attrArn,
         bidPercentage: 60,
-        // Deep Learning AMI — Docker + CUDA + nvidia-container-toolkit preinstalled
-        // Override imageId here with a custom AMI (pre-pulled image) to cut cold-start
-        // imageId: "ami-0xxxxxxxxxxxxxxxxx",
-        tags: { Name: "krunch-batch-worker" },
+        tags: { Name: "krunch-spot-worker" },
+      },
+    });
+
+    const onDemandEnv = new batch.CfnComputeEnvironment(this, "OnDemandEnv", {
+      ...sharedComputeProps,
+      computeResources: {
+        ...sharedResources,
+        type: "EC2",
+        allocationStrategy: "BEST_FIT_PROGRESSIVE",
+        tags: { Name: "krunch-ondemand-worker" },
       },
     });
 
     // ---------------------------------------------------------------------------
-    // Job queue
+    // Job queue — preferred env first, fallback to the other
     // ---------------------------------------------------------------------------
+    const [primary, fallback] = preferSpot
+      ? [spotEnv, onDemandEnv]
+      : [onDemandEnv, spotEnv];
+
     const jobQueue = new batch.CfnJobQueue(this, "JobQueue", {
       state: "ENABLED",
       priority: 10,
-      computeEnvironmentOrder: [{
-        order: 1,
-        computeEnvironment: computeEnv.ref,
-      }],
+      computeEnvironmentOrder: [
+        { order: 1, computeEnvironment: primary.ref },
+        { order: 2, computeEnvironment: fallback.ref },
+      ],
     });
 
     // ---------------------------------------------------------------------------

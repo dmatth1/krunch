@@ -221,8 +221,11 @@ def main():
                           help="Source URL (s3://, http://, file://)")
     p_submit.add_argument("--dest", required=True,
                           help="Destination URL for compressed output")
-    p_submit.add_argument("--workers", type=int, default=4,
-                          help="Number of parallel compress tasks (default: 4)")
+    p_submit.add_argument("--workers", type=int, default=1,
+                          help="Number of parallel compress tasks (default: 1)")
+    p_submit.add_argument("--spot", action=argparse.BooleanOptionalAction,
+                          default=True,
+                          help="Use spot instances (default: --spot)")
     p_submit.add_argument("--stack", default="KrunchStack",
                           help="CloudFormation stack name (default: KrunchStack)")
     p_submit.add_argument("--job-queue",
