@@ -7,12 +7,22 @@
 > Status: pre-launch (private repo). v1 launch target: 6 weeks.
 > See `V1_PLAN.md` for the roadmap.
 
+## Install the CLI
+
+```bash
+sudo install scripts/krunch /usr/local/bin/krunch
+```
+
+Then `krunch` is on your PATH. The CLI is a thin wrapper that
+shells out to Docker (for compress/decompress) or AWS Batch (for
+submit).
+
 ## Quick start
 
 ```bash
-# Single-shot: container starts, processes, exits
-docker run --gpus all -i ghcr.io/dmatth1/krunch:v1 compress   < data.jsonl  > data.krunch
-docker run --gpus all -i ghcr.io/dmatth1/krunch:v1 decompress < data.krunch > data.jsonl
+# Single-shot on any GPU host
+krunch compress   < data.jsonl  > data.krunch
+krunch decompress < data.krunch > data.jsonl
 ```
 
 For large files / archival workloads, run as a distributed batch job.
@@ -21,14 +31,18 @@ The same Docker image runs as an array job under any scheduler
 directly from object storage and run in parallel.
 
 ```bash
-# Reference deployer: AWS Batch
+# One-time setup: deploy the AWS Batch infra
 cd deploy/aws-cdk && npm install && npx cdk deploy
 
-python3 scripts/krunch_cli.py submit \
+# Submit a distributed job
+krunch submit \
   --source s3://my-bucket/logs/data.jsonl \
   --dest   s3://my-bucket/logs/data.krunch \
   --workers 8
 ```
+
+> Override the Docker image for `compress` / `decompress` via
+> `KRUNCH_IMAGE=ghcr.io/me/krunch:dev krunch compress < in > out`.
 
 ## What's inside the image
 
