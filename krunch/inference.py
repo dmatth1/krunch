@@ -98,42 +98,46 @@ def _softmax_np(logits: np.ndarray) -> np.ndarray:
 BOS_TOKEN = 0  # initial seed for both encode and decode — must match
 
 
+def _categorical_from_logits(logits_row: np.ndarray):
+    """Softmax → clip → renormalize → Categorical. Same numerical recipe
+    on encode and decode sides so the bitstream is byte-exact."""
+    probs = _softmax_np(logits_row.astype(np.float64))
+    probs = np.clip(probs, 1e-9, 1.0)
+    probs /= probs.sum()
+    return constriction.stream.model.Categorical(probs, perfect=False)
+
+
 def ac_encode(tokens: list[int], logits_seq: np.ndarray) -> bytes:
     """
-    Arithmetic-encode tokens[0..N-1] using logits_seq[0..N-1] as distributions.
+    Range-encode tokens[0..N-1] using logits_seq[0..N-1] as distributions.
     logits_seq[i] must be the model's prediction for tokens[i] given the prefix
-    [BOS, tokens[0], ..., tokens[i-1]]. ANS encodes in reverse.
+    [BOS, tokens[0], ..., tokens[i-1]]. Range coding is symmetric (encode and
+    decode both run in forward order), which lets compress_chunk stream:
+    forward batch i → range-encode immediately → free logits → next batch.
     """
     assert len(tokens) == logits_seq.shape[0], \
         f"tokens ({len(tokens)}) vs logits ({logits_seq.shape[0]}) length mismatch"
-    codec = constriction.stream.stack.AnsCoder()
-    for t in range(len(tokens) - 1, -1, -1):
-        probs = _softmax_np(logits_seq[t].astype(np.float64))
-        probs = np.clip(probs, 1e-9, 1.0)
-        probs /= probs.sum()
-        model = constriction.stream.model.Categorical(probs, perfect=False)
-        codec.encode_reverse(np.array([tokens[t]], dtype=np.int32), model)
-    return np.array(codec.get_compressed(), dtype=np.uint32).tobytes()
+    enc = constriction.stream.queue.RangeEncoder()
+    for t in range(len(tokens)):
+        enc.encode(np.array([tokens[t]], dtype=np.int32),
+                   _categorical_from_logits(logits_seq[t]))
+    return np.array(enc.get_compressed(), dtype=np.uint32).tobytes()
 
 
 def ac_decode(bitstream: bytes, n_tokens: int, logits_fn) -> list[int]:
     """
-    Arithmetic-decode n_tokens. logits_fn(state, last_input) -> (logits, new_state)
+    Range-decode n_tokens. logits_fn(state, last_input) -> (logits, new_state)
     is called n_tokens times: first with last_input=BOS_TOKEN, state=None;
     subsequent calls feed the just-decoded token.
     """
     compressed = np.frombuffer(bitstream, dtype=np.uint32)
-    codec = constriction.stream.stack.AnsCoder(compressed)
+    dec = constriction.stream.queue.RangeDecoder(compressed)
     tokens = []
     state = None
     last_input = BOS_TOKEN
     for _ in range(n_tokens):
         logits, state = logits_fn(state, last_input)
-        probs = _softmax_np(logits.astype(np.float64))
-        probs = np.clip(probs, 1e-9, 1.0)
-        probs /= probs.sum()
-        model = constriction.stream.model.Categorical(probs, perfect=False)
-        tok = int(codec.decode(model))
+        tok = int(dec.decode(_categorical_from_logits(logits)))
         tokens.append(tok)
         last_input = tok
     return tokens
@@ -185,21 +189,38 @@ class InferenceEngine:
 
     def compress_chunk(self, data: bytes) -> bytes:
         """
-        Compress a single chunk to AC bitstream + mini-header.
+        Compress a single chunk to a range-coded bitstream + mini-header.
+
+        Streaming: each forward batch's logits are range-encoded immediately
+        and freed before the next forward call. Peak memory is O(SEQ_BATCH ×
+        vocab) ≈ 200 MB regardless of chunk size — the per-chunk memory
+        bound that was capping chunk size on small instances is gone.
         """
         text = data.decode("utf-8", errors="replace")
         tokens = self._tokenizer.encode(text).ids
         if len(tokens) < 1:
             raise ValueError("chunk has no tokens after tokenization")
 
-        logits_seq = self._forward_logits(tokens)
-        ac_bytes = ac_encode(tokens, logits_seq)
-        del logits_seq  # free ~tokens × vocab × 4 bytes immediately
+        SEQ_BATCH = int(os.environ.get("KRUNCH_FORWARD_BATCH", 1024))
+        full_input = [BOS_TOKEN] + tokens[:-1]  # length N
 
-        # Force the torch CUDA allocator to release cached memory back to the
-        # OS. Without this, the cache grows monotonically across chunks and
-        # the host eventually OOM-kills us — observed on g5.xlarge (16 GB) at
-        # the 100-chunk mark.
+        enc = constriction.stream.queue.RangeEncoder()
+        state = None
+        pos = 0  # next token index to encode
+        for i in range(0, len(full_input), SEQ_BATCH):
+            batch = full_input[i:i + SEQ_BATCH]
+            logits, state = self._model.forward(batch, state, full_output=True)
+            np_logits = _to_numpy(logits)  # (B, vocab)
+            for row in np_logits:
+                enc.encode(np.array([tokens[pos]], dtype=np.int32),
+                           _categorical_from_logits(row))
+                pos += 1
+            del np_logits, logits  # release before the next forward call
+
+        ac_bytes = np.array(enc.get_compressed(), dtype=np.uint32).tobytes()
+
+        # Force the torch CUDA allocator to return cached memory across chunks
+        # (otherwise the cache drifts upward over a long compress run).
         try:
             import torch
             if torch.cuda.is_available():
@@ -224,35 +245,6 @@ class InferenceEngine:
         text = self._tokenizer.decode(tokens)
         result = text.encode("utf-8")
         return result[:orig_len]
-
-    def _forward_logits(self, tokens: list[int]) -> np.ndarray:
-        """
-        Compute logits[i] = prediction for tokens[i] given prefix
-        [BOS, tokens[0], ..., tokens[i-1]].
-
-        Sequence-forward (batched within the WKV kernel's T_MAX = 1024)
-        with a pre-allocated destination so we don't pay the np.concatenate
-        doubling — at 50K vocab × float32 each chunk's logits is already
-        large; concatenating would peak at 2× before the source list goes
-        out of scope.
-        """
-        SEQ_BATCH = int(os.environ.get("KRUNCH_FORWARD_BATCH", 1024))
-        full_input = [BOS_TOKEN] + tokens[:-1]  # length N
-        n = len(full_input)
-        state = None
-        result: Optional[np.ndarray] = None  # lazy-allocated on first batch
-        written = 0
-        for i in range(0, n, SEQ_BATCH):
-            batch = full_input[i:i + SEQ_BATCH]
-            logits, state = self._model.forward(batch, state, full_output=True)
-            chunk_np = _to_numpy(logits)  # (B, vocab)
-            if result is None:
-                result = np.empty((n, chunk_np.shape[1]), dtype=np.float32)
-            result[written:written + chunk_np.shape[0]] = chunk_np
-            written += chunk_np.shape[0]
-            del chunk_np, logits  # release fp16/fp32 temporaries promptly
-        assert result is not None and written == n
-        return result
 
 
 def _to_numpy(t) -> np.ndarray:
