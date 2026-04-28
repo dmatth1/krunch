@@ -15,6 +15,10 @@ Run on any host with an NVIDIA GPU + Docker:
 curl -fsSL https://raw.githubusercontent.com/dmatth1/krunch/main/install.sh | sudo bash
 
 # 2. Use it (instant — image is cached)
+krunch compress   data.jsonl  -o data.krunch
+krunch decompress data.krunch -o data.jsonl
+
+# Or pipe-style (Unix idiom)
 krunch compress   < data.jsonl  > data.krunch
 krunch decompress < data.krunch > data.jsonl
 ```

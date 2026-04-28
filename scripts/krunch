@@ -9,7 +9,7 @@ Commands:
   krunch status      --job-id ID                             Check Batch job status
 
 `compress` / `decompress` shell out to Docker. Default image is
-ghcr.io/dmatth1/krunch:v1; override with KRUNCH_IMAGE env var.
+ghcr.io/dmatth1/krunch:latest; override with KRUNCH_IMAGE env var.
 
 `submit` requires boto3 + AWS credentials with Batch + S3 permissions.
 """
@@ -21,7 +21,7 @@ import subprocess
 import sys
 import time
 
-DEFAULT_IMAGE = os.environ.get("KRUNCH_IMAGE", "ghcr.io/dmatth1/krunch:v1")
+DEFAULT_IMAGE = os.environ.get("KRUNCH_IMAGE", "ghcr.io/dmatth1/krunch:latest")
 
 
 # ---------------------------------------------------------------------------
@@ -40,14 +40,48 @@ def _run_local(action: str, args) -> int:
     if not _has_docker():
         print("Error: docker not found on PATH", file=sys.stderr)
         return 1
-    if args.dry_run:
-        print(f"docker run --rm --gpus all -i {DEFAULT_IMAGE} {action}")
-        return 0
+
     cmd = ["docker", "run", "--rm", "--gpus", "all", "-i", DEFAULT_IMAGE, action]
+    stdin_src = sys.stdin
+    stdout_dst = sys.stdout
+    in_handle = None
+    out_handle = None
+
+    # Optional positional input file: `krunch compress data.jsonl`
+    if args.input:
+        try:
+            in_handle = open(args.input, "rb")
+            stdin_src = in_handle
+        except OSError as e:
+            print(f"Error: cannot open input '{args.input}': {e}", file=sys.stderr)
+            return 1
+
+    # Optional -o output file: `krunch compress data.jsonl -o data.krunch`
+    if args.out:
+        try:
+            out_handle = open(args.out, "wb")
+            stdout_dst = out_handle
+        except OSError as e:
+            print(f"Error: cannot open output '{args.out}': {e}", file=sys.stderr)
+            if in_handle: in_handle.close()
+            return 1
+
+    if args.dry_run:
+        in_label = args.input or "<stdin>"
+        out_label = args.out or "<stdout>"
+        print(f"docker run --rm --gpus all -i {DEFAULT_IMAGE} {action}  "
+              f"# stdin={in_label}, stdout={out_label}")
+        if in_handle: in_handle.close()
+        if out_handle: out_handle.close()
+        return 0
+
     try:
-        return subprocess.run(cmd).returncode
+        return subprocess.run(cmd, stdin=stdin_src, stdout=stdout_dst).returncode
     except KeyboardInterrupt:
         return 130
+    finally:
+        if in_handle: in_handle.close()
+        if out_handle: out_handle.close()
 
 
 def _has_docker() -> bool:
@@ -285,8 +319,12 @@ def main():
     for action in ("compress", "decompress"):
         p = sub.add_parser(
             action,
-            help=f"{action.capitalize()} stdin → stdout (single GPU host via Docker)",
+            help=f"{action.capitalize()} a file (single GPU host via Docker)",
         )
+        p.add_argument("input", nargs="?", default=None,
+                       help="Input file (default: stdin)")
+        p.add_argument("-o", "--out", default=None,
+                       help="Output file (default: stdout)")
         p.add_argument("--dry-run", action="store_true",
                        help="Print the docker command instead of running it")
 
