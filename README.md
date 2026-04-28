@@ -84,63 +84,41 @@ KB/s** on A10G fp16, byte-exact decompression.
 | nginx logs | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
 | The Stack (Python) | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
 
-## Throughput
+## Throughput vs total CUDA cores in the fleet
 
-### Single-worker absolute throughput by GPU type
+Compression chunks are independent, so aggregate throughput scales
+linearly with parallel CUDA cores — you can move right on the chart
+either by adding workers (`--workers N`) or by picking a GPU with
+more cores per chip. Both knobs end up at the same place.
 
-> *To be filled in. Need: compress + decompress KB/s for one g{5,6e}.xlarge
-> instance on a fixed 1 GB sample. Same image, same chunk size (1 MB).
-> Hardware differs — more CUDA cores + faster memory bandwidth = more
-> KB/s per worker.*
-
-| GPU | CUDA cores | compress (KB/s) | decompress (KB/s) | $/hr (spot us-east-1) |
-|---|---|---|---|---|
-| A10G (g5.xlarge) | 9,216 | _tbd_ | _tbd_ | ~$0.30 |
-| L4 (g6.xlarge) | 7,680 | _tbd_ | _tbd_ | ~$0.30 |
-| L40S (g6e.xlarge) | 18,176 | _tbd_ | _tbd_ | ~$0.90 |
-| A100 40GB (p4d.24xlarge, 1 GPU) | 6,912 + tensor | _tbd_ | _tbd_ | ~$3.40 |
-| H100 80GB (p5.48xlarge, 1 GPU) | 16,896 + tensor | _tbd_ | _tbd_ | ~$5.50 |
-
-### Single-GPU throughput vs batch size
-
-> *To be filled in. Need: decompress KB/s on a single A10G as we vary*
-> *the cross-chunk batch size (`KRUNCH_DECOMPRESS_BATCH ∈ {1, 4, 8, 16, 32}`).*
-> *Bigger batches keep more CUDA cores active per kernel launch — should*
-> *scale near-linearly until either GPU memory or per-batch state*
-> *bookkeeping overhead bites.*
-
-| batch | A10G decompress (KB/s) |
-|---|---|
-| 1 (current) | _tbd_ |
-| 4 | _tbd_ |
-| 8 | _tbd_ |
-| 16 | _tbd_ |
-| 32 | _tbd_ |
-
-### Scaling across workers (`krunch submit --workers N`)
-
-> *To be filled in. Need: aggregate compress + decompress KB/s on a*
-> *fixed corpus (~10 GB) at `--workers ∈ {1, 2, 4, 8, 16, 32}` on a*
-> *g5.xlarge Batch fleet. Expect near-linear scaling for both — chunks*
-> *are independent, the only coordination is the final assemble step.*
+> *To be filled in. Need: compress + decompress KB/s on a fixed corpus*
+> *(~10 GB) at several fleet sizes. Mix configurations to span the*
+> *x-axis: e.g., 1× g5.xlarge (9k cores), 1× g6e.xlarge (18k), 4×*
+> *g5.xlarge (37k), 8× g5.xlarge (74k), 1× p5.48xlarge (135k).*
 
 ```
   aggregate KB/s
-    │
-    │                                            compress  ●━━━━━━━●
-    │                                               ●━━━━━━━●
-    │                                       decompress ●━━━●
-    │                                ●━━━━━━━●
-    │                          ●━━━●
-    │                ●━━━●
-    │           ●━━━●
-    │      ●━━━●
-    │  ●━━━●
-    └──┬──┬──┬──┬──┬──┬──→  workers
-       1  2  4  8  16 32
+    │                                            compress
+    │                                                ●  (tbd)
+    │                                          ●━━━━━━●
+    │                                     ●━━●
+    │                                ●━━●            decompress
+    │                          ●━━●                       ●  (tbd)
+    │                ●━━●                            ●━━━━━━●
+    │           ●━━━●                           ●━━●
+    │      ●━━━●                            ●━━●
+    │  ●━━━●                            ●━●
+    └──┬──────┬──────┬──────┬──────┬──────→  total CUDA cores in the fleet
+       9k    18k    37k    74k    135k
+       1×    1×     4×     8×     1×
+       g5    g6e    g5     g5     p5
+       .x    .x     .x     .x     .48x
 ```
 
-Each `●` is `_tbd_` until measured.
+Each `●` is `_tbd_` until measured. The fleet-size column under the
+x-axis shows one example configuration that lands at that core count;
+others (e.g. 2× g6e or 4× g6) reach similar core totals and should
+land on the same line.
 
 ## When *not* to use krunch
 
