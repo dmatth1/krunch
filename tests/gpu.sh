@@ -32,7 +32,7 @@ INSTANCE_PROFILE="${KRUNCH_INSTANCE_PROFILE:?KRUNCH_INSTANCE_PROFILE env var req
 
 S3_PREFIX="krunch-tier3"
 SAMPLE_LOCAL="data/spike6/wildchat_en_content.content.bin"
-SAMPLE_LIMIT_MB=100
+SAMPLE_LIMIT_MB="${KRUNCH_SAMPLE_MB:-100}"
 LOCAL_BUILD="${KRUNCH_LOCAL_BUILD:-0}"
 KRUNCH_IMAGE_TAG="${KRUNCH_IMAGE:-ghcr.io/dmatth1/krunch:latest}"
 TEST_TAG="$(date +%Y%m%d-%H%M%S)"
