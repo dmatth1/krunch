@@ -63,6 +63,47 @@ Architecture validated on real GPU: ratio **0.111** on WildChat-English
 (vs zstd-22's 0.167 — a 33% reduction), compress throughput **≥ 800
 KB/s** on A10G fp16, byte-exact decompression.
 
+## Ratio comparisons
+
+> *To be filled in. Need: krunch vs zstd-22 vs bzip3 on at least —*
+> *WildChat-English (chat / dialogue), enwik8 / enwik9 (Wikipedia), a*
+> *log corpus (e.g. nginx or HDFS), and a code corpus (e.g. The Stack*
+> *Python subset). All numbers from a single g5.xlarge run with the*
+> *published `:latest` image, sample size ≥ 100 MB per corpus.*
+
+| corpus | krunch | zstd-22 | bzip3 | krunch vs zstd |
+|---|---|---|---|---|
+| WildChat-English | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
+| enwik8 | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
+| enwik9 | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
+| nginx logs | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
+| The Stack (Python) | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
+
+## Throughput scaling with `krunch submit --workers N`
+
+> *To be filled in. Need: aggregate compress throughput on a fixed*
+> *corpus (~10 GB) at `--workers ∈ {1, 2, 4, 8, 16, 32}` on a g5.xlarge*
+> *Batch fleet. Expect a near-linear line (chunks are independent, no*
+> *coordination overhead until the assemble step).*
+
+```
+  aggregate compress KB/s
+    │
+    │
+    │                                                      ●  (tbd)
+    │
+    │                                          ●  (tbd)
+    │
+    │                              ●  (tbd)
+    │
+    │                  ●  (tbd)
+    │
+    │      ●  (tbd)
+    │  ●  (tbd)
+    └──┬──┬──┬──┬──┬──┬──→  workers
+       1  2  4  8  16 32
+```
+
 ## When *not* to use krunch
 
 Krunch is a neural compressor for text. 
