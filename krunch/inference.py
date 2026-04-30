@@ -299,14 +299,28 @@ class InferenceEngine:
         import krunch_ac_cuda
         from krunch import cpp_path
 
+        prof = os.environ.get("KRUNCH_CPP_PROFILE") == "1"
+        if prof:
+            import time as _time
+            torch.cuda.synchronize()
+            t0 = _time.time()
+
         weights = cpp_path.init_weights(self._model, self._device)
+        if prof:
+            torch.cuda.synchronize(); t1 = _time.time()
         full_input = [BOS_TOKEN] + tokens[:-1]
         T = len(full_input)
         state = cpp_path.fresh_state(weights)
+        if prof:
+            torch.cuda.synchronize(); t2 = _time.time()
 
         with torch.no_grad():
             logits = cpp_path.forward_packed(weights, full_input, state)
+            if prof:
+                torch.cuda.synchronize(); t3 = _time.time()
             cdfs = cpp_path.softmax_cdfs_per_row(logits)  # [T, V+1]
+            if prof:
+                torch.cuda.synchronize(); t4 = _time.time()
 
         cap = max(len(data) * 2, 64 << 10)
         output_buf = torch.zeros(cap, dtype=torch.uint8, device=self._device)
@@ -318,10 +332,19 @@ class InferenceEngine:
         krunch_ac_cuda.encode_step(cdfs, symbols, output_buf, ac_state)
         krunch_ac_cuda.encode_finalize(output_buf, ac_state)
         torch.cuda.synchronize()
+        if prof:
+            t5 = _time.time()
 
         bit_offset = int(ac_state[3].item())
         n_bytes = (bit_offset + 7) // 8
         ac_bytes = bytes(output_buf[:n_bytes].cpu().numpy())
+        if prof:
+            t6 = _time.time()
+            logger.info(
+                "cpp_compress T=%d: weights=%.1fms state_init=%.1fms "
+                "forward=%.1fms cdf=%.1fms ac=%.1fms copy=%.1fms total=%.1fms",
+                T, (t1-t0)*1000, (t2-t1)*1000, (t3-t2)*1000,
+                (t4-t3)*1000, (t5-t4)*1000, (t6-t5)*1000, (t6-t0)*1000)
         try:
             torch.cuda.empty_cache()
         except Exception:

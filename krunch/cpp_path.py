@@ -112,12 +112,11 @@ def forward_packed(weights: dict, input_ids, state):
             state[0][i], state[1][i], state[2][i], state[3][i], state[4][i],
             *layers[i],
         )
-    # Per-row ln_out + det_matmul to match decoder shape exactly.
-    x_flat = x.view(T, n_embd)
-    xn = torch.cat([
-        F.layer_norm(x_flat[t:t+1], (n_embd,), weight=ln_out_w, bias=ln_out_b)
-        for t in range(T)
-    ], dim=0)
+    # Batched ln_out — verified shape-stable in
+    # test_full_model_packed_vs_stepped.py: "ln_out batched vs per-row
+    # diff: 0.000000e+00" across T=31 with real RWKV-4 weights.
+    x_flat = x.view(T, n_embd).contiguous()
+    xn = F.layer_norm(x_flat, (n_embd,), weight=ln_out_w, bias=ln_out_b)
     logits = krunch_ac_cuda.det_matmul(xn.contiguous(), head_w.contiguous())
     return logits  # [T, V]
 

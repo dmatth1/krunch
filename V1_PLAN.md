@@ -756,12 +756,31 @@ Scaffolding in `krunch_ac/cuda/rwkv_step.cu`. Plan, ~1-2 weeks:
    ```
    Ratio_dec/enc collapsed from 30–68× → 12×. But two regressions
    surfaced:
-   1. **Encode 4× slower than stock** at 32 KB (10.1 vs 44.1 KB/s).
-      Was 7× slower; closed by batched det_softmax_cdf kernel
-      (`krunch_ac/cuda/det_softmax_cdf.cu`, +60% encoder speedup,
-      bit-stable across [T,V] vs [1,V] invocation). Remaining
-      overhead is the C++ packed forward itself + per-call Python
-      orchestration.
+   1. **Encode 4× slower than stock** at 32 KB (10.4 vs 44.1 KB/s).
+      Was 7× slower; closed somewhat by batched det_softmax_cdf
+      kernel (`krunch_ac/cuda/det_softmax_cdf.cu`, +60% encoder
+      speedup, bit-stable across [T,V] vs [1,V] invocation).
+
+      **Profiling (KRUNCH_CPP_PROFILE=1) at T=6360 / 32 KB chunk:**
+      ```
+      forward    2969.7 ms  (97%)
+      cdf          75.1 ms
+      ac            5.1 ms
+      total      3051.0 ms
+      ```
+      The C++ packed forward is the bottleneck, not anything around
+      it. Cause: `det_matmul.cu` uses one thread per output element
+      with a serial fp32 K-loop — no Tensor Cores. At M=6360 K=768,
+      this is dramatically slower than cuBLAS's TC-accelerated GEMM.
+      cuBLAS gives the speed but is shape-dependent (different
+      algo for M=1 vs M=6360 → fp16 drift breaks AC roundtrip).
+
+      **Fix:** rewrite `det_matmul` to use Tensor Cores via the
+      WMMA / `mma.sync` API. Bit-invariant across M is achievable
+      by always using the same block tile schedule + the same
+      reduction order; this is what makes WMMA a viable
+      replacement (unlike cuBLAS which auto-selects). Estimated 2-4
+      days of careful CUDA work + verification it stays bit-stable.
    2. ~~**Ratio degraded ~20%**~~ — initially flagged as a
       regression, but the "stock" baseline number is meaningless: the
       stock path FAILS roundtrip (the comparison row in the bench

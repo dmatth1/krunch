@@ -25,6 +25,11 @@ void launch_relu_sq(void*, int, cudaStream_t);
 // Deterministic matmul — see det_matmul.cu.
 void launch_det_matmul(const void* x, const void* W, void* y,
                         int write_fp32, int M, int K, int N, cudaStream_t stream);
+// Tensor-Core-accelerated deterministic matmul — see det_matmul_tc.cu.
+// Requires M to be a multiple of 16 (caller must pad).
+void launch_det_matmul_tc(const void* A, const void* B, void* C,
+                           int write_fp32, int M, int K, int N,
+                           cudaStream_t stream);
 // Deterministic softmax + CDF — see det_softmax_cdf.cu.
 void launch_det_softmax_cdf(const void* logits, void* cdf,
                              int T, int V, int cdf_T_value,
@@ -56,8 +61,11 @@ static at::Tensor gemm_fp16(at::Tensor x, at::Tensor w,
     if (USE_DET) {
         cudaStream_t stream = at::cuda::getCurrentCUDAStream();
         const int write_fp32 = (dtype == at::kFloat) ? 1 : 0;
-        launch_det_matmul(x_c.data_ptr(), w_c.data_ptr(), out.data_ptr(),
-                           write_fp32, M, K, N, stream);
+        // Always use TC kernel (handles arbitrary M/N via shared-mem
+        // staging with bounds checks). Bit-identical across M because
+        // tile schedule + K-loop order are fixed.
+        launch_det_matmul_tc(x_c.data_ptr(), w_c.data_ptr(),
+                              out.data_ptr(), write_fp32, M, K, N, stream);
     } else {
         static auto op = c10::Dispatcher::singleton()
             .findSchemaOrThrow("rwkv::gemm_fp16_cublas", "")
