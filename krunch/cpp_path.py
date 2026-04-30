@@ -150,25 +150,22 @@ def forward_stepped(weights: dict, last_token: int, state):
 
 
 def softmax_cdfs_per_row(logits_TxV):
-    """Per-row softmax + CDF — bit-identical to decoder's [1,V] path
-    even when logits are [T,V]. Cost: T Python iterations.
-    """
-    import torch
-    from krunch_ac.gpu_encode import probs_to_cdf_gpu
-    T = int(logits_TxV.shape[0])
-    cdf_rows = []
-    for t in range(T):
-        p = torch.softmax(logits_TxV[t:t+1].float(), dim=-1)
-        cdf_rows.append(probs_to_cdf_gpu(p).contiguous())
-    return torch.cat(cdf_rows, dim=0).contiguous()  # [T, V+1]
+    """Batched softmax + CDF via det_softmax_cdf kernel.
+    Bit-identical between [T,V] and [1,V] invocation (verified) so
+    encoder and decoder produce the same CDFs. ~20× faster than the
+    per-row Python loop on T=1024."""
+    import krunch_ac_cuda
+    from krunch_ac.cdf import T as CDF_T
+    return krunch_ac_cuda.det_softmax_cdf(logits_TxV.contiguous(), CDF_T)
 
 
 def softmax_cdf_one_row(logits_V):
     """Single-row softmax + CDF for the stepped decoder path."""
-    import torch
-    from krunch_ac.gpu_encode import probs_to_cdf_gpu
-    p = torch.softmax(logits_V.float().reshape(1, -1), dim=-1)
-    return probs_to_cdf_gpu(p)[0].contiguous()
+    import krunch_ac_cuda
+    from krunch_ac.cdf import T as CDF_T
+    cdf = krunch_ac_cuda.det_softmax_cdf(
+        logits_V.reshape(1, -1).contiguous(), CDF_T)
+    return cdf[0].contiguous()
 
 
 def cpp_path_enabled() -> bool:

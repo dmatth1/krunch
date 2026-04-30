@@ -756,9 +756,12 @@ Scaffolding in `krunch_ac/cuda/rwkv_step.cu`. Plan, ~1-2 weeks:
    ```
    Ratio_dec/enc collapsed from 30–68× → 12×. But two regressions
    surfaced:
-   1. **Encode 7× slower than stock** at 32 KB (6.3 vs 44.5 KB/s).
-      Cause: per-row Python softmax+CDF loop runs ~8K times.
-      Fix: write a batched deterministic softmax kernel.
+   1. **Encode 4× slower than stock** at 32 KB (10.1 vs 44.1 KB/s).
+      Was 7× slower; closed by batched det_softmax_cdf kernel
+      (`krunch_ac/cuda/det_softmax_cdf.cu`, +60% encoder speedup,
+      bit-stable across [T,V] vs [1,V] invocation). Remaining
+      overhead is the C++ packed forward itself + per-call Python
+      orchestration.
    2. ~~**Ratio degraded ~20%**~~ — initially flagged as a
       regression, but the "stock" baseline number is meaningless: the
       stock path FAILS roundtrip (the comparison row in the bench

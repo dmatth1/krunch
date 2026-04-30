@@ -25,6 +25,10 @@ void launch_relu_sq(void*, int, cudaStream_t);
 // Deterministic matmul — see det_matmul.cu.
 void launch_det_matmul(const void* x, const void* W, void* y,
                         int write_fp32, int M, int K, int N, cudaStream_t stream);
+// Deterministic softmax + CDF — see det_softmax_cdf.cu.
+void launch_det_softmax_cdf(const void* logits, void* cdf,
+                             int T, int V, int cdf_T_value,
+                             cudaStream_t stream);
 }
 
 // Match BlinkDL's matmul exactly: call rwkv::gemm_fp16_cublas via the
@@ -390,4 +394,16 @@ void register_layer_cpp(pybind11::module& m) {
           "Deterministic shape-invariant matmul: y = x @ W.",
           pybind11::arg("x"), pybind11::arg("W"),
           pybind11::arg("out_dtype") = c10::nullopt);
+    m.def("det_softmax_cdf", [](at::Tensor logits_TxV, int cdf_T_value) {
+        TORCH_CHECK(logits_TxV.dim() == 2 && logits_TxV.scalar_type() == at::kHalf);
+        auto x = logits_TxV.contiguous();
+        const int T = (int)x.size(0);
+        const int V = (int)x.size(1);
+        auto out = at::empty({T, V + 1}, x.options().dtype(at::kInt));
+        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+        launch_det_softmax_cdf(x.data_ptr(), out.data_ptr(),
+                                T, V, cdf_T_value, stream);
+        return out;
+    }, "Deterministic batched softmax + CDF (per-row, shape-invariant).",
+       pybind11::arg("logits"), pybind11::arg("cdf_T_value"));
 }
