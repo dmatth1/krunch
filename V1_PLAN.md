@@ -730,14 +730,22 @@ Scaffolding in `krunch_ac/cuda/rwkv_step.cu`. Plan, ~1-2 weeks:
    - **CDFs: bit-identical** through `probs_to_cdf_gpu` (per-row vs
      batched), 0/31 row mismatches.
 
-   **AC roundtrip status: progressed from FAIL@step-2 → FAIL@step-14**
-   on 32-token sequence. Model side is now provably deterministic; the
-   remaining mismatch is in the AC encode/decode kernels themselves
-   (`encode_step` batched vs row-by-row produces SAME bitstream — so
-   not a batching bug — but `decode_step` cannot fully roundtrip past
-   step 14). Next: instrument AC kernels (compare low/high/value
-   trajectory at each step encode vs decode), or compare GPU AC
-   against the Python `cpu_reference.RangeEncoder/Decoder`.
+   **AC roundtrip status: PASS — bit-exact byte-for-byte 2026-04-30.**
+   Final root cause: PyTorch's CUDA `torch.softmax(., dim=-1)` is
+   shape-dependent — `softmax([T,V])` and `softmax([1,V])` of the same
+   row don't produce bit-identical outputs (different reduction
+   strategy). Fix: encoder runs softmax row-by-row to mirror the
+   decoder's [1,V] invocation shape. Verified with synthetic CDF
+   roundtrip that the AC kernels themselves are bit-symmetric
+   (`scripts/test_ac_only_roundtrip.py`). End-to-end roundtrip on
+   32-token sample: 31 bytes (~7.75 bits/token), all tokens decoded
+   exact, 0 CDF mismatches.
+
+   **Cost:** per-row Python loop in encoder for softmax + CDF. For 32
+   tokens this is negligible; for large chunks it adds Python
+   overhead. Follow-up: write a deterministic batched softmax kernel
+   (per-row max/exp/sum in fp32 with explicit serial reduction) to
+   restore batched encoder throughput without breaking bit-exactness.
 
    Files added/modified:
    - NEW `krunch_ac/cuda/det_matmul.cu`

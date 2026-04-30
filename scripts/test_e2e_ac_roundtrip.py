@@ -119,8 +119,16 @@ def main():
     # Deterministic head matmul: cuBLAS picks different algos at T=N vs T=1
     # so we use the bit-invariant kernel here too.
     logits_enc = krunch_ac_cuda.det_matmul(x_norm.contiguous(), head_w.contiguous())  # [T, V]
-    probs_enc = torch.softmax(logits_enc.float(), dim=-1)
-    cdfs_enc = probs_to_cdf_gpu(probs_enc).contiguous()  # [T, V+1]
+    # Per-row softmax + per-row CDF: matches decoder's [1, V] invocation
+    # shape exactly. Avoids any shape-dependent reduction strategy.
+    probs_rows = []
+    cdf_rows = []
+    for t in range(T):
+        p_t = torch.softmax(logits_enc[t:t+1].float(), dim=-1)
+        probs_rows.append(p_t)
+        cdf_rows.append(probs_to_cdf_gpu(p_t).contiguous())
+    probs_enc = torch.cat(probs_rows, dim=0)
+    cdfs_enc = torch.cat(cdf_rows, dim=0).contiguous()  # [T, V+1]
 
     # GPU AC encode — call row-by-row to mirror the per-token decode path.
     # encode_step batched and decode_step single-row may not be bit-symmetric.
@@ -161,6 +169,11 @@ def main():
         logits_d = krunch_ac_cuda.det_matmul(x_norm.contiguous(), head_w.contiguous()).flatten()
         probs_d = torch.softmax(logits_d.float().reshape(1, -1), dim=-1)
         cdf_row = probs_to_cdf_gpu(probs_d)[0].contiguous()
+        # DIAG: compare decoder's CDF against encoder's per-step CDF.
+        cdf_enc_row = cdfs_enc[step].contiguous()
+        cdf_diff = (cdf_row.long() - cdf_enc_row.long()).abs().max().item()
+        if cdf_diff != 0:
+            print(f"  step {step}: cdf_diff={cdf_diff} (encoder vs decoder)", flush=True)
         krunch_ac_cuda.decode_step(cdf_row, input_buf, ac_state_d, out_sym)
         tok = int(out_sym.item())
         decoded.append(tok)
