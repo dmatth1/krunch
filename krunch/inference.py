@@ -211,16 +211,24 @@ class InferenceEngine:
         per batch (was the v1 bottleneck — 200 MB/batch × ~25K batches
         = 5 TB cross-PCIe).
 
+        With KRUNCH_CPP_PATH=1 (and KRUNCH_DETERMINISTIC_MATMUL=1):
+        uses the bit-exact C++ orchestration path so the bitstream is
+        byte-identical to what `decompress_chunk` reproduces stepped.
+
         Peak memory: O(SEQ_BATCH × vocab) for probs + ~200 MB for CDF.
         """
         import torch
         import krunch_ac_cuda
         from krunch_ac.gpu_encode import probs_to_cdf_gpu
+        from krunch import cpp_path
 
         text = data.decode("utf-8", errors="replace")
         tokens = self._tokenizer.encode(text).ids
         if len(tokens) < 1:
             raise ValueError("chunk has no tokens after tokenization")
+
+        if cpp_path.cpp_path_enabled():
+            return self._compress_chunk_cpp(data, tokens)
 
         SEQ_BATCH = int(os.environ.get("KRUNCH_FORWARD_BATCH", 1024))
         full_input = [BOS_TOKEN] + tokens[:-1]
@@ -282,6 +290,76 @@ class InferenceEngine:
         mini_header = struct.pack(">II", len(data), len(tokens))
         return mini_header + ac_bytes
 
+    def _compress_chunk_cpp(self, data: bytes, tokens: list[int]) -> bytes:
+        """Bit-exact C++ orchestration path. Encoder runs all 12 layers
+        packed (one shot), then per-row softmax+CDF + batched GPU AC
+        encode. Output bitstream is byte-identical to what
+        `_decompress_chunk_cpp` reproduces stepped."""
+        import torch
+        import krunch_ac_cuda
+        from krunch import cpp_path
+
+        weights = cpp_path.init_weights(self._model, self._device)
+        full_input = [BOS_TOKEN] + tokens[:-1]
+        T = len(full_input)
+        state = cpp_path.fresh_state(weights)
+
+        with torch.no_grad():
+            logits = cpp_path.forward_packed(weights, full_input, state)
+            cdfs = cpp_path.softmax_cdfs_per_row(logits)  # [T, V+1]
+
+        cap = max(len(data) * 2, 64 << 10)
+        output_buf = torch.zeros(cap, dtype=torch.uint8, device=self._device)
+        ac_state = torch.zeros(4, dtype=torch.uint32, device=self._device)
+        ac_state[1] = 0xFFFFFFFF
+        symbols = torch.as_tensor(tokens, dtype=torch.int32, device=self._device).contiguous()
+        # Batched encode is bit-symmetric to row-by-row decode (verified
+        # in scripts/test_ac_only_roundtrip.py) — keep batched for speed.
+        krunch_ac_cuda.encode_step(cdfs, symbols, output_buf, ac_state)
+        krunch_ac_cuda.encode_finalize(output_buf, ac_state)
+        torch.cuda.synchronize()
+
+        bit_offset = int(ac_state[3].item())
+        n_bytes = (bit_offset + 7) // 8
+        ac_bytes = bytes(output_buf[:n_bytes].cpu().numpy())
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        mini_header = struct.pack(">II", len(data), len(tokens))
+        return mini_header + ac_bytes
+
+    def _decompress_chunk_cpp(self, encoded: bytes, orig_len: int,
+                                n_tokens: int, bitstream: bytes) -> bytes:
+        """Bit-exact C++ orchestration path. Stepped forward per token,
+        per-row softmax+CDF, GPU AC decode."""
+        import torch
+        import krunch_ac_cuda
+        from krunch import cpp_path
+
+        weights = cpp_path.init_weights(self._model, self._device)
+        state = cpp_path.fresh_state(weights)
+
+        bs_padded = bitstream + b"\x00" * 64
+        input_buf = torch.frombuffer(bytearray(bs_padded), dtype=torch.uint8).to(self._device)
+        ac_state = torch.zeros(4, dtype=torch.uint32, device=self._device)
+        out_sym = torch.empty(1, dtype=torch.int32, device=self._device)
+        krunch_ac_cuda.decode_init(input_buf, ac_state)
+
+        tokens: list[int] = []
+        last = BOS_TOKEN
+        with torch.no_grad():
+            for _ in range(n_tokens):
+                logits = cpp_path.forward_stepped(weights, last, state)
+                cdf_row = cpp_path.softmax_cdf_one_row(logits)
+                krunch_ac_cuda.decode_step(cdf_row, input_buf, ac_state, out_sym)
+                tok = int(out_sym.item())
+                tokens.append(tok)
+                last = tok
+
+        text = self._tokenizer.decode(tokens)
+        return text.encode("utf-8")[:orig_len]
+
     def decompress_chunk(self, encoded: bytes) -> bytes:
         """Decompress a single AC-encoded chunk produced by compress_chunk.
 
@@ -296,9 +374,13 @@ class InferenceEngine:
         import torch
         import krunch_ac_cuda
         from krunch_ac.gpu_encode import probs_to_cdf_gpu
+        from krunch import cpp_path
 
         orig_len, n_tokens = struct.unpack(">II", encoded[:8])
         bitstream = encoded[8:]
+
+        if cpp_path.cpp_path_enabled():
+            return self._decompress_chunk_cpp(encoded, orig_len, n_tokens, bitstream)
 
         # Pad the bitstream so over-reads at the last-token renorm don't
         # walk off the end. PRECISION extra bits is safe.
@@ -308,23 +390,228 @@ class InferenceEngine:
         out_sym = torch.empty(1, dtype=torch.int32, device=self._device)
         krunch_ac_cuda.decode_init(input_buf, ac_state)
 
+        # Optional: torch.compile the per-step forward (idea I in V1_PLAN).
+        # Goal: pay launch overhead once at compile, then replay the captured
+        # graph per step. Toggle via KRUNCH_DECOMPRESS_COMPILE=1. Falls back
+        # silently to eager if rwkv's forward graph-breaks. mode=
+        # "reduce-overhead" enables CUDA graphs trees automatically.
+        compile_fwd = os.environ.get("KRUNCH_DECOMPRESS_COMPILE") == "1"
+        if compile_fwd and not hasattr(self, "_compiled_forward"):
+            try:
+                fwd = self._model.forward
+                self._compiled_forward = torch.compile(
+                    fwd, mode="reduce-overhead", fullgraph=False, dynamic=False)
+                logger.info("decompress: torch.compile enabled on per-step forward")
+            except Exception as e:
+                logger.warning("decompress: torch.compile setup failed: %s", e)
+                self._compiled_forward = self._model.forward
+
+        # Optional: record top-K(logits) vs actual-decoded-token to measure
+        # self-speculation acceptance rate (idea G in V1_PLAN). Off by
+        # default — KRUNCH_DECOMPRESS_INSTRUMENT=1 to enable. This adds one
+        # GPU sync per step; measurement run only.
+        instrument = os.environ.get("KRUNCH_DECOMPRESS_INSTRUMENT") == "1"
+        if instrument:
+            top1_matches = 0
+            top2_matches = 0
+            top4_matches = 0
+            top8_matches = 0
+
         tokens: list[int] = []
         rwkv_state = None
         last_input = BOS_TOKEN
+        forward_fn = (self._compiled_forward if compile_fwd
+                      else self._model.forward)
         for _ in range(n_tokens):
-            logits, rwkv_state = self._model.forward([last_input], rwkv_state)
+            logits, rwkv_state = forward_fn([last_input], rwkv_state)
             if not isinstance(logits, torch.Tensor):
                 logits = torch.as_tensor(logits, device=self._device)
             with torch.no_grad():
                 probs = torch.softmax(logits.float().reshape(1, -1), dim=-1)
                 cdf_row = probs_to_cdf_gpu(probs)[0].contiguous()
+                if instrument:
+                    top8 = torch.topk(probs, 8, dim=-1).indices[0].cpu().numpy()
             krunch_ac_cuda.decode_step(cdf_row, input_buf, ac_state, out_sym)
             tok = int(out_sym.item())  # forces sync; required to feed next forward
+            if instrument:
+                if tok == int(top8[0]): top1_matches += 1
+                if tok in top8[:2]: top2_matches += 1
+                if tok in top8[:4]: top4_matches += 1
+                if tok in top8[:8]: top8_matches += 1
             tokens.append(tok)
             last_input = tok
 
+        if instrument:
+            n = max(1, n_tokens)
+            logger.info(
+                "instrument: chunk %d tokens — top1=%.1f%% top2=%.1f%% top4=%.1f%% top8=%.1f%%",
+                n_tokens,
+                100 * top1_matches / n, 100 * top2_matches / n,
+                100 * top4_matches / n, 100 * top8_matches / n,
+            )
+
         text = self._tokenizer.decode(tokens)
         return text.encode("utf-8")[:orig_len]
+
+    def compress_chunks_batched(self, chunks: list[bytes]) -> list[bytes]:
+        """Compress N chunks in lockstep, B=N forward + B=N AC encode per
+        timestep. Symmetric to `decompress_chunks_batched`: identical
+        forward shape (`forward_batched`, B=N, T=1) on both sides
+        guarantees bit-equivalent logits → AC roundtrip.
+        Returns list of N compressed-chunk byte strings (mini-header + AC).
+        """
+        import torch
+        import krunch_ac_cuda
+        from krunch_ac.gpu_encode import probs_to_cdf_gpu
+        from krunch.batched_rwkv4 import init_state_batched, forward_batched
+
+        B = len(chunks)
+        if B == 0:
+            return []
+        if B == 1:
+            return [self.compress_chunk(chunks[0])]
+
+        # Tokenize each chunk separately. Pad to common length T_max with a
+        # benign pad token (BOS); past each chunk's true length we ignore
+        # the encoded bits (chunk's mini-header records its true token count).
+        per_chunk_tokens: list[list[int]] = []
+        orig_lens: list[int] = []
+        for c in chunks:
+            orig_lens.append(len(c))
+            text = c.decode("utf-8", errors="replace")
+            toks = self._tokenizer.encode(text).ids
+            if len(toks) < 1:
+                raise ValueError("chunk has no tokens after tokenization")
+            per_chunk_tokens.append(toks)
+        n_tokens_per = [len(t) for t in per_chunk_tokens]
+        T_max = max(n_tokens_per)
+
+        device = self._device
+        # Per-chunk token tensor [B, T_max], padded with BOS in the unused
+        # tail (the AC encode just ignores symbols at t >= n_tokens[i]).
+        tokens_padded = torch.full((B, T_max), BOS_TOKEN,
+                                    dtype=torch.long, device=device)
+        for i, toks in enumerate(per_chunk_tokens):
+            tokens_padded[i, :len(toks)] = torch.tensor(
+                toks, dtype=torch.long, device=device)
+        # Inputs: [BOS] + tokens[:-1]; outputs: tokens. Build by shifting.
+        inputs_padded = torch.full((B, T_max), BOS_TOKEN,
+                                    dtype=torch.long, device=device)
+        inputs_padded[:, 1:] = tokens_padded[:, :-1]
+
+        # Per-chunk output buffer: worst-case size 2× input bytes + slack.
+        per_cap = max(max(orig_lens) * 2, 64 << 10)
+        TAIL_PAD = 64
+        per_stride = per_cap + TAIL_PAD
+        # Concatenated output buffer + base offsets (matches decompress's
+        # bitstream concat layout, in reverse).
+        base_offsets = [i * per_stride for i in range(B)]
+        output_buf = torch.zeros(B * per_stride, dtype=torch.uint8, device=device)
+        base_byte_offsets = torch.tensor(base_offsets, dtype=torch.int32, device=device)
+        # Encoder states: [B, 4] uint32, low=0 high=0xFFFFFFFF pending=0 bit_offset=0
+        ac_states = torch.zeros(B * 4, dtype=torch.uint32, device=device)
+        ac_states.view(B, 4)[:, 1] = 0xFFFFFFFF
+
+        rwkv_state = init_state_batched(self._model, B, device=device)
+
+        for t in range(T_max):
+            cur_in = inputs_padded[:, t]
+            logits, rwkv_state = forward_batched(
+                self._model, cur_in.unsqueeze(1), rwkv_state, full_output=False)
+            with torch.no_grad():
+                probs = torch.softmax(logits.float(), dim=-1)
+                cdfs = probs_to_cdf_gpu(probs).contiguous()  # [B, V+1]
+            sym_t = tokens_padded[:, t].to(torch.int32).contiguous()
+            krunch_ac_cuda.encode_step_batched(
+                cdfs, sym_t, output_buf, base_byte_offsets, ac_states)
+
+        krunch_ac_cuda.encode_finalize_batched(
+            output_buf, base_byte_offsets, ac_states)
+        torch.cuda.synchronize()
+
+        # Pull bit_offsets per stream, slice output, build per-chunk results.
+        bit_offsets_cpu = ac_states.view(B, 4)[:, 3].cpu().numpy()
+        output_cpu = output_buf.cpu().numpy()
+        out: list[bytes] = []
+        for i in range(B):
+            n_bytes = int((bit_offsets_cpu[i] + 7) // 8)
+            ac_bytes = bytes(output_cpu[base_offsets[i]:base_offsets[i] + n_bytes])
+            mini_header = struct.pack(">II", orig_lens[i], n_tokens_per[i])
+            out.append(mini_header + ac_bytes)
+        return out
+
+    def decompress_chunks_batched(self, encoded_chunks: list[bytes]) -> list[bytes]:
+        """Decompress B independent chunks in lockstep, one batched forward
+        + one batched AC decode launch per timestep, with decoded symbols
+        living on the GPU between iterations. The Python loop runs `max_T`
+        times instead of `max_T × B` (cf. per-chunk path). One CPU sync at
+        the end, not per-token.
+        """
+        import torch
+        import krunch_ac_cuda
+        from krunch_ac.gpu_encode import probs_to_cdf_gpu
+        from krunch.batched_rwkv4 import init_state_batched, forward_batched
+
+        B = len(encoded_chunks)
+        if B == 0:
+            return []
+        if B == 1:
+            return [self.decompress_chunk(encoded_chunks[0])]
+
+        # Per-chunk mini-headers + bitstreams.
+        orig_lens: list[int] = []
+        n_tokens_per: list[int] = []
+        bitstreams: list[bytes] = []
+        for enc in encoded_chunks:
+            ol, nt = struct.unpack(">II", enc[:8])
+            orig_lens.append(ol)
+            n_tokens_per.append(nt)
+            bitstreams.append(enc[8:])
+        max_T = max(n_tokens_per)
+
+        # Concatenate bitstreams with per-stream byte offsets + 64-byte
+        # tail padding per stream so post-final renormalization reads
+        # don't walk into the next stream's bytes.
+        TAIL_PAD = 64
+        base_offsets: list[int] = []
+        pos = 0
+        for bs in bitstreams:
+            base_offsets.append(pos)
+            pos += len(bs) + TAIL_PAD
+        cat = bytearray(pos)
+        for off, bs in zip(base_offsets, bitstreams):
+            cat[off:off + len(bs)] = bs
+
+        device = self._device
+        input_buf = torch.frombuffer(bytes(cat), dtype=torch.uint8).clone().to(device)
+        base_byte_offsets = torch.tensor(base_offsets, dtype=torch.int32, device=device)
+        ac_states = torch.zeros(B * 4, dtype=torch.uint32, device=device)
+        krunch_ac_cuda.decode_init_batched(input_buf, base_byte_offsets, ac_states)
+
+        rwkv_state = init_state_batched(self._model, B, device=device)
+        last_input = torch.full((B,), BOS_TOKEN, dtype=torch.long, device=device)
+        out_syms = torch.empty(B, dtype=torch.int32, device=device)
+        decoded_tokens = torch.zeros((B, max_T), dtype=torch.int32, device=device)
+
+        for t in range(max_T):
+            logits, rwkv_state = forward_batched(
+                self._model, last_input.unsqueeze(1), rwkv_state, full_output=False)
+            with torch.no_grad():
+                probs = torch.softmax(logits.float(), dim=-1)
+                cdfs = probs_to_cdf_gpu(probs).contiguous()  # [B, V+1]
+            krunch_ac_cuda.decode_step_batched(
+                cdfs, input_buf, base_byte_offsets, ac_states, out_syms)
+            decoded_tokens[:, t] = out_syms
+            last_input = out_syms.long()
+
+        # Single sync at the end.
+        decoded_cpu = decoded_tokens.cpu().numpy()
+        out: list[bytes] = []
+        for i in range(B):
+            toks = decoded_cpu[i, :n_tokens_per[i]].tolist()
+            text = self._tokenizer.decode(toks)
+            out.append(text.encode("utf-8")[:orig_lens[i]])
+        return out
 
 
 def _gpu_softmax_to_numpy(logits) -> np.ndarray:
