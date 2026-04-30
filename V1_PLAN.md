@@ -747,6 +747,40 @@ Scaffolding in `krunch_ac/cuda/rwkv_step.cu`. Plan, ~1-2 weeks:
    (per-row max/exp/sum in fp32 with explicit serial reduction) to
    restore batched encoder throughput without breaking bit-exactness.
 
+   **End-to-end engine roundtrip via cpp_path (T4, 2026-04-30):**
+   ```
+   8 KB  : C++  enc 6.5 KB/s  dec 0.5 KB/s  ratio 0.055  PASS bit-exact
+   8 KB  : stck enc 1.1 KB/s  dec 0.6 KB/s  ratio 0.044  (no roundtrip)
+   32 KB : C++  enc 6.3 KB/s  dec 0.5 KB/s  ratio 0.084  PASS bit-exact
+   32 KB : stck enc 44.5 KB/s dec 0.7 KB/s  ratio 0.070  (no roundtrip)
+   ```
+   Ratio_dec/enc collapsed from 30–68× → 12×. But two regressions
+   surfaced:
+   1. **Encode 7× slower than stock** at 32 KB (6.3 vs 44.5 KB/s).
+      Cause: per-row Python softmax+CDF loop runs ~8K times.
+      Fix: write a batched deterministic softmax kernel.
+   2. **Ratio degraded ~20%** (0.084 vs 0.070 at 32 KB) — exceeds
+      the user's <0.1% tolerance. Cause: det_matmul produces
+      slightly different (not just shape-invariant) logits than
+      tuned cuBLAS, which translates to less-peaked posteriors and
+      worse coding.
+
+   Decompress speed unchanged from stock (0.5 vs 0.7 KB/s) — the
+   per-token forward+sync floor is what actually bounds decode, and
+   we haven't attacked that yet (CUDA graphs around the stepped C++
+   path + worker pool are the next levers).
+
+   **Next concrete steps:**
+   1. Investigate ratio gap: does dropping fp32-accumulate to a
+      different scheme (e.g., Kahan, or pairwise reduction) close
+      it, or is fp16-output the floor? Try fp32 output + post-cast
+      after the head only (head computes more carefully than mid
+      layers).
+   2. Deterministic batched softmax+CDF kernel — kill the per-row
+      Python loop, restore batched encoder speed.
+   3. CUDA graph the per-token C++ stepped path so decode latency
+      drops below ~200 us/token.
+
    Files added/modified:
    - NEW `krunch_ac/cuda/det_matmul.cu`
    - MOD `krunch_ac/cuda/layer_cpp.cpp` (env-toggle gemm + unified t1
