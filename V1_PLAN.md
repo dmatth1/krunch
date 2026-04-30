@@ -789,7 +789,15 @@ Scaffolding in `krunch_ac/cuda/rwkv_step.cu`. Plan, ~1-2 weeks:
    2. Deterministic batched softmax+CDF kernel — kill the per-row
       Python loop, restore batched encoder speed.
    3. CUDA graph the per-token C++ stepped path so decode latency
-      drops below ~200 us/token.
+      drops below ~200 us/token. **Started, not landed.** Wired in
+      `cpp_path.forward_stepped_graphed` + `KRUNCH_CPP_GRAPH=1`
+      toggle. Roundtrip FAILS with the toggle on: existing C++
+      wrapper `rwkv4_layer_step_cpp_graphed` runs 2 warmup forwards
+      that mutate the shared state tensors before capture, so the
+      first decode token sees state advanced 3× instead of 1×. Fix
+      is to split warmup from capture in the C++ side (or
+      capture from Python with torch.cuda.graph against
+      non-state-mutating wrappers). Half-day item; deferred.
 
    Files added/modified:
    - NEW `krunch_ac/cuda/det_matmul.cu`

@@ -348,9 +348,15 @@ class InferenceEngine:
 
         tokens: list[int] = []
         last = BOS_TOKEN
+        # KRUNCH_CPP_GRAPH=1 enables CUDA-graph-captured per-layer
+        # forward. First call per layer captures, subsequent calls
+        # replay one graph (saves ~12× ATen launch overhead).
+        use_graph = os.environ.get("KRUNCH_CPP_GRAPH", "0") == "1"
+        fwd = (cpp_path.forward_stepped_graphed if use_graph
+               else cpp_path.forward_stepped)
         with torch.no_grad():
             for _ in range(n_tokens):
-                logits = cpp_path.forward_stepped(weights, last, state)
+                logits = fwd(weights, last, state)
                 cdf_row = cpp_path.softmax_cdf_one_row(logits)
                 krunch_ac_cuda.decode_step(cdf_row, input_buf, ac_state, out_sym)
                 tok = int(out_sym.item())
