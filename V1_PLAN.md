@@ -789,15 +789,22 @@ Scaffolding in `krunch_ac/cuda/rwkv_step.cu`. Plan, ~1-2 weeks:
    2. Deterministic batched softmax+CDF kernel — kill the per-row
       Python loop, restore batched encoder speed.
    3. CUDA graph the per-token C++ stepped path so decode latency
-      drops below ~200 us/token. **Started, not landed.** Wired in
-      `cpp_path.forward_stepped_graphed` + `KRUNCH_CPP_GRAPH=1`
-      toggle. Roundtrip FAILS with the toggle on: existing C++
-      wrapper `rwkv4_layer_step_cpp_graphed` runs 2 warmup forwards
-      that mutate the shared state tensors before capture, so the
-      first decode token sees state advanced 3× instead of 1×. Fix
-      is to split warmup from capture in the C++ side (or
-      capture from Python with torch.cuda.graph against
-      non-state-mutating wrappers). Half-day item; deferred.
+      drops below ~200 us/token. **Tried, blocked.** Both v1 (C++
+      wrapper) and v2 (Python torch.cuda.graph with
+      snapshot/restore around capture) FAIL roundtrip. Single-layer
+      reproducer (`scripts/test_graph_one_layer.py`) shows the
+      graph diverges from a ground-truth direct call immediately
+      on step 0 (out_diff = 0.18, then explodes). The layer
+      forward calls two ops that don't appear to capture
+      deterministically in this PyTorch+CUDA build:
+      `rwkv::gemm_fp16_cublas` (rwkv's custom op via the
+      Dispatcher) and `rwkv::wkv_forward`. Likely either uses
+      cuBLAS workspaces that aren't graph-safe, or stream-ordered
+      memory that doesn't replay. Fix is multi-day: replace those
+      two custom ops with graph-safe equivalents (bare cuBLAS API
+      with explicit workspace, our own WKV kernel inline). Until
+      then decode is bounded by per-token Python+kernel-launch
+      latency.
 
    Files added/modified:
    - NEW `krunch_ac/cuda/det_matmul.cu`
