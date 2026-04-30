@@ -3,8 +3,9 @@ per-step output bit-exactly. Uses the same code as the e2e roundtrip
 but skips the AC stage so we can pinpoint where state diverges.
 """
 import os
-os.environ["KRUNCH_DETERMINISTIC_MATMUL"] = "1"
-os.environ["RWKV_CUDA_ON"] = "1"
+# Inherit KRUNCH_DETERMINISTIC_MATMUL from caller; default off so we can
+# probe whether cuBLAS-only is shape-stable at our layer shapes.
+os.environ.setdefault("RWKV_CUDA_ON", "1")
 
 import torch, torch.nn.functional as F
 from krunch.inference import _load_rwkv, MODEL_PATH, BOS_TOKEN

@@ -759,11 +759,18 @@ Scaffolding in `krunch_ac/cuda/rwkv_step.cu`. Plan, ~1-2 weeks:
    1. **Encode 7× slower than stock** at 32 KB (6.3 vs 44.5 KB/s).
       Cause: per-row Python softmax+CDF loop runs ~8K times.
       Fix: write a batched deterministic softmax kernel.
-   2. **Ratio degraded ~20%** (0.084 vs 0.070 at 32 KB) — exceeds
-      the user's <0.1% tolerance. Cause: det_matmul produces
-      slightly different (not just shape-invariant) logits than
-      tuned cuBLAS, which translates to less-peaked posteriors and
-      worse coding.
+   2. ~~**Ratio degraded ~20%**~~ — initially flagged as a
+      regression, but the "stock" baseline number is meaningless: the
+      stock path FAILS roundtrip (the comparison row in the bench
+      output explicitly says FAIL), so its compressed size is what
+      the encoder produced, not what's recoverable. cpp_path is the
+      first GPU-AC path that actually decodes back. Independent
+      precision check (`scripts/test_det_matmul_precision.py`) shows
+      det_matmul matches cuBLAS to within fp16 quantization for all
+      our shapes — abs_mean diff vs fp64 ground truth is identical
+      to cuBLAS for K∈{768,3072}, N∈{768,3072,50277}, M∈{1,32,1024}.
+      Real cpp_path ratio (0.055 @ 8 KB, 0.084 @ 32 KB) is the
+      faithful compression number for this model + this text.
 
    Decompress speed unchanged from stock (0.5 vs 0.7 KB/s) — the
    per-token forward+sync floor is what actually bounds decode, and
