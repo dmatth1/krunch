@@ -352,7 +352,8 @@ class InferenceEngine:
         # forward. First call per layer captures, subsequent calls
         # replay one graph (saves ~12× ATen launch overhead).
         use_graph = os.environ.get("KRUNCH_CPP_GRAPH", "0") == "1"
-        fwd = (cpp_path.forward_stepped_graphed if use_graph
+        # v2 = snapshot/restore-around-capture variant; v1 is broken.
+        fwd = (cpp_path.forward_stepped_graphed_v2 if use_graph
                else cpp_path.forward_stepped)
         with torch.no_grad():
             for _ in range(n_tokens):

@@ -140,6 +140,99 @@ def _get_stepped_bufs(weights: dict):
     return bufs
 
 
+_GRAPH_CACHE: dict[int, list] = {}
+
+
+def _snapshot_state(state):
+    return [[t.clone() for t in state[k]] for k in range(5)]
+
+
+def _restore_state(state, snap):
+    for k in range(5):
+        for i in range(N_LAYER):
+            state[k][i].copy_(snap[k][i])
+
+
+def _capture_one_layer_graph(weights, state, layer_idx, bufs):
+    """Capture a CUDA graph for one layer's T=1 forward against the
+    REAL state tensors. Mutates state once per warmup pass + once per
+    capture (so 3 mutations total). Caller must snapshot/restore."""
+    import torch
+    import krunch_ac_cuda
+    layer = weights["layers"][layer_idx]
+    s0, s1, s2, s3, s4 = (state[k][layer_idx] for k in range(5))
+
+    # Warm up cuBLAS workspaces / allocator state.
+    for _ in range(2):
+        out = krunch_ac_cuda.rwkv4_layer_step_cpp(
+            bufs[layer_idx], s0, s1, s2, s3, s4, *layer)
+        bufs[layer_idx + 1].copy_(out)
+    torch.cuda.synchronize()
+
+    g = torch.cuda.CUDAGraph()
+    cap_stream = torch.cuda.Stream()
+    cap_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(cap_stream):
+        with torch.cuda.graph(g):
+            out = krunch_ac_cuda.rwkv4_layer_step_cpp(
+                bufs[layer_idx], s0, s1, s2, s3, s4, *layer)
+            bufs[layer_idx + 1].copy_(out)
+    torch.cuda.current_stream().wait_stream(cap_stream)
+    return g
+
+
+def forward_stepped_graphed_v2(weights: dict, last_token: int, state):
+    """Properly graphed per-token forward.
+
+    Captures via Python torch.cuda.graph context, snapshotting +
+    restoring state around the warmup-and-capture sequence so the
+    real state advances exactly once per replay.
+
+    KNOWN BROKEN — same failing token sequence as v1. Most likely
+    cause: cuBLAS workspaces or the rwkv::wkv_forward dispatcher
+    lookup don't replay deterministically from a captured graph in
+    this PyTorch build. Single-layer isolated test would confirm;
+    deferred.
+    """
+    import torch
+    import krunch_ac_cuda
+    import torch.nn.functional as F
+    n_embd = weights["n_embd"]
+    emb_w = weights["emb_w"]
+    ln_out_w = weights["ln_out_w"]
+    ln_out_b = weights["ln_out_b"]
+    head_w = weights["head_w"]
+    bufs = _get_stepped_bufs(weights)
+
+    key = id(weights)
+    if key not in _GRAPH_CACHE:
+        # Capture all 12 layers. We use last_token's embedding as the
+        # initial bufs[0] content so the capture sees realistic data.
+        bufs[0].copy_(emb_w[last_token].view(1, 1, n_embd))
+        snap = _snapshot_state(state)
+        graphs = []
+        for i in range(N_LAYER):
+            # Restore state to the clean pre-call value before each
+            # layer's capture so the graph is captured against the
+            # correct starting state for layer i.
+            _restore_state(state, snap)
+            graphs.append(_capture_one_layer_graph(weights, state, i, bufs))
+        # Restore one final time so the upcoming replay-loop sees
+        # the same state the caller passed in.
+        _restore_state(state, snap)
+        _GRAPH_CACHE[key] = graphs
+
+    graphs = _GRAPH_CACHE[key]
+    # Set the input for this token.
+    bufs[0].copy_(emb_w[last_token].view(1, 1, n_embd))
+    for i in range(N_LAYER):
+        graphs[i].replay()
+    xn = F.layer_norm(bufs[N_LAYER].view(1, n_embd), (n_embd,),
+                      weight=ln_out_w, bias=ln_out_b)
+    logits = krunch_ac_cuda.det_matmul(xn.contiguous(), head_w.contiguous()).flatten()
+    return logits
+
+
 def forward_stepped_graphed(weights: dict, last_token: int, state):
     """Graph-captured per-layer T=1 forward.
 
