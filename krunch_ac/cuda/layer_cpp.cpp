@@ -41,6 +41,7 @@ void launch_det_matmul_tc_3way(
 void launch_det_matmul_cublas(const void* x, const void* W, void* y,
                                int write_fp32, int M, int K, int N,
                                cudaStream_t stream);
+void set_det_matmul_cublas_algo(int algo_id);
 // Deterministic softmax + CDF — see det_softmax_cdf.cu.
 void launch_det_softmax_cdf(const void* logits, void* cdf,
                              int T, int V, int cdf_T_value,
@@ -482,6 +483,36 @@ void register_layer_cpp(pybind11::module& m) {
           "Deterministic shape-invariant matmul: y = x @ W.",
           pybind11::arg("x"), pybind11::arg("W"),
           pybind11::arg("out_dtype") = c10::nullopt);
+    m.def("det_matmul_cublas_pinned", [](at::Tensor x, at::Tensor W,
+                                          c10::optional<at::ScalarType> out_dtype) {
+        // Test-only binding: forces the cuBLAS pinned-algo path so we
+        // can verify shape-stability of THE actual code path used by
+        // gemm_fp16 when KRUNCH_CUBLAS_PINNED=1. The plain det_matmul
+        // pybind goes through launch_det_matmul_tc (WMMA), so testing
+        // that doesn't tell us anything about cuBLAS pinned.
+        auto xc = x.contiguous();
+        auto Wc = W.contiguous();
+        const int M = (int)xc.size(0);
+        const int K = (int)xc.size(1);
+        const int N = (int)Wc.size(-1);
+        const auto dtype = out_dtype.has_value() ? out_dtype.value() : xc.scalar_type();
+        auto out = at::empty({M, N}, xc.options().dtype(dtype));
+        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+        const int write_fp32 = (dtype == at::kFloat) ? 1 : 0;
+        launch_det_matmul_cublas(xc.data_ptr(), Wc.data_ptr(),
+                                  out.data_ptr(), write_fp32,
+                                  M, K, N, stream);
+        return out;
+    }, "Run cuBLAS pinned-algo matmul (the path gemm_fp16 takes when "
+       "KRUNCH_CUBLAS_PINNED=1). Use to verify shape-stability before "
+       "trusting the path in production.",
+       pybind11::arg("x"), pybind11::arg("W"),
+       pybind11::arg("out_dtype") = c10::nullopt);
+    m.def("set_cublas_pinned_algo", [](int algo_id) {
+        set_det_matmul_cublas_algo(algo_id);
+    }, "Override the cuBLAS algo enum used by det_matmul_cublas_pinned + "
+       "the in-engine cuBLAS path. Useful for sweeping algos.",
+       pybind11::arg("algo_id"));
     m.def("det_softmax_cdf", [](at::Tensor logits_TxV, int cdf_T_value) {
         TORCH_CHECK(logits_TxV.dim() == 2 && logits_TxV.scalar_type() == at::kHalf);
         auto x = logits_TxV.contiguous();
