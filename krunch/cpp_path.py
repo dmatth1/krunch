@@ -303,22 +303,28 @@ def forward_stepped(weights: dict, last_token: int, state):
 
 
 def softmax_cdfs_per_row(logits_TxV):
-    """Batched softmax + CDF via det_softmax_cdf kernel.
+    """Batched softmax + CDF via det_softmax_cdf kernel + torch.cumsum.
     Bit-identical between [T,V] and [1,V] invocation (verified) so
-    encoder and decoder produce the same CDFs. ~20× faster than the
-    per-row Python loop on T=1024."""
+    encoder and decoder produce the same CDFs. The kernel writes
+    counts; we scan with torch.cumsum (much faster than the kernel's
+    own serial cumsum at V=50277)."""
+    import torch
     import krunch_ac_cuda
     from krunch_ac.cdf import T as CDF_T
-    return krunch_ac_cuda.det_softmax_cdf(logits_TxV.contiguous(), CDF_T)
+    counts = krunch_ac_cuda.det_softmax_cdf(logits_TxV.contiguous(), CDF_T)
+    counts[:, 1:] = torch.cumsum(counts[:, 1:], dim=-1)
+    return counts
 
 
 def softmax_cdf_one_row(logits_V):
     """Single-row softmax + CDF for the stepped decoder path."""
+    import torch
     import krunch_ac_cuda
     from krunch_ac.cdf import T as CDF_T
-    cdf = krunch_ac_cuda.det_softmax_cdf(
+    counts = krunch_ac_cuda.det_softmax_cdf(
         logits_V.reshape(1, -1).contiguous(), CDF_T)
-    return cdf[0].contiguous()
+    counts[:, 1:] = torch.cumsum(counts[:, 1:], dim=-1)
+    return counts[0].contiguous()
 
 
 def cpp_path_enabled() -> bool:

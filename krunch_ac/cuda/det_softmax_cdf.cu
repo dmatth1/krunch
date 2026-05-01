@@ -177,18 +177,11 @@ extern "C" __global__ void det_softmax_cdf_kernel(
     }
     __syncthreads();
 
-    // ---------- 5) cumsum ----------
-    // Simple serial cumsum by thread 0 — V is ~50K so this is fine
-    // for an 8K-token chunk (256 ms total at ~50K ops/row × 1024 rows
-    // = 50M ops/chunk, runs in <10 ms on T4 with shared L1).
-    // Future: parallel block scan if this dominates.
-    if (tid == 0) {
-        int acc = 0;
-        for (int i = 1; i <= V; i++) {
-            acc += row_cdf[i];
-            row_cdf[i] = acc;
-        }
-    }
+    // NOTE: cumsum is done by the caller (torch.cumsum on the output
+    // slice). Earlier we did a serial cumsum-by-thread-0 here, but
+    // that was dramatically slower than torch's tuned scan
+    // (1.9 ms → 0.1 ms per row at V=50277 on T4). The kernel writes
+    // counts; caller scans.
 }
 
 extern "C" void launch_det_softmax_cdf(
