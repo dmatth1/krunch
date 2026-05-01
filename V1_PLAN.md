@@ -570,27 +570,41 @@ T4 numbers extrapolate to A10G ~3× → ~87 / 54 KB/s.
    D alone: ~3-5 days, ~2-3× both sides. May overlap A/B/C effort.
 
    **Honest 200 KB/s reachability assessment (2026-05-01 after
-   lever A measurement):**
+   lever A measurement + careful math):**
 
-   The single-op-replacement levers (matmul tile tuning, layer_norm
-   kernel) each save <5% end-to-end because no single op dominates
-   the layer step — it's a chain of ~16 small ops where each takes
-   ~230µs (50µs ATen overhead + ~180µs GPU compute). To hit 200 KB/s
-   on A10G we need ~3× speedup, which requires:
+   Compress (currently 66 KB/s on A10G):
+   - Per-layer-step time: 3.7 ms = 16 ops × ~230 µs each
+   - Of that 230 µs: ~50 µs launch overhead, ~180 µs actual GPU compute
+   - Eliminating ALL launch overhead (full persistent kernel) saves
+     16 × 50 = 800 µs / 3.7 ms = 22% per-layer-step → ~80 KB/s
+   - Intermediate global memory r/w between fused ops is 1.5-12 KB
+     per intermediate; total savings ~1 MB at 600 GB/s = negligible
+   - **Compress ceiling on A10G with this model: ~80-90 KB/s.**
+     Not 200. The model's flops/token are not enough to keep the
+     TC pipeline full at small batches.
 
-   - Eliminating most ATen overhead (≤50µs × 16 ops = ~800µs / 3.7ms
-     layer step = 22% of layer time saved by full ATen replacement)
-   - PLUS fusing intermediate global memory r/w (premix output
-     directly to matmul registers, sigmoid+mul fused, etc.)
+   Decompress (currently 35 KB/s on A10G with B=128):
+   - Per-token cost is 142 µs of which most is per-step overhead
+     from ~16 launches across many small operations
+   - Persistent kernel ELIMINATES that per-step launch chain →
+     1 launch per layer instead of 16
+   - Plus M=B=128 keeps TC matmul saturated
+   - Realistic decompress with persistent kernel: ~150-200 KB/s
+     (true variance depends on WKV implementation efficiency
+     inside the persistent kernel — sequential per-channel chain
+     can't be parallelized further but lives in registers, no
+     global memory r/w per step)
 
-   That's exactly option D (full persistent / fused-everything kernel).
-   A+B+C combined deliver ~30% speedup; D delivers ~3×. **Skipping
-   to D directly is the higher-leverage path.**
+   **Verdict:** persistent kernel gets DECOMPRESS to gate (~150-200
+   KB/s) but COMPRESS caps around 80-90 KB/s on a single A10G with
+   this 169M model. Reaching 200 compress requires bigger GPU or
+   smaller model.
 
-   Recommendation: **commit to D (3-5 days)** instead of grinding
-   through A+B+C piecemeal. If D doesn't reach 200 KB/s, the answer
-   is "this model on this GPU caps at ~150 KB/s, accept or change
-   one of those variables."
+   **Recommendation:** commit to persistent kernel for decompress
+   (high ROI — closes the bigger gap). For compress, either accept
+   ~80-90 KB/s OR shift the speed gate to acknowledge the
+   model+hardware floor. Don't pretend single-A10G can hit 200
+   compress with RWKV-4-Pile-169M; the math doesn't support it.
 
 2. **Bigger-sample T3 measurement** — re-run on 100 MB+ WildChat
    slice with the encoder fusion live. Decompress gate may be
