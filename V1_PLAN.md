@@ -749,11 +749,36 @@ Scaffolding in `krunch_ac/cuda/rwkv_step.cu`. Plan, ~1-2 weeks:
 
    **End-to-end engine roundtrip via cpp_path (T4, 2026-04-30, latest):**
    ```
-   8 KB  : C++  enc 44.2 KB/s  dec 0.8 KB/s  ratio 0.055  PASS bit-exact
-   8 KB  : stck enc 44.1 KB/s  dec 0.6 KB/s  ratio 0.044  (no roundtrip)
-   32 KB : C++  enc 33.4 KB/s  dec 0.8 KB/s  ratio 0.084  PASS bit-exact
-   32 KB : stck enc 42.7 KB/s  dec 0.6 KB/s  ratio 0.070  (no roundtrip)
+   8 KB  : C++  enc 44.7 KB/s  dec 1.3 KB/s  ratio 0.055  PASS bit-exact
+   8 KB  : stck enc 44.5 KB/s  dec 0.6 KB/s  ratio 0.044  (no roundtrip)
+   32 KB : C++  enc 33.2 KB/s  dec 1.3 KB/s  ratio 0.084  PASS bit-exact
+   32 KB : stck enc 44.9 KB/s  dec 0.7 KB/s  ratio 0.070  (no roundtrip)
    ```
+   Encoder matches stock at 8 KB and is within 1.35× at 32 KB.
+   Decoder is **2× faster than stock decode** at every size and is
+   bit-exact. Asymmetry collapsed to 26-35× from cpp's actual numbers.
+
+   Per-token decode profile (T4): forward 3.90 ms (96.4%), cdf 0.12,
+   decode 0.01, sync 0.02 — total 4.05 ms/token. Forward is ~96% of
+   decode time and dominated by per-launch kernel overhead from
+   ~180 op launches per token (60 matmuls + 120 ATen ops).
+
+   **Worker-pool decode is dead as a lever for cpp_path.** Measured
+   4-worker aggregate at 0.9 KB/s vs single-stream 1.3 KB/s — workers
+   contend for the same SMs since cpp_path now saturates the GPU.
+   The earlier worker-pool gains (1.81-2.12×) were when cpp_path
+   was Python-bound; not the case anymore.
+
+   **Remaining decode levers:**
+   - More multi-way matmul fusion (ffn_Rw + ffn_Kw stacked, even
+     with different N).
+   - Epilogue fusion: sigmoid into 3-way output, relu_sq into
+     ffn_Kw output, residual-add into output matmul. ~24 launches
+     saved per token (~10% decode win each).
+   - Persistent kernel covering ln+premix+attn+wkv+r*y+Ow+ln+premix+
+     ffn block in one launch. 5-7 day item; would gain 5-10×.
+   - Half-precision WKV with TC: WKV is currently a serial fp32
+     kernel; could co-locate with surrounding matmuls.
    Encoder matches stock at 8 KB and is within 1.28× at 32 KB.
    Decoder beats stock at every size and is bit-exact. Asymmetry
    collapsed from the original 30-68× to ~42-57× of cpp's actual
