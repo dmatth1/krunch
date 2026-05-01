@@ -46,10 +46,54 @@ void set_det_matmul_cublas_algo(int algo_id);
 void launch_det_matmul_tc_v2(const void* A, const void* B, void* C,
                               int write_fp32, int M, int K, int N,
                               cudaStream_t stream);
+// Custom row-wise LayerNorm — see layer_norm.cu.
+void launch_layer_norm(const void* x, const void* gamma, const void* beta,
+                        void* y, int N, int C, float eps,
+                        cudaStream_t stream);
 // Deterministic softmax + CDF — see det_softmax_cdf.cu.
 void launch_det_softmax_cdf(const void* logits, void* cdf,
                              int T, int V, int cdf_T_value,
                              cudaStream_t stream);
+}
+
+// Custom row-wise LayerNorm wrapper. Replaces at::layer_norm in
+// the layer-step hot path: same per-row math (mean → var → normalize
+// → affine), but as one custom kernel call (one block per row,
+// fp32 reductions) instead of going through the PyTorch dispatcher.
+// Bit-stable across batch dim by construction.
+//
+// Bit-pattern differs from at::layer_norm (different reduction order
+// + we accumulate in fp32 throughout) — both compress and decompress
+// must use the SAME code path or AC roundtrip breaks. Default OFF
+// (KRUNCH_LAYERNORM_CUSTOM=1 to enable).
+static at::Tensor layer_norm_cust(at::Tensor x, at::Tensor gamma,
+                                   at::Tensor beta, double eps) {
+    auto x_c = x.contiguous();
+    const auto sizes = x_c.sizes();
+    const int64_t C = sizes[sizes.size() - 1];
+    const int64_t N = x_c.numel() / C;
+    auto y = at::empty_like(x_c);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    launch_layer_norm(x_c.data_ptr(), gamma.contiguous().data_ptr(),
+                       beta.contiguous().data_ptr(), y.data_ptr(),
+                       (int)N, (int)C, (float)eps, stream);
+    return y;
+}
+
+static bool use_custom_layer_norm() {
+    static const bool USE_CUSTOM_LN = []{
+        const char* e = std::getenv("KRUNCH_LAYERNORM_CUSTOM");
+        return e != nullptr && std::string(e) == "1";
+    }();
+    return USE_CUSTOM_LN;
+}
+
+static at::Tensor maybe_layer_norm(at::Tensor x, at::IntArrayRef shape,
+                                    at::Tensor gamma, at::Tensor beta) {
+    if (use_custom_layer_norm()) {
+        return layer_norm_cust(x, gamma, beta, 1e-5);
+    }
+    return at::layer_norm(x, shape, gamma, beta);
 }
 
 // Match BlinkDL's matmul exactly: call rwkv::gemm_fp16_cublas via the
@@ -131,7 +175,7 @@ at::Tensor rwkv4_layer_step_cpp_t1(
     const int64_t C = x.size(2);
 
     // LayerNorm 1
-    auto xx = at::layer_norm(x, {C}, ln1_w, ln1_b);  // [1, 1, C]
+    auto xx = maybe_layer_norm(x, {C}, ln1_w, ln1_b);  // [1, 1, C]
     auto xx_2d = xx.contiguous().view({1, C});        // [1, C]
 
     // Time-mix premix via the SAME fused kernel used by the packed path.
@@ -216,7 +260,7 @@ at::Tensor rwkv4_layer_step_cpp_t1(
     auto x_after_att = x.view({1, C}) + out_att;          // [1, C]
 
     // LayerNorm 2
-    auto xx2 = at::layer_norm(x_after_att, {C}, ln2_w, ln2_b);  // [1, C]
+    auto xx2 = maybe_layer_norm(x_after_att, {C}, ln2_w, ln2_b);  // [1, C]
     auto xx2_c = xx2.contiguous();
 
     // FFN premix via fused kernel (matches packed path bit-for-bit).
@@ -275,7 +319,7 @@ at::Tensor rwkv4_layer_step_cpp(
     // over B; state tensors must be [B, C] / [B, n_att].
 
     // LayerNorm 1
-    auto xx = at::layer_norm(x, {C}, ln1_w, ln1_b);                // [1, T, C]
+    auto xx = maybe_layer_norm(x, {C}, ln1_w, ln1_b);                // [1, T, C]
     auto xx_flat = xx.contiguous().view({B * T, C});
 
     // Fused premix: kx, vx, rx = mix(xx, sx_full, tm_*).
@@ -350,7 +394,7 @@ at::Tensor rwkv4_layer_step_cpp(
     auto x_after_att = x + att_out;                                  // [1, T, C]
 
     // LayerNorm 2 + FFN
-    auto xx2 = at::layer_norm(x_after_att, {C}, ln2_w, ln2_b);
+    auto xx2 = maybe_layer_norm(x_after_att, {C}, ln2_w, ln2_b);
     auto xx2_flat = xx2.contiguous().view({B * T, C});
 
     // Fused FFN premix: ffn_kx, ffn_rx = mix(xx2, ffn_xx, ffn_tm_*).

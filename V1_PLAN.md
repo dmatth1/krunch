@@ -541,11 +541,15 @@ T4 numbers extrapolate to A10G ~3× → ~87 / 54 KB/s.
 
    Fusion targets (highest leverage first):
 
-     A. **Replace at::layer_norm with custom layer_norm kernel.**
-        2 calls per layer × 12 = 24 ATen launches eliminated. ATen
-        layer_norm goes through the dispatcher + may call cuBLAS
-        internally for the variance reduction. Custom: one block
-        per row, fused mean + var + normalize. ~half-day.
+     A. ~~Replace at::layer_norm with custom layer_norm kernel.~~
+        **Tried 2026-05-01.** Built `layer_norm.cu` (one block per
+        row, fp32 reductions); enabled via KRUNCH_LAYERNORM_CUSTOM=1.
+        Bit-exact T3 roundtrip PASS. End-to-end **3% slower** on T4
+        (compress 366s vs 356s baseline; decompress 584s vs 572s).
+        Diagnosis: at::layer_norm is already efficient + LN time is
+        <1% of compress wall (~23K LN calls × ~50µs = ~1s out of 358s
+        total compress). Single-op replacement doesn't help here.
+        Kept in tree as KRUNCH_LAYERNORM_CUSTOM=1 opt-in.
 
      B. **Fuse `at::sigmoid` + multiply into one kernel.** sigmoid
         of an [n] tensor + multiplied by another [n] is one block
@@ -565,9 +569,28 @@ T4 numbers extrapolate to A10G ~3× → ~87 / 54 KB/s.
    Cumulative (A+B+C): ~2 days, ~1.5-2× both sides.
    D alone: ~3-5 days, ~2-3× both sides. May overlap A/B/C effort.
 
-   Recommend A → B → C in order (each verifiable independently with
-   bit-exact roundtrip tests), then evaluate whether D is still
-   needed before committing.
+   **Honest 200 KB/s reachability assessment (2026-05-01 after
+   lever A measurement):**
+
+   The single-op-replacement levers (matmul tile tuning, layer_norm
+   kernel) each save <5% end-to-end because no single op dominates
+   the layer step — it's a chain of ~16 small ops where each takes
+   ~230µs (50µs ATen overhead + ~180µs GPU compute). To hit 200 KB/s
+   on A10G we need ~3× speedup, which requires:
+
+   - Eliminating most ATen overhead (≤50µs × 16 ops = ~800µs / 3.7ms
+     layer step = 22% of layer time saved by full ATen replacement)
+   - PLUS fusing intermediate global memory r/w (premix output
+     directly to matmul registers, sigmoid+mul fused, etc.)
+
+   That's exactly option D (full persistent / fused-everything kernel).
+   A+B+C combined deliver ~30% speedup; D delivers ~3×. **Skipping
+   to D directly is the higher-leverage path.**
+
+   Recommendation: **commit to D (3-5 days)** instead of grinding
+   through A+B+C piecemeal. If D doesn't reach 200 KB/s, the answer
+   is "this model on this GPU caps at ~150 KB/s, accept or change
+   one of those variables."
 
 2. **Bigger-sample T3 measurement** — re-run on 100 MB+ WildChat
    slice with the encoder fusion live. Decompress gate may be
