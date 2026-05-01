@@ -1133,6 +1133,32 @@ a GPU, I'll saturate it."
   A100/L40S=256, H100=512). Wired into
   `_decompress_chunks_batched_cpp` so a multi-thousand-chunk file
   splits into B-sized groups instead of OOM-ing.
+- ⏳ Dynamic compress chunk size — currently fixed at 64 KB
+  default. 64 KB is wrong for two regimes: tiny files (<1 MB,
+  fewer chunks than B → wasted ratio cost from cold-starts that
+  buy no extra parallelism) and very large files on big GPUs (1 GB+
+  on H100 with B=512 capacity → fewer, bigger chunks would lower
+  per-chunk bookkeeping overhead).
+
+  Right design (works single-machine + distributed):
+  ```
+  total = int(os.environ["KRUNCH_INPUT_LEN"])  # always known
+  target_B = int(os.environ.get("KRUNCH_TARGET_B", "128"))  # decompress
+                                                            # GPU's B
+  target_chunks = max(target_B * 4, 16)
+  chunk_size = max(64KB, ceil(total / target_chunks))
+  ```
+  Every worker reads `KRUNCH_INPUT_LEN` from the same env contract,
+  so all N workers pick the SAME chunk_size regardless of how the
+  file is split across them. The aggregate blob has uniform chunk
+  sizing; decompress (single-host or another distributed pass)
+  picks its own B independently from that chunk count.
+
+  `KRUNCH_TARGET_B` env override lets the user pin chunk size for a
+  known decompress GPU class. Default (128) is the A10G assumption
+  — conservative for H100 (still fills B=512 if file is large
+  enough), suboptimal-but-functional for T4 (will pick B=64 from
+  available chunks).
 - ⏳ Microbench-based auto-tune (replace heuristic table with
   startup probe) — backlog; current table is good enough for
   shipped GPU classes.
