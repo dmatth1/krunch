@@ -111,31 +111,44 @@ def forward_packed(weights: dict, input_ids, state):
     if not isinstance(input_ids, torch.Tensor):
         input_ids = torch.as_tensor(input_ids, dtype=torch.long, device=device)
     T = int(input_ids.shape[0])
+    # Single-shot path: caller wants all logits at once. Used by tests
+    # and the no-AC engine path. Keep for backwards compatibility.
+    return forward_packed_window(weights, input_ids, state, off=0, n=T)
 
-    # Time-batch in SEQ_BATCH-sized windows so the head matmul output
-    # ([T_window, V=50277]) doesn't blow out VRAM at large T. State
-    # carries forward between windows naturally — this is bit-identical
-    # to one big T call (verified by the per-chunk roundtrip in
-    # test_engine_cpp_roundtrip.py at T<=8K).
-    SEQ_BATCH = int(os.environ.get("KRUNCH_FORWARD_BATCH", "1024"))
-    out_chunks = []
-    for off in range(0, T, SEQ_BATCH):
-        ids_w = input_ids[off:off + SEQ_BATCH]
-        T_w = int(ids_w.shape[0])
-        x = emb_w[ids_w].view(1, T_w, n_embd).contiguous()
-        for i in range(N_LAYER):
-            x = krunch_ac_cuda.rwkv4_layer_step_cpp(
-                x.contiguous(),
-                state[0][i], state[1][i], state[2][i], state[3][i], state[4][i],
-                *layers[i],
-            )
-        x_flat = x.view(T_w, n_embd).contiguous()
-        xn = F.layer_norm(x_flat, (n_embd,),
-                          weight=ln_out_w, bias=ln_out_b)
-        logits_w = krunch_ac_cuda.det_matmul(xn.contiguous(),
-                                              head_w.contiguous())
-        out_chunks.append(logits_w)
-    return torch.cat(out_chunks, dim=0) if len(out_chunks) > 1 else out_chunks[0]
+
+def forward_packed_window(weights: dict, input_ids, state, off: int, n: int):
+    """Run the layer stack on a window [off, off+n) of input_ids. State
+    is mutated in place — repeated calls with sequential, non-overlapping
+    windows produce the same final state as one big call.
+
+    Returns logits [n, V] (fp16). Caller is responsible for keeping VRAM
+    bounded by choosing n: at V=50277 each window's output is
+    n × 100 KB. For 1 MB chunks pick n ≤ 4096 to stay under ~400 MB."""
+    import torch
+    import krunch_ac_cuda
+    import torch.nn.functional as F
+    n_embd = weights["n_embd"]
+    layers = weights["layers"]
+    emb_w = weights["emb_w"]
+    ln_out_w = weights["ln_out_w"]
+    ln_out_b = weights["ln_out_b"]
+    head_w = weights["head_w"]
+
+    if not isinstance(input_ids, torch.Tensor):
+        input_ids = torch.as_tensor(input_ids, dtype=torch.long,
+                                     device=weights["device"])
+    ids_w = input_ids[off:off + n]
+    T_w = int(ids_w.shape[0])
+    x = emb_w[ids_w].view(1, T_w, n_embd).contiguous()
+    for i in range(N_LAYER):
+        x = krunch_ac_cuda.rwkv4_layer_step_cpp(
+            x.contiguous(),
+            state[0][i], state[1][i], state[2][i], state[3][i], state[4][i],
+            *layers[i],
+        )
+    x_flat = x.view(T_w, n_embd).contiguous()
+    xn = F.layer_norm(x_flat, (n_embd,), weight=ln_out_w, bias=ln_out_b)
+    return krunch_ac_cuda.det_matmul(xn.contiguous(), head_w.contiguous())
 
 
 _STEPPED_BUFS_CACHE: dict[int, list] = {}

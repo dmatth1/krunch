@@ -471,8 +471,11 @@ def main():
                         help="Input URL (s3://, http://, file://)")
     p_plan.add_argument("--dest", "--output", dest="output_url", required=True,
                         help="Output URL")
-    p_plan.add_argument("--workers", type=int, default=4,
-                        help="Number of parallel workers (default: 4)")
+    p_plan.add_argument("--workers", type=int, required=True,
+                        help="Number of parallel worker machines. "
+                             "Required — there's no universal sane default; "
+                             "pick based on input size + your cluster quota + "
+                             "cost target. Each worker = 1 GPU container.")
     p_plan.add_argument("--image", default=DEFAULT_IMAGE,
                         help=f"Docker image (default: {DEFAULT_IMAGE})")
     p_plan.add_argument("--queue", default="krunch-queue",

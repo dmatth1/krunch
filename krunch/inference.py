@@ -311,25 +311,33 @@ class InferenceEngine:
         full_input = [BOS_TOKEN] + tokens[:-1]
         T = len(full_input)
         state = cpp_path.fresh_state(weights)
+        full_input_t = torch.as_tensor(full_input, dtype=torch.long,
+                                        device=self._device)
         if prof:
             torch.cuda.synchronize(); t2 = _time.time()
 
-        with torch.no_grad():
-            logits = cpp_path.forward_packed(weights, full_input, state)
-            if prof:
-                torch.cuda.synchronize(); t3 = _time.time()
-            cdfs = cpp_path.softmax_cdfs_per_row(logits)  # [T, V+1]
-            if prof:
-                torch.cuda.synchronize(); t4 = _time.time()
-
+        # Stream forward → cdf → encode in SEQ_BATCH-sized windows so
+        # peak VRAM is bounded by one window's logits + cdfs (~600 MB
+        # at SEQ_BATCH=4096). State + AC state carry forward between
+        # windows naturally. Bit-identical to running each stage all
+        # at once (when memory allows).
+        SEQ_BATCH = int(os.environ.get("KRUNCH_FORWARD_BATCH", "1024"))
         cap = max(len(data) * 2, 64 << 10)
         output_buf = torch.zeros(cap, dtype=torch.uint8, device=self._device)
         ac_state = torch.zeros(4, dtype=torch.uint32, device=self._device)
         ac_state[1] = 0xFFFFFFFF
         symbols = torch.as_tensor(tokens, dtype=torch.int32, device=self._device).contiguous()
-        # Batched encode is bit-symmetric to row-by-row decode (verified
-        # in scripts/test_ac_only_roundtrip.py) — keep batched for speed.
-        krunch_ac_cuda.encode_step(cdfs, symbols, output_buf, ac_state)
+
+        with torch.no_grad():
+            for off in range(0, T, SEQ_BATCH):
+                n_w = min(SEQ_BATCH, T - off)
+                logits_w = cpp_path.forward_packed_window(
+                    weights, full_input_t, state, off, n_w)
+                cdfs_w = cpp_path.softmax_cdfs_per_row(logits_w)
+                sym_w = symbols[off:off + n_w].contiguous()
+                krunch_ac_cuda.encode_step(cdfs_w, sym_w, output_buf, ac_state)
+        if prof:
+            torch.cuda.synchronize(); t3 = t4 = _time.time()
         krunch_ac_cuda.encode_finalize(output_buf, ac_state)
         torch.cuda.synchronize()
         if prof:
