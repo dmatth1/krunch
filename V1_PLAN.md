@@ -606,6 +606,45 @@ T4 numbers extrapolate to A10G ~3× → ~87 / 54 KB/s.
    model+hardware floor. Don't pretend single-A10G can hit 200
    compress with RWKV-4-Pile-169M; the math doesn't support it.
 
+   **Persistent kernel decompress — sharper math (2026-05-01):**
+
+   Measured A10G decompress: 35 KB/s aggregate at B≈128 = ~15 ms
+   per timestep. Theoretical compute floor at B=128 from per-step
+   ops (12 layers × 7 matmul + WKV + premix + LN + sigmoid + add):
+   ~750 µs. Gap: 20× over theoretical.
+
+   Persistent kernel attacks the 20× gap by collapsing 12 × 16 ≈
+   190 ATen launches per step into ~10 fused-kernel launches.
+   Realistic recovery: 2-3× (5-7 ms / step instead of 15 ms) →
+   **~80-100 KB/s aggregate decompress on A10G**.
+
+   **Not 200 KB/s.** The remaining 5-7 ms / step is real GPU
+   compute — matmul, WKV recurrence, layer_norm reductions — that
+   no amount of fusion eliminates.
+
+   **Fused kernels in tree (2026-05-01):**
+   - `fused_pre_attn.cu` — LN1 + premix3 fused, T=1 only (decompress).
+     Skeleton built; not yet wired into rwkv4_layer_step_cpp_t1.
+     Bit-stability vs the LN+premix chain needs verification before
+     enable: requires both compress + decompress to use compatible
+     LN arithmetic. Compress would use `launch_layer_norm` (already
+     in tree) + `launch_premix_3` — same arithmetic, two launches
+     instead of one.
+
+   **Decision needed before continuing:**
+   - (a) Build out remaining 3 fused kernels (sigmoid+WKV+mul,
+        residual+LN2+premix2, sigmoid+mul+add), wire into engine,
+        measure on A10G. ~3 more days for 2-3× decompress (target
+        ~80-100 KB/s).
+   - (b) Accept that single-A10G with 169M can't hit 200 either way;
+        re-spec gate to ~80-100 KB/s decompress + ~80 KB/s compress.
+        Ship what we have.
+   - (c) Switch hardware target to A100/L40S/H100 — bigger TFlops
+        + bigger B fit; 200 KB/s likely reachable with current code.
+   - (d) Switch model to a smaller one (e.g., RWKV-4-Pile-1.5B is
+        OPPOSITE direction; would need a sub-100M variant). Big
+        product change.
+
 2. **Bigger-sample T3 measurement** — re-run on 100 MB+ WildChat
    slice with the encoder fusion live. Decompress gate may be
    reachable without the persistent kernel because larger files
