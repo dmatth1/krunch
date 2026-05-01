@@ -4,13 +4,19 @@ Wraps `krunch_ac_cuda.rwkv4_layer_step_cpp{,_t1}` + the deterministic
 matmul kernel + per-row softmax/CDF so encoder (packed T) and decoder
 (stepped T=1) produce byte-identical AC bitstreams.
 
-Set `KRUNCH_DETERMINISTIC_MATMUL=1` and `KRUNCH_CPP_PATH=1` to
-activate. Verified bit-exact on the 32-token end-to-end harness in
-`scripts/test_e2e_ac_roundtrip.py`.
+`KRUNCH_DETERMINISTIC_MATMUL=1` and `KRUNCH_CPP_PATH=1` default ON as
+of 2026-04-30 — bit-exact GPU AC roundtrip is the only correct path
+on GPU. Set either to 0 to fall back to the legacy BlinkDL forward
+(will FAIL roundtrip; kept for bench comparisons only).
 """
 from __future__ import annotations
 
 import os
+
+# Default deterministic matmul ON before any C++ extension import.
+# The C++ static-const reads this once at module load; setting it
+# afterward has no effect.
+os.environ.setdefault("KRUNCH_DETERMINISTIC_MATMUL", "1")
 
 N_LAYER = 12
 
@@ -379,4 +385,9 @@ def softmax_cdf_one_row(logits_V):
 
 
 def cpp_path_enabled() -> bool:
-    return os.environ.get("KRUNCH_CPP_PATH", "0") == "1"
+    """Default ON as of 2026-04-30 — bit-exact GPU AC roundtrip is the
+    only correct path. Set KRUNCH_CPP_PATH=0 to fall back to the
+    legacy BlinkDL path (will FAIL roundtrip on GPU AC; kept for
+    bench comparisons only)."""
+    val = os.environ.get("KRUNCH_CPP_PATH", "1")
+    return val == "1"

@@ -352,6 +352,75 @@ class InferenceEngine:
         mini_header = struct.pack(">II", len(data), len(tokens))
         return mini_header + ac_bytes
 
+    def _decompress_chunks_batched_cpp(self, encoded_chunks: list[bytes]) -> list[bytes]:
+        """Bit-exact cross-chunk batched decompress.
+
+        Decodes B chunks in parallel through ONE batched stepped forward
+        per timestep. Throughput scales near-linearly with B until TC
+        matmul utilization saturates (T4 ≈ B=64, A10G ≈ B=128-256).
+
+        Same numerics as `_decompress_chunk_cpp` per-chunk, just processed
+        in lockstep — verified bit-exact in scripts/test_batched_stepped.py
+        (3-chunk batched == 3-chunk sequential, all state diffs = 0).
+        """
+        import torch
+        import krunch_ac_cuda
+        from krunch import cpp_path
+
+        B = len(encoded_chunks)
+        # Parse mini-headers
+        orig_lens: list[int] = []
+        n_tokens_per: list[int] = []
+        bitstreams: list[bytes] = []
+        for enc in encoded_chunks:
+            ol, nt = struct.unpack(">II", enc[:8])
+            orig_lens.append(ol)
+            n_tokens_per.append(nt)
+            bitstreams.append(enc[8:])
+        max_T = max(n_tokens_per)
+
+        # Concatenate bitstreams with per-stream byte offsets + 64-byte
+        # tail padding per stream.
+        TAIL_PAD = 64
+        base_offsets: list[int] = []
+        pos = 0
+        for bs in bitstreams:
+            base_offsets.append(pos)
+            pos += len(bs) + TAIL_PAD
+        cat = bytearray(pos)
+        for off, bs in zip(base_offsets, bitstreams):
+            cat[off:off + len(bs)] = bs
+
+        device = self._device
+        input_buf = torch.frombuffer(bytes(cat), dtype=torch.uint8).clone().to(device)
+        base_byte_offsets = torch.tensor(base_offsets, dtype=torch.int32, device=device)
+        ac_states = torch.zeros(B * 4, dtype=torch.uint32, device=device)
+        krunch_ac_cuda.decode_init_batched(input_buf, base_byte_offsets, ac_states)
+
+        weights = cpp_path.init_weights(self._model, self._device)
+        state = cpp_path.fresh_state_batched(weights, B)
+        last_input = torch.full((B,), BOS_TOKEN, dtype=torch.long, device=device)
+        out_syms = torch.empty(B, dtype=torch.int32, device=device)
+        decoded_tokens = torch.zeros((B, max_T), dtype=torch.int32, device=device)
+
+        with torch.no_grad():
+            for t in range(max_T):
+                logits = cpp_path.forward_stepped_batched(weights, last_input, state)
+                cdfs = cpp_path.softmax_cdfs_per_row(logits)
+                krunch_ac_cuda.decode_step_batched(
+                    cdfs, input_buf, base_byte_offsets, ac_states, out_syms)
+                decoded_tokens[:, t] = out_syms
+                last_input = out_syms.long()
+
+        # Single sync at the end.
+        decoded_cpu = decoded_tokens.cpu().numpy()
+        out: list[bytes] = []
+        for i in range(B):
+            toks = decoded_cpu[i, :n_tokens_per[i]].tolist()
+            text = self._tokenizer.decode(toks)
+            out.append(text.encode("utf-8")[:orig_lens[i]])
+        return out
+
     def _decompress_chunk_cpp(self, encoded: bytes, orig_len: int,
                                 n_tokens: int, bitstream: bytes) -> bytes:
         """Bit-exact C++ orchestration path. Stepped forward per token,
@@ -580,13 +649,20 @@ class InferenceEngine:
         import torch
         import krunch_ac_cuda
         from krunch_ac.gpu_encode import probs_to_cdf_gpu
-        from krunch.batched_rwkv4 import init_state_batched, forward_batched
+        from krunch import cpp_path
 
         B = len(encoded_chunks)
         if B == 0:
             return []
         if B == 1:
             return [self.decompress_chunk(encoded_chunks[0])]
+
+        # Bit-exact C++ orchestration path (matches compress_chunk's
+        # cpp_path so the bitstream roundtrips byte-for-byte).
+        if cpp_path.cpp_path_enabled():
+            return self._decompress_chunks_batched_cpp(encoded_chunks)
+
+        from krunch.batched_rwkv4 import init_state_batched, forward_batched
 
         # Per-chunk mini-headers + bitstreams.
         orig_lens: list[int] = []
