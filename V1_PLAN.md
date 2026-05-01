@@ -518,6 +518,57 @@ T4 numbers extrapolate to A10G ~3× → ~87 / 54 KB/s.
    fused-kernel work needed for decompress; should design once and
    apply to both paths.
 
+   **Persistent / fused layer kernel — design plan:**
+
+   Current per-layer ATen op chain inside `rwkv4_layer_step_cpp`
+   (~15 launches per layer × 12 layers = 180 per token):
+
+     1. `at::layer_norm(x)`                — LN1
+     2. `launch_premix_3` (custom)         — kx, vx, rx
+     3. `gemm_fp16(rx, Rw)` → `at::sigmoid` — r
+     4. `gemm_fp16(kx, Kw)` (fp32 out)     — k
+     5. `gemm_fp16(vx, Vw)` (fp32 out)     — v
+     6. `wkv_op` (rwkv custom)             — y_flat
+     7. `r * y` (ATen mul)
+     8. `gemm_fp16(ry, Ow)`                — out_att
+     9. `x + out_att` (ATen add)           — x_after_att
+    10. `at::layer_norm(x_after_att)`      — LN2
+    11. `launch_premix_2` (custom)         — ffn_kx, ffn_rx
+    12. `gemm_fp16(ffn_rx, ffn_Rw)` → sigmoid → r_ffn
+    13. `gemm_fp16(ffn_kx, ffn_Kw)` → `launch_relu_sq` → k_ffn
+    14. `gemm_fp16(k_ffn, ffn_Vw)`         — v_ffn
+    15. `x_after_att + r_ffn * v_ffn`      — x_final
+
+   Fusion targets (highest leverage first):
+
+     A. **Replace at::layer_norm with custom layer_norm kernel.**
+        2 calls per layer × 12 = 24 ATen launches eliminated. ATen
+        layer_norm goes through the dispatcher + may call cuBLAS
+        internally for the variance reduction. Custom: one block
+        per row, fused mean + var + normalize. ~half-day.
+
+     B. **Fuse `at::sigmoid` + multiply into one kernel.** sigmoid
+        of an [n] tensor + multiplied by another [n] is one block
+        per element-pair. 2 calls per layer × 12 = 24 ATen launches
+        eliminated. ~half-day.
+
+     C. **Fuse residual add into the matmul epilogue.** Ow output
+        adds to x; ffn_V output adds to (x_after_att + r_ffn *).
+        WMMA epilogue can do `acc + bias` for free. ~1 day to add
+        epilogue support to det_matmul_tc.
+
+     D. **Persistent kernel covering the whole layer step.** One
+        `cudaLaunchKernel` does premix + matmuls + WKV + r*y + Ow.
+        Single-block-per-batch design with explicit grid scheduling.
+        ~3-5 days, biggest win (~3× decompress, ~2× compress).
+
+   Cumulative (A+B+C): ~2 days, ~1.5-2× both sides.
+   D alone: ~3-5 days, ~2-3× both sides. May overlap A/B/C effort.
+
+   Recommend A → B → C in order (each verifiable independently with
+   bit-exact roundtrip tests), then evaluate whether D is still
+   needed before committing.
+
 2. **Bigger-sample T3 measurement** — re-run on 100 MB+ WildChat
    slice with the encoder fusion live. Decompress gate may be
    reachable without the persistent kernel because larger files
