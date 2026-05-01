@@ -37,6 +37,10 @@ void launch_det_matmul_tc_3way(
     void* y0, void* y1, void* y2,
     int wf0, int wf1, int wf2,
     int M, int K, int N, cudaStream_t stream);
+// Pinned-algo cuBLAS GEMM — see det_matmul_cublas.cu.
+void launch_det_matmul_cublas(const void* x, const void* W, void* y,
+                               int write_fp32, int M, int K, int N,
+                               cudaStream_t stream);
 // Deterministic softmax + CDF — see det_softmax_cdf.cu.
 void launch_det_softmax_cdf(const void* logits, void* cdf,
                              int T, int V, int cdf_T_value,
@@ -68,11 +72,24 @@ static at::Tensor gemm_fp16(at::Tensor x, at::Tensor w,
     if (USE_DET) {
         cudaStream_t stream = at::cuda::getCurrentCUDAStream();
         const int write_fp32 = (dtype == at::kFloat) ? 1 : 0;
-        // Always use TC kernel (handles arbitrary M/N via shared-mem
-        // staging with bounds checks). Bit-identical across M because
-        // tile schedule + K-loop order are fixed.
-        launch_det_matmul_tc(x_c.data_ptr(), w_c.data_ptr(),
-                              out.data_ptr(), write_fp32, M, K, N, stream);
+        // Pinned-algo cuBLAS path is faster on A10G (uses tuned TC
+        // tile schedules) AND shape-stable (algo enum is fixed across
+        // M values). Default ON; disable via KRUNCH_CUBLAS_PINNED=0
+        // for benchmark comparison or if a future cuBLAS version
+        // drops the chosen algo.
+        static const bool USE_CUBLAS_PIN = []{
+            const char* e = std::getenv("KRUNCH_CUBLAS_PINNED");
+            return e == nullptr || std::string(e) != "0";
+        }();
+        if (USE_CUBLAS_PIN) {
+            launch_det_matmul_cublas(x_c.data_ptr(), w_c.data_ptr(),
+                                      out.data_ptr(), write_fp32,
+                                      M, K, N, stream);
+        } else {
+            // Fallback WMMA kernel — bit-identical across M, slower.
+            launch_det_matmul_tc(x_c.data_ptr(), w_c.data_ptr(),
+                                  out.data_ptr(), write_fp32, M, K, N, stream);
+        }
     } else {
         static auto op = c10::Dispatcher::singleton()
             .findSchemaOrThrow("rwkv::gemm_fp16_cublas", "")
