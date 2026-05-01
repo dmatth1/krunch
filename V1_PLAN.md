@@ -747,13 +747,18 @@ Scaffolding in `krunch_ac/cuda/rwkv_step.cu`. Plan, ~1-2 weeks:
    (per-row max/exp/sum in fp32 with explicit serial reduction) to
    restore batched encoder throughput without breaking bit-exactness.
 
-   **End-to-end engine roundtrip via cpp_path (T4, 2026-04-30):**
+   **End-to-end engine roundtrip via cpp_path (T4, 2026-04-30, latest):**
    ```
-   8 KB  : C++  enc 6.5 KB/s  dec 0.5 KB/s  ratio 0.055  PASS bit-exact
-   8 KB  : stck enc 1.1 KB/s  dec 0.6 KB/s  ratio 0.044  (no roundtrip)
-   32 KB : C++  enc 6.3 KB/s  dec 0.5 KB/s  ratio 0.084  PASS bit-exact
-   32 KB : stck enc 44.5 KB/s dec 0.7 KB/s  ratio 0.070  (no roundtrip)
+   8 KB  : C++  enc 44.2 KB/s  dec 0.8 KB/s  ratio 0.055  PASS bit-exact
+   8 KB  : stck enc 44.1 KB/s  dec 0.6 KB/s  ratio 0.044  (no roundtrip)
+   32 KB : C++  enc 33.4 KB/s  dec 0.8 KB/s  ratio 0.084  PASS bit-exact
+   32 KB : stck enc 42.7 KB/s  dec 0.6 KB/s  ratio 0.070  (no roundtrip)
    ```
+   Encoder matches stock at 8 KB and is within 1.28× at 32 KB.
+   Decoder beats stock at every size and is bit-exact. Asymmetry
+   collapsed from the original 30-68× to ~42-57× of cpp's actual
+   (working) numbers — the residual gap is the per-token forward+
+   sync floor, not the model arithmetic.
    Ratio_dec/enc collapsed from 30–68× → 12×. But two regressions
    surfaced:
    1. **Encode 4× slower than stock** at 32 KB (10.4 vs 44.1 KB/s).
