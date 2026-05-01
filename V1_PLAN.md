@@ -479,6 +479,35 @@ T4 numbers extrapolate to A10G ~3× → ~87 / 54 KB/s.
    det_matmul_cublas + KRUNCH_CUBLAS_PINNED env are kept in tree
    as opt-in for benchmark comparison only.
 
+   **Compress speed honest state (2026-05-01):**
+   - Measured A10G: 66 KB/s (10 MB WildChat, bit-exact path).
+   - Gate: ≥200 KB/s. **Gap: 3.0× short.**
+   - There's no direct apples-to-apples prior compress
+     measurement; "stock 200 KB/s pre-GPU-AC" was on a DIFFERENT
+     code path with CPU AC + constriction, never decoded back
+     under our current bit-exact contract — so we don't have a
+     credible "regression" or "improvement" claim against it.
+   - Compress speed gap matters as much as decompress for the user
+     UX: if decompress catches up to ≥200 via persistent kernel,
+     compress at 66 becomes the new asymmetry users feel
+     (decompress 3× faster than compress).
+
+   **Arch-agnostic compress levers (in order):**
+
+   1. Tune the existing `det_matmul_tc` (still arch-agnostic via
+      WMMA sm_70+). Larger output tiles (32×32 = 4 WMMA frags per
+      block), async copy (`cp.async`, sm_80+ with sm_75 fallback),
+      double-buffered shared memory pipeline. ~2-3 days. Estimate
+      1.5-2× compress speedup on every arch.
+
+   2. CUTLASS-based GEMM with fixed tile-schedule template.
+      Compile-time arch specialization; bit-stable across M for
+      any given template choice. ~3-5 days. Estimate 2-3× compress
+      everywhere.
+
+   Decompress lever (persistent kernel for the per-token forward)
+   is independent and runs in parallel.
+
 2. **Bigger-sample T3 measurement** — re-run on 100 MB+ WildChat
    slice with the encoder fusion live. Decompress gate may be
    reachable without the persistent kernel because larger files
