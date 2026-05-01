@@ -391,3 +391,44 @@ def cpp_path_enabled() -> bool:
     bench comparisons only)."""
     val = os.environ.get("KRUNCH_CPP_PATH", "1")
     return val == "1"
+
+
+# GPU-name → recommended cross-chunk batch size B. Picked from
+# this session's measurements on T4 (peak around B=64) and
+# extrapolation for other classes. Auto-tune at worker startup
+# would replace this — keep the table as a sane default.
+_DECOMPRESS_BATCH_TABLE = {
+    "Tesla T4":              64,
+    "NVIDIA A10G":           128,
+    "NVIDIA A100":           256,
+    "NVIDIA L4":             128,
+    "NVIDIA L40S":           256,
+    "NVIDIA H100":           512,
+    "NVIDIA H100 80GB HBM3": 512,
+}
+
+
+def pick_decompress_batch(default: int = 64) -> int:
+    """Return the recommended cross-chunk batch size for the current
+    GPU. Reads `nvidia-smi --query-gpu=name` once and consults the
+    heuristic table. Falls back to `default` for unknown GPUs.
+
+    Override via env `KRUNCH_DECOMPRESS_BATCH=N` (used by CI for
+    repeatability; users shouldn't normally need this)."""
+    env = os.environ.get("KRUNCH_DECOMPRESS_BATCH")
+    if env:
+        try:
+            return max(1, int(env))
+        except ValueError:
+            pass
+    try:
+        import subprocess
+        name = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            text=True, timeout=2).strip().splitlines()[0].strip()
+    except Exception:
+        return default
+    for prefix, B in _DECOMPRESS_BATCH_TABLE.items():
+        if name.startswith(prefix):
+            return B
+    return default

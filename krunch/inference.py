@@ -355,9 +355,11 @@ class InferenceEngine:
     def _decompress_chunks_batched_cpp(self, encoded_chunks: list[bytes]) -> list[bytes]:
         """Bit-exact cross-chunk batched decompress.
 
-        Decodes B chunks in parallel through ONE batched stepped forward
-        per timestep. Throughput scales near-linearly with B until TC
-        matmul utilization saturates (T4 ≈ B=64, A10G ≈ B=128-256).
+        Decodes up to B_MAX chunks in parallel per batched stepped
+        forward call (B_MAX picked per-GPU by cpp_path.pick_decompress_batch).
+        If the input exceeds B_MAX, splits into B_MAX-sized groups and
+        processes them sequentially. Each group's per-timestep launch
+        overhead is fixed; the GPU is saturated within each group.
 
         Same numerics as `_decompress_chunk_cpp` per-chunk, just processed
         in lockstep — verified bit-exact in scripts/test_batched_stepped.py
@@ -366,6 +368,15 @@ class InferenceEngine:
         import torch
         import krunch_ac_cuda
         from krunch import cpp_path
+
+        # Auto-pick per-GPU batch size; split input into B_MAX-sized groups.
+        B_MAX = cpp_path.pick_decompress_batch()
+        if len(encoded_chunks) > B_MAX:
+            out: list[bytes] = []
+            for i in range(0, len(encoded_chunks), B_MAX):
+                out.extend(self._decompress_chunks_batched_cpp(
+                    encoded_chunks[i:i + B_MAX]))
+            return out
 
         B = len(encoded_chunks)
         # Parse mini-headers

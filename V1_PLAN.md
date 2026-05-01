@@ -347,7 +347,7 @@ Validation tiers (cheapest → most expensive, gate each before the next):
 | **T1: Quick checks** (free) | unit tests (`test_blob.py`), `krunch plan --target … --dry-run` artifact-validation for every supported target, plan-template lint. CI-equivalent. | ✅ |
 | **T2: Local CPU integration** (free) | `tests/integration.sh`: full neural path on CPU, byte-exact roundtrip on 224 B sample. Validates the single-shot CLI before spending GPU $. | ✅ |
 | **T3: Single-instance speed** (~$0.10–$5, hours) | `tests/gpu.sh` on g4dn (T4 cheap) or g5 (A10G full): ratio + **compress AND decompress** wall on a real WildChat sample. **Gate (tightened 2026-04-30 per Dan): ratio ≤ 0.11, byte-exact roundtrip, compress AND decompress avg ≥ 200 KB/s on A10G.** Path forward: cross-chunk batched stepped forward (process B chunks in parallel through one C++ layer call). All other levers (worker pool, CUDA graphs, single-stream fusion) measured insufficient on T4/A10G this session. | ⏳ |
-| **T4: `krunch plan` end-to-end** (~$2-5, ~30 min) | Build `krunch plan` for AWS Batch + k8s + Modal + local. Validate each emits a syntactically-valid artifact, then run **at least one target end-to-end** on the WildChat sample (likely AWS Batch since we already have the reference CDK + spike-6 validated path). Gates: same ratio, ~N× wall reduction at N=2, partial-blob cleanup happens, finalize task succeeds. Validates the "any batch system" README claim by exercising the env-var contract through one real scheduler. | ⏳ blocked on T3 green |
+| **T4: `krunch plan` end-to-end** (~$2-5, ~30 min) | Build `krunch plan` for AWS Batch + k8s + Modal + local. Validate each emits a syntactically-valid artifact, then run **at least one target end-to-end** on the WildChat sample (likely AWS Batch since we already have the reference CDK + spike-6 validated path). Gates: same ratio, ~N× wall reduction at N=2, partial-blob cleanup happens, finalize task succeeds. Validates the "any batch system" README claim by exercising the env-var contract through one real scheduler. | 🚧 scaffolding shipped 2026-04-30 (templates + CLI + worker + CI dry-run); blocked on T3 green for e2e run |
 | Docs | README, architecture.md, tuning.md, operations.md, benchmarks.md. 3-4 ratio benchmarks on public corpora (chat, support tickets, wiki, code) | ⏳ |
 | Polish | typed Python client SDK, Go client SDK, CI (lint + smoke), SECURITY.md, CONTRIBUTING.md | ⏳ |
 | Soft launch | dev-tool slack channels, ~10 individual reach-outs | ⏳ |
@@ -1112,6 +1112,32 @@ internally via one of (in order of preference):
 fallback if probing fails, env override for explicit control. Document
 in `tuning.md`. The contract stays simple: "give me a byte range and
 a GPU, I'll saturate it."
+
+**T4 progress (2026-04-30):**
+- ✅ `krunch/plan/` module — render() + validate(), 7 targets shipped
+  (aws-batch, k8s, modal, ray, slurm, gcp-batch, local). All
+  render + schema-validate cleanly.
+- ✅ `krunch/plan_cli.py` — in-image entry point. Host wrapper
+  docker-runs it so user only needs docker (no `pip install krunch`).
+- ✅ `scripts/krunch plan ...` host-side wrapper subcommand.
+  `--dry-run` validates schema; otherwise emits to stdout.
+- ✅ `krunch/job.py` reshaped around v1 env-var contract (KRUNCH_MODE,
+  KRUNCH_INPUT_URL, KRUNCH_OUTPUT_URL, KRUNCH_PART_INDEX,
+  KRUNCH_PART_COUNT, KRUNCH_INPUT_LEN, KRUNCH_FINALIZE_OF). Handles
+  compress, decompress, finalize modes. Same contract works on
+  every orchestrator; per-target templates map orchestrator-specific
+  vars (AWS_BATCH_JOB_ARRAY_INDEX, JOB_COMPLETION_INDEX,
+  SLURM_ARRAY_TASK_ID) → KRUNCH_PART_INDEX in the launch artifact.
+- ✅ `tests/test_plan.py` — Tier-1 CI test renders + validates every
+  target on every PR. Catches template breakage before push to
+  ghcr.io.
+- ⏳ Per-GPU auto-tune for cross-chunk batch B at worker startup
+  (heuristic table by GPU name, fallback to a 1-sec microbench).
+  Not strictly required for AWS Batch e2e at single-instance
+  scale — only matters once we run on multiple GPU types.
+- ⏳ AWS Batch e2e validation run (the actual T4 gate). Blocked on
+  T3 green so we know the per-instance numbers before pinning a
+  Batch queue config.
 
 **Edge cases that don't fully saturate (acceptable):**
 - File smaller than `B × chunk_size` — runs at lower B, graceful.
