@@ -763,6 +763,32 @@ Scaffolding in `krunch_ac/cuda/rwkv_step.cu`. Plan, ~1-2 weeks:
    decode time and dominated by per-launch kernel overhead from
    ~180 op launches per token (60 matmuls + 120 ATen ops).
 
+   **A10G validation (g5.xlarge, 2026-04-30):**
+   ```
+   8 KB  : C++  enc 132.2 KB/s  dec 1.2 KB/s  ratio 0.055  PASS
+   8 KB  : stck enc   0.7 KB/s  dec 0.7 KB/s  ratio 0.044  FAIL
+   32 KB : C++  enc  98.7 KB/s  dec 1.2 KB/s  ratio 0.084  PASS
+   32 KB : stck enc  52.8 KB/s  dec 0.7 KB/s  ratio 0.070  FAIL
+   ```
+   Encoder scales ~3× from T4 to A10G (33→99 KB/s, 45→132 KB/s) —
+   compute-bound, benefits from A10G's TFLOP advantage. **cpp_path
+   beats stock encode at 32 KB on A10G** (98.7 vs 52.8 KB/s, 1.87×
+   faster) — the deterministic kernels apparently scale better than
+   BlinkDL's JIT-scripted forward at this size.
+
+   Decoder is **identical T4 vs A10G** (1.2 KB/s on both, per-token
+   forward 4.07 ms on A10G vs 3.90 ms on T4 — within noise). This
+   confirms the decode bottleneck is CPU-side launch overhead, not
+   GPU compute. **A10G cannot help decode** until the per-token
+   forward is collapsed into one launch (persistent kernel).
+
+   Distance to "decompress = compress at 200 KB/s" goal:
+   - Compress: 132 KB/s on A10G — need 1.5× more (close).
+   - Decompress: 1.2 KB/s on A10G — need 167× more.
+   The decompress gap requires the persistent kernel + graph-safe
+   forward rewrite (5-7 day item). No GPU upgrade or worker pool
+   shortcut closes it.
+
    **Worker-pool decode is dead as a lever for cpp_path.** Measured
    4-worker aggregate at 0.9 KB/s vs single-stream 1.3 KB/s — workers
    contend for the same SMs since cpp_path now saturates the GPU.
