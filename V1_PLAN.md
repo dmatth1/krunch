@@ -443,43 +443,52 @@ No paid customers in v1 — that's v2's job.
 compress wall on a single A10G**. The 30× compress/decompress asymmetry
 is the gate.
 
-**T3 first-run findings (2026-04-30, A10G g5.xlarge, 10 MB WildChat
-via `tests/gpu.sh`-equivalent path):**
+**T3 status (2026-05-01):**
 
-| Run | Chunk | B | Compress KB/s | Decompress KB/s | Ratio | Roundtrip |
-|---|---|---|---|---|---|---|
-| 1 | 1 MB | 10 | 105 | aborted | 0.1162 | not tested |
-| 2 | 64 KB | 128 | 109 | 35 | 0.1166 | ❌ CRC fail |
-| 3 | 64 KB | 8   | n/a | 6 | n/a | ❌ same CRC |
+Bug fixed and pushed: **CRC mismatch was UTF-8 chunk boundary
+slicing**, not a batched-decompress bug. `chunking._split_utf8_safe`
+now snaps each chunk boundary back from UTF-8 continuation bytes
+(0x80-0xBF) so multi-byte codepoints aren't cut. ASCII content
+(my earlier synthetic tests) never hit this; WildChat hits it ~1%
+of the time, which is why 158/160 chunks bit-exact while 2 chunks
+got `\xef\xbf\xbd` (replacement char) where original was `\xe2\x80\x9c`.
 
-Both batched-decompress runs produced the **same wrong CRC**
-(`0xc9a5f1d0` vs expected `0x928aa11b`) → the bug is **not** a B-scale
-issue. Cross-chunk batched decompress is bit-deterministic but
-disagrees with the streaming compress at multi-window boundaries.
+Verified bit-exact on T4 with full 10 MB WildChat:
+  compress 29 KB/s, decompress 18 KB/s, ratio 0.1166, BYTE_EXACT=PASS.
+T4 numbers extrapolate to A10G ~3× → ~87 / 54 KB/s.
 
-Most likely culprit: `cpp_path.forward_packed_window` (added
-2026-04-30 to fix OOM at 1 MB chunks) doesn't preserve bit-exact
-state-carry across SEQ_BATCH=1024 boundaries. Existing roundtrip
-unit test (scripts/test_engine_cpp_roundtrip.py) only used T<2K
-tokens (one window) — never exercised the multi-window code path.
+**Remaining T3 gaps (vs ratio ≤0.11, both speeds ≥200, byte-exact):**
 
-**Open T3 bugs / gaps to close:**
-1. **CRC mismatch on multi-window compress + batched decompress.**
-   Repro test landing as `scripts/test_multi_window_roundtrip.py`
-   (no GPU dependency at write time; runs against the live image).
-   Fix path: bisect compress side (compare logits per-token between
-   forward_packed_window in N windows vs N×T=1 stepped) to localize
-   the state-carry mismatch.
-2. **Decompress speed 35 KB/s ≪ 200 target.** Even with bigger B
-   (256, 512), per-step compute floor on A10G caps around 50-100
-   KB/s for a single GPU. Full decompress speedup requires the
-   persistent kernel work (V1_PLAN backlog, multi-day).
-3. **Compress speed 109 KB/s ≪ 200 target.** Encoder fusion
-   (cuBLAS algo pin + ATen fusion) was the agreed lever but
-   deferred until T3 correctness lands.
-4. **Ratio 0.1166 vs 0.11 target.** ~6% over. Mostly model
-   numerics with cpp_path; may also be the +0.04% chunk-size cost
-   from 64 KB. Defer revisit until correctness + speed land.
+| | A10G projection | Target | Gap |
+|---|---|---|---|
+| Ratio | 0.1166 | ≤0.11 | +6% |
+| Compress | ~87 KB/s | ≥200 | 2.3× |
+| Decompress | ~54 KB/s | ≥200 | 3.7× |
+| Roundtrip | ✅ | ✅ | — |
+
+**Plan (in order):**
+
+1. **Encoder fusion first (cuBLAS algo pin)** — replace det_matmul_tc
+   on layer matmuls with `cublasGemmEx` pinned to a specific algo
+   (CUBLAS_GEMM_ALGO* enum, not DEFAULT which auto-selects). cuBLAS
+   with fixed algo is shape-stable AND uses tuned tile schedules →
+   2-3× compress on A10G expected. Single C++ file change. Verify
+   bit-exact vs det_matmul_tc on T4 first.
+
+2. **Bigger-sample T3 measurement** — re-run on 100 MB+ WildChat
+   slice with the encoder fusion live. Decompress gate may be
+   reachable without the persistent kernel because larger files
+   support higher B without dropping chunk size (the ratio-cost
+   tradeoff that caps a 10 MB file).
+
+3. **Persistent kernel for decompress** — only if (2) shows
+   decompress still <200 KB/s. 1-2 weeks of CUDA work. Sized
+   from prior measurements: A10G with B=128 plateaus around
+   120-150 KB/s; persistent kernel removes per-step launch
+   overhead floor.
+
+4. **Ratio gap (+6%)** — minor. If everything else lands and ratio
+   is the only gap, can revisit chunk size / model numerics.
 
 **Shipped (in tree, exercised by tests/gpu.sh):**
 
