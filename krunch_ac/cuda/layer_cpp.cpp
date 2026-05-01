@@ -30,6 +30,13 @@ void launch_det_matmul(const void* x, const void* W, void* y,
 void launch_det_matmul_tc(const void* A, const void* B, void* C,
                            int write_fp32, int M, int K, int N,
                            cudaStream_t stream);
+// 3-way batched TC matmul — see det_matmul_tc_3way.cu.
+void launch_det_matmul_tc_3way(
+    const void* x0, const void* x1, const void* x2,
+    const void* W0, const void* W1, const void* W2,
+    void* y0, void* y1, void* y2,
+    int wf0, int wf1, int wf2,
+    int M, int K, int N, cudaStream_t stream);
 // Deterministic softmax + CDF — see det_softmax_cdf.cu.
 void launch_det_softmax_cdf(const void* logits, void* cdf,
                              int T, int V, int cdf_T_value,
@@ -113,10 +120,40 @@ at::Tensor rwkv4_layer_step_cpp_t1(
         kx.data_ptr(), vx.data_ptr(), rx.data_ptr(),
         1, 1, (int)C, stream_t1);
 
-    // K, V, R linears
-    auto r = at::sigmoid(gemm_fp16(rx, Rw));                       // [1, C]
-    auto k = gemm_fp16(kx, Kw, at::kFloat);                        // [1, n_att]
-    auto v = gemm_fp16(vx, Vw, at::kFloat);                        // [1, n_att]
+    // K, V, R linears — fused into one TC kernel launch (3 GEMMs in 1).
+    // Outputs:
+    //   k = kx @ Kw  → fp32 [1, n_att]
+    //   v = vx @ Vw  → fp32 [1, n_att]
+    //   r_pre = rx @ Rw → fp16 [1, C]   (sigmoid applied below)
+    const int n_att = (int)Kw.size(-1);
+    auto k = at::empty({1, n_att}, kx.options().dtype(at::kFloat));
+    auto v = at::empty({1, n_att}, vx.options().dtype(at::kFloat));
+    auto r_pre = at::empty({1, C}, rx.options());
+    auto Kw_c = Kw.contiguous();
+    auto Vw_c = Vw.contiguous();
+    auto Rw_c = Rw.contiguous();
+    static const bool USE_DET_3WAY = []{
+        const char* e = std::getenv("KRUNCH_DETERMINISTIC_MATMUL");
+        return e != nullptr && std::string(e) == "1";
+    }();
+    if (USE_DET_3WAY) {
+        // n_att == C for RWKV-4 (768 == 768), so M=N=K=768; K dim of input
+        // must match. Kw is [C, n_att], Vw is [C, n_att], Rw is [C, C].
+        // All have K=C=768 and N=n_att=C=768 → same shape, batchable.
+        TORCH_CHECK(n_att == (int)C, "3-way fusion needs n_att == C");
+        launch_det_matmul_tc_3way(
+            kx.data_ptr(), vx.data_ptr(), rx.data_ptr(),
+            Kw_c.data_ptr(), Vw_c.data_ptr(), Rw_c.data_ptr(),
+            k.data_ptr(), v.data_ptr(), r_pre.data_ptr(),
+            /*wf0=*/1, /*wf1=*/1, /*wf2=*/0,
+            /*M=*/1, /*K=*/(int)C, /*N=*/n_att, stream_t1);
+    } else {
+        // Fallback: 3 separate matmuls via the dispatcher.
+        k.copy_(gemm_fp16(kx, Kw, at::kFloat));
+        v.copy_(gemm_fp16(vx, Vw, at::kFloat));
+        r_pre.copy_(gemm_fp16(rx, Rw));
+    }
+    auto r = at::sigmoid(r_pre);                                   // [1, C]
 
     // WKV via rwkv's CUDA op (handles B*T*C = 1*1*C = C elements).
     auto k_flat = k.contiguous();
@@ -225,9 +262,32 @@ at::Tensor rwkv4_layer_step_cpp(
         kx_flat.data_ptr(), vx_flat.data_ptr(), rx_flat.data_ptr(),
         (int)B, (int)T, (int)C, stream0);
 
-    auto r = at::sigmoid(gemm_fp16(rx_flat, Rw)).view({B, T, C});
-    auto k = gemm_fp16(kx_flat, Kw, at::kFloat);                    // [B*T, n_att]
-    auto v = gemm_fp16(vx_flat, Vw, at::kFloat);                    // [B*T, n_att]
+    // K, V, R linears — fused into one TC kernel launch (3 GEMMs in 1).
+    const int n_att_p = (int)Kw.size(-1);
+    auto k = at::empty({B * T, n_att_p}, kx_flat.options().dtype(at::kFloat));
+    auto v = at::empty({B * T, n_att_p}, vx_flat.options().dtype(at::kFloat));
+    auto r_pre_flat = at::empty({B * T, C}, rx_flat.options());
+    auto Kw_c_p = Kw.contiguous();
+    auto Vw_c_p = Vw.contiguous();
+    auto Rw_c_p = Rw.contiguous();
+    static const bool USE_DET_3WAY_P = []{
+        const char* e = std::getenv("KRUNCH_DETERMINISTIC_MATMUL");
+        return e != nullptr && std::string(e) == "1";
+    }();
+    if (USE_DET_3WAY_P) {
+        TORCH_CHECK(n_att_p == (int)C, "3-way fusion needs n_att == C");
+        launch_det_matmul_tc_3way(
+            kx_flat.data_ptr(), vx_flat.data_ptr(), rx_flat.data_ptr(),
+            Kw_c_p.data_ptr(), Vw_c_p.data_ptr(), Rw_c_p.data_ptr(),
+            k.data_ptr(), v.data_ptr(), r_pre_flat.data_ptr(),
+            /*wf0=*/1, /*wf1=*/1, /*wf2=*/0,
+            /*M=*/(int)(B * T), /*K=*/(int)C, /*N=*/n_att_p, stream0);
+    } else {
+        k.copy_(gemm_fp16(kx_flat, Kw, at::kFloat));
+        v.copy_(gemm_fp16(vx_flat, Vw, at::kFloat));
+        r_pre_flat.copy_(gemm_fp16(rx_flat, Rw));
+    }
+    auto r = at::sigmoid(r_pre_flat).view({B, T, C});
 
     // WKV: kernel expects [B*T, C] in/out.
     auto k_c = k.contiguous();

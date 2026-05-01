@@ -20,7 +20,8 @@ setup(
             sources=["main.cpp", "encode_kernel.cu", "decode_kernel.cu",
                      "rwkv_step.cu", "mb_gemv.cu", "layer_cpp.cpp",
                      "premix_kernels.cu", "det_matmul.cu",
-                     "det_softmax_cdf.cu", "det_matmul_tc.cu"],
+                     "det_softmax_cdf.cu", "det_matmul_tc.cu",
+                     "det_matmul_tc_3way.cu"],
             extra_compile_args={
                 "cxx": ["-O3", "-std=c++17"],
                 "nvcc": ["-O3", "--use_fast_math", "-std=c++17"],
