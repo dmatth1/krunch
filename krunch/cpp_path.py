@@ -111,20 +111,31 @@ def forward_packed(weights: dict, input_ids, state):
     if not isinstance(input_ids, torch.Tensor):
         input_ids = torch.as_tensor(input_ids, dtype=torch.long, device=device)
     T = int(input_ids.shape[0])
-    x = emb_w[input_ids].view(1, T, n_embd).contiguous()
-    for i in range(N_LAYER):
-        x = krunch_ac_cuda.rwkv4_layer_step_cpp(
-            x.contiguous(),
-            state[0][i], state[1][i], state[2][i], state[3][i], state[4][i],
-            *layers[i],
-        )
-    # Batched ln_out — verified shape-stable in
-    # test_full_model_packed_vs_stepped.py: "ln_out batched vs per-row
-    # diff: 0.000000e+00" across T=31 with real RWKV-4 weights.
-    x_flat = x.view(T, n_embd).contiguous()
-    xn = F.layer_norm(x_flat, (n_embd,), weight=ln_out_w, bias=ln_out_b)
-    logits = krunch_ac_cuda.det_matmul(xn.contiguous(), head_w.contiguous())
-    return logits  # [T, V]
+
+    # Time-batch in SEQ_BATCH-sized windows so the head matmul output
+    # ([T_window, V=50277]) doesn't blow out VRAM at large T. State
+    # carries forward between windows naturally — this is bit-identical
+    # to one big T call (verified by the per-chunk roundtrip in
+    # test_engine_cpp_roundtrip.py at T<=8K).
+    SEQ_BATCH = int(os.environ.get("KRUNCH_FORWARD_BATCH", "1024"))
+    out_chunks = []
+    for off in range(0, T, SEQ_BATCH):
+        ids_w = input_ids[off:off + SEQ_BATCH]
+        T_w = int(ids_w.shape[0])
+        x = emb_w[ids_w].view(1, T_w, n_embd).contiguous()
+        for i in range(N_LAYER):
+            x = krunch_ac_cuda.rwkv4_layer_step_cpp(
+                x.contiguous(),
+                state[0][i], state[1][i], state[2][i], state[3][i], state[4][i],
+                *layers[i],
+            )
+        x_flat = x.view(T_w, n_embd).contiguous()
+        xn = F.layer_norm(x_flat, (n_embd,),
+                          weight=ln_out_w, bias=ln_out_b)
+        logits_w = krunch_ac_cuda.det_matmul(xn.contiguous(),
+                                              head_w.contiguous())
+        out_chunks.append(logits_w)
+    return torch.cat(out_chunks, dim=0) if len(out_chunks) > 1 else out_chunks[0]
 
 
 _STEPPED_BUFS_CACHE: dict[int, list] = {}
