@@ -59,7 +59,7 @@ def compress_all(raw: bytes,
     If `neural_batch_fn` is supplied (the chunks-batched encode path),
     invoke it once with all chunks; otherwise per-chunk via `neural_fn`.
     """
-    chunks = [raw[i:i + CHUNK_SIZE] for i in range(0, len(raw), CHUNK_SIZE)]
+    chunks = _split_utf8_safe(raw, CHUNK_SIZE)
     if neural_batch_fn is not None and len(chunks) > 1:
         compressed = neural_batch_fn(chunks)
         entries = [
@@ -69,6 +69,32 @@ def compress_all(raw: bytes,
         return entries, len(entries)
     entries = [_compress_chunk(chunk, neural_fn) for chunk in chunks]
     return entries, len(entries)
+
+
+def _split_utf8_safe(raw: bytes, target_size: int) -> list[bytes]:
+    """Split `raw` into chunks of approximately `target_size` bytes,
+    snapping each chunk boundary back to the nearest UTF-8 codepoint
+    boundary so multi-byte sequences are never cut in half.
+
+    `compress_chunk` decodes its input as UTF-8 with errors="replace"
+    before tokenizing — without this snap, a partial codepoint at the
+    chunk boundary becomes U+FFFD, making compress silently lossy.
+    Chunk sizes vary by ≤3 bytes from `target_size`. Chunks always
+    sum to len(raw)."""
+    chunks = []
+    pos = 0
+    n = len(raw)
+    while pos < n:
+        end = min(pos + target_size, n)
+        if end < n:
+            # UTF-8 continuation bytes are 0b10xxxxxx (0x80-0xBF).
+            # Walk back while we're sitting on one — splitting before
+            # any continuation byte keeps codepoints intact.
+            while end > pos and 0x80 <= raw[end] < 0xC0:
+                end -= 1
+        chunks.append(raw[pos:end])
+        pos = end
+    return chunks
 
 
 def _compress_chunk(chunk: bytes,
