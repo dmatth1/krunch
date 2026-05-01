@@ -818,8 +818,15 @@ Scaffolding in `krunch_ac/cuda/rwkv_step.cu`. Plan, ~1-2 weeks:
 
    Estimated effort: 2-3 days focused.
 
-   **Compress speedup plan (parallel track, 2026-04-30 — to hit
-   ≥200 KB/s on A10G; stretch 700 KB/s).**
+   **Compress speedup plan — DEFERRED past T3 gate (per Dan,
+   2026-04-30).** T3 only requires decompress to hit 200 KB/s; once
+   that lands and T3 passes, T4 work begins and compress
+   optimization can be sequenced after. Plan retained below for
+   reference.
+
+   ----
+   **Compress speedup plan (post-T3, to hit ≥200 KB/s on A10G;
+   stretch 700 KB/s).**
 
    Current A10G measured: 132 KB/s @ 8 KB chunks, 99 KB/s @ 32 KB
    (memory-bandwidth bound on the head matmul at large T). Need
@@ -1076,6 +1083,40 @@ to-end. Blocked on T3 green.
   `--workers`, optional `--image` / `--queue` / `--memory` etc.;
   renders the matching template to stdout. `--dry-run` validates
   template against schema without printing.
+
+**Per-GPU saturation (NEW 2026-04-30 — required for the "any GPU"
+claim).** `--workers N` controls machine count; per-GPU saturation
+must happen INSIDE the worker container. Compress already saturates
+because each chunk is a packed-T matmul (large M). Decompress
+saturation depends on the cross-chunk batch size B (number of chunks
+in flight on one GPU at once), and **optimal B is GPU-specific**:
+
+  - T4 (16 GB):  B ≈ 64
+  - A10G (24 GB): B ≈ 128–256
+  - A100/H100:   B ≈ 512+
+
+`krunch plan` itself stays GPU-agnostic — the artifact only describes
+the worker count, not internal batching. The Docker image picks B
+internally via one of (in order of preference):
+
+  1. **Auto-tune at worker startup** — probe VRAM, run a ~1 sec
+     microbench at B=8/64/256/512, pick the B that maximizes
+     KB/s within the VRAM budget. Best UX, robust to new GPUs.
+     Adds ~2-5 sec to worker cold start.
+  2. **Heuristic table** keyed on `nvidia-smi --query-gpu=name`
+     — fast, but every new GPU needs a table entry.
+  3. **Env override** `KRUNCH_DECOMPRESS_BATCH=N` for power users
+     and CI repeatability.
+
+**T4 ships with all three:** auto-tune by default, heuristic table as
+fallback if probing fails, env override for explicit control. Document
+in `tuning.md`. The contract stays simple: "give me a byte range and
+a GPU, I'll saturate it."
+
+**Edge cases that don't fully saturate (acceptable):**
+- File smaller than `B × chunk_size` — runs at lower B, graceful.
+- Heterogeneous chunk lengths — batch shrinks toward end of file.
+- Weaker-than-expected GPU — auto-tune picks lower B.
 
 **Validate:**
 
