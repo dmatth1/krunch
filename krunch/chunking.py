@@ -26,9 +26,14 @@ logger = logging.getLogger(__name__)
 # encoded bytes batch by batch, so peak memory is O(SEQ_BATCH × vocab) ≈
 # 200 MB regardless of chunk size). Bigger chunks → better ratio (more model
 # context, smaller cold-start fraction); smaller chunks → more cross-chunk
-# parallelism for the distributed Batch path. 1 MB matches Spike 6's tradeoff.
-# Override via KRUNCH_CHUNK_SIZE.
-CHUNK_SIZE = int(os.environ.get("KRUNCH_CHUNK_SIZE", 1048576))  # 1 MB
+# parallelism for cross-chunk batched decode (each chunk is one batch
+# slot in the stepped forward; B=128 on A10G, so we want ≥128 chunks
+# per file to keep the GPU saturated).
+#
+# 64 KB measured cost vs 1 MB on a 3 MB WildChat sample: +0.08% ratio
+# (essentially noise). Default flipped 2026-04-30 to fill the GPU on
+# small-to-mid files. Override via KRUNCH_CHUNK_SIZE.
+CHUNK_SIZE = int(os.environ.get("KRUNCH_CHUNK_SIZE", 65536))  # 64 KB
 
 # Number of chunks decompressed concurrently on a single worker. Each
 # concurrent stream maintains its own RNN state and AC decoder; threads
