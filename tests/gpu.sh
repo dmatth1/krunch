@@ -6,7 +6,8 @@
 # on a 100 MB WildChat sample. Same exact path as a real user, just
 # automated end-to-end.
 #
-# Gates: ratio ≤ 0.165, compress ≥ 300 KB/s, byte-exact roundtrip.
+# Gates (tightened 2026-04-30): ratio ≤ 0.11, compress AND decompress
+# avg ≥ 200 KB/s, byte-exact roundtrip.
 #
 # Cost: ~$0.30/hr × ~10 min ≈ $0.05 (image pull + run, no build).
 # Set KRUNCH_LOCAL_BUILD=1 to build from source instead of pulling
@@ -201,8 +202,9 @@ result = {
     "decompress_kb_s": round(dkb, 1),
     "byte_exact": byte_exact,
     "gates": {
-        "ratio_lte_0_165": ratio <= 0.165,
-        "compress_kb_s_gte_300": ckb >= 300,
+        "ratio_lte_0_11": ratio <= 0.11,
+        "compress_kb_s_gte_200": ckb >= 200,
+        "decompress_kb_s_gte_200": dkb >= 200,
         "byte_exact": byte_exact,
     },
 }

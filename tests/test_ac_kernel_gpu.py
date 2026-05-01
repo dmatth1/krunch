@@ -152,3 +152,64 @@ def test_decode_kernel_roundtrip(N, V, seed):
         f"GPU decode diverges from input symbols at N={N},V={V},seed={seed}\n"
         f"first mismatch: idx={(decoded != sym).argmax()} "
         f"expected={sym[(decoded != sym).argmax()]} got={decoded[(decoded != sym).argmax()]}")
+
+
+# ---------------------------------------------------------------------------
+# Batched decode kernel: B independent chunks decoded in lockstep
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("B,N,V,seed", [
+    (2, 16, 32, 7),
+    (4, 64, 256, 8),
+    (8, 256, 1024, 9),
+    (3, 1024, 50277, 10),
+])
+def test_decode_step_batched_roundtrip(B, N, V, seed):
+    """Encode B independent chunks, then decode them all in B-wide lockstep
+    using `decode_step_batched`. Every chunk must round-trip byte-exact."""
+    device = "cuda"
+
+    bitstreams = []
+    cdfs_per_chunk = []  # list of (N, V+1) numpy uint32
+    syms_per_chunk = []  # list of (N,) int32 numpy
+    for b in range(B):
+        p = _rand_probs(N, V, seed=seed + b)
+        rng = np.random.default_rng(seed + b + 100)
+        cum = np.cumsum(p, axis=1)
+        u = rng.random((N, 1)).astype(np.float32)
+        sym = (u < cum).argmax(axis=1).astype(np.int32)
+        bs_gpu, cdf_np = _gpu_encode_single_batch(p, sym)
+        bitstreams.append(bs_gpu)
+        cdfs_per_chunk.append(cdf_np)
+        syms_per_chunk.append(sym)
+
+    # Concat bitstreams + 64-byte tail pad per stream.
+    TAIL_PAD = 64
+    base_offsets = []
+    pos = 0
+    for bs in bitstreams:
+        base_offsets.append(pos)
+        pos += len(bs) + TAIL_PAD
+    cat = bytearray(pos)
+    for off, bs in zip(base_offsets, bitstreams):
+        cat[off:off + len(bs)] = bs
+
+    input_buf = torch.frombuffer(bytes(cat), dtype=torch.uint8).clone().to(device)
+    base_byte_offsets = torch.tensor(base_offsets, dtype=torch.int32, device=device)
+    states = torch.zeros(B * 4, dtype=torch.uint32, device=device)
+    krunch_ac_cuda.decode_init_batched(input_buf, base_byte_offsets, states)
+
+    out_syms = torch.empty(B, dtype=torch.int32, device=device)
+    decoded = np.empty((B, N), dtype=np.int32)
+    for t in range(N):
+        # Build the per-step CDF batch [B, V+1] from each chunk's CDFs at step t.
+        cdfs_t = np.stack([cdfs_per_chunk[b][t] for b in range(B)]).astype(np.int32)
+        cdfs_gpu = torch.from_numpy(cdfs_t).to(device)
+        krunch_ac_cuda.decode_step_batched(
+            cdfs_gpu, input_buf, base_byte_offsets, states, out_syms)
+        decoded[:, t] = out_syms.cpu().numpy()
+
+    for b in range(B):
+        assert (decoded[b] == syms_per_chunk[b]).all(), (
+            f"chunk {b} of {B} mismatched at first index "
+            f"{(decoded[b] != syms_per_chunk[b]).argmax()}")

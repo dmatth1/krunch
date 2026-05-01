@@ -125,3 +125,114 @@ void launch_decode_step(
 {
     decode_step_kernel<<<1, 1, 0, stream>>>(cdf, V, input_buf, state, out_sym);
 }
+
+// ---------------------------------------------------------------------------
+// Batched variants — B independent streams in one launch. Each stream owns
+// a (low, high, value, bit_offset) tuple and reads from `input_buf` starting
+// at `base_byte_offsets[stream]`. CDFs are laid out as `[B, V+1]` row-major
+// (each step uses the same V across streams). One thread per stream; work
+// within a stream is still serial (range-coder dependency chain), so the
+// win comes from issuing one launch per timestep instead of B launches.
+// ---------------------------------------------------------------------------
+
+extern "C" __global__ void decode_init_batched_kernel(
+    const uint8_t* __restrict__ input_buf,
+    const int32_t* __restrict__ base_byte_offsets,  // [B]
+    DecodeState* states,                            // [B]
+    int B)
+{
+    const int stream = blockIdx.x * blockDim.x + threadIdx.x;
+    if (stream >= B) return;
+
+    const uint8_t* in = input_buf + base_byte_offsets[stream];
+    uint32_t bit_offset = 0;
+    uint32_t value = 0;
+    for (int i = 0; i < PRECISION; i++) {
+        value = (value << 1) | read_bit(in, bit_offset);
+    }
+    states[stream].low = 0;
+    states[stream].high = 0xFFFFFFFFu;
+    states[stream].value = value;
+    states[stream].bit_offset = bit_offset;
+}
+
+extern "C" __global__ void decode_step_batched_kernel(
+    const int32_t* __restrict__ cdfs,   // [B, V+1]
+    int V,
+    const uint8_t* __restrict__ input_buf,
+    const int32_t* __restrict__ base_byte_offsets,  // [B]
+    DecodeState* states,                // [B]
+    int32_t* out_syms,                  // [B]
+    int B)
+{
+    const int stream = blockIdx.x * blockDim.x + threadIdx.x;
+    if (stream >= B) return;
+
+    const int32_t* cdf = cdfs + (size_t)stream * (size_t)(V + 1);
+    const uint8_t* in = input_buf + base_byte_offsets[stream];
+
+    uint32_t low = states[stream].low;
+    uint32_t high = states[stream].high;
+    uint32_t value = states[stream].value;
+    uint32_t bit_offset = states[stream].bit_offset;
+
+    const uint64_t rng = (uint64_t)(high - low) + 1ULL;
+    const uint64_t value_off = (uint64_t)(value - low) + 1ULL;
+    const uint64_t target = (value_off * (uint64_t)CDF_T - 1ULL) / rng;
+
+    int lo = 0, hi = V;
+    while (lo < hi) {
+        int mid = (lo + hi) >> 1;
+        if ((uint32_t)cdf[mid + 1] <= (uint32_t)target) lo = mid + 1;
+        else hi = mid;
+    }
+    const int sym = lo;
+    out_syms[stream] = sym;
+
+    const uint32_t sym_lo = (uint32_t)cdf[sym];
+    const uint32_t sym_hi = (uint32_t)cdf[sym + 1];
+    high = low + (uint32_t)((rng * (uint64_t)sym_hi) >> CDF_PRECISION) - 1u;
+    low  = low + (uint32_t)((rng * (uint64_t)sym_lo) >> CDF_PRECISION);
+
+    while (true) {
+        if (high < HALF) {
+            // E1
+        } else if (low >= HALF) {
+            low -= HALF; high -= HALF; value -= HALF;
+        } else if (low >= QTR && high < THREE_QTR) {
+            low -= QTR; high -= QTR; value -= QTR;
+        } else {
+            break;
+        }
+        low = (low << 1) & 0xFFFFFFFFu;
+        high = ((high << 1) | 1u) & 0xFFFFFFFFu;
+        value = ((value << 1) | read_bit(in, bit_offset)) & 0xFFFFFFFFu;
+    }
+
+    states[stream].low = low;
+    states[stream].high = high;
+    states[stream].value = value;
+    states[stream].bit_offset = bit_offset;
+}
+
+void launch_decode_init_batched(
+    const uint8_t* input_buf, const int32_t* base_byte_offsets,
+    DecodeState* states, int B, cudaStream_t stream)
+{
+    const int threads = 32;
+    const int blocks = (B + threads - 1) / threads;
+    decode_init_batched_kernel<<<blocks, threads, 0, stream>>>(
+        input_buf, base_byte_offsets, states, B);
+}
+
+void launch_decode_step_batched(
+    const int32_t* cdfs, int V,
+    const uint8_t* input_buf, const int32_t* base_byte_offsets,
+    DecodeState* states, int32_t* out_syms,
+    int B, cudaStream_t stream)
+{
+    const int threads = 32;
+    const int blocks = (B + threads - 1) / threads;
+    decode_step_batched_kernel<<<blocks, threads, 0, stream>>>(
+        cdfs, V, input_buf, base_byte_offsets, states, out_syms, B);
+}

@@ -50,7 +50,17 @@ def cmd_compress(args):
     raw = _read_input(args.input)
     with _stdout_to_stderr():
         engine.load()
-    chunk_entries, n_chunks = compress_all(raw, engine.compress_chunk)
+    # Compress stays sequential per chunk (T=1024 packed forward) — that's
+    # what gives ~155 KB/s on A10G. The chunk-batched compress path
+    # (`engine.compress_chunks_batched`) exists and is correct but slows
+    # compress 5×; reachable opportunistically via KRUNCH_COMPRESS_BATCHED=1.
+    if os.environ.get("KRUNCH_COMPRESS_BATCHED") == "1":
+        chunk_entries, n_chunks = compress_all(
+            raw, engine.compress_chunk,
+            neural_batch_fn=engine.compress_chunks_batched,
+        )
+    else:
+        chunk_entries, n_chunks = compress_all(raw, engine.compress_chunk)
     crc = zlib.crc32(raw) & 0xFFFFFFFF
     blob = encode_header(len(raw), n_chunks, crc) + b"".join(chunk_entries)
     _write_output(args.output, blob)
@@ -65,7 +75,33 @@ def cmd_decompress(args):
         engine.load()
     hdr = decode_header(blob)
     entries_bytes = blob[HEADER_SIZE:]
-    raw = decompress_all(entries_bytes, hdr["n_chunks"], engine.decompress_chunk)
+    # Decompress dispatch:
+    #   - KRUNCH_CPP_PATH=1 (default): single-process cross-chunk batched
+    #     stepped forward via engine.decompress_chunks_batched. Saturates
+    #     GPU by processing B chunks in parallel through ONE batched
+    #     forward per timestep. Bit-exact roundtrip.
+    #   - KRUNCH_CPP_PATH=0 (legacy): multi-process worker pool over the
+    #     per-chunk path. Faster on the broken-but-unverified BlinkDL path
+    #     where per-chunk single-stream decompress was Python-bound.
+    from .cpp_path import cpp_path_enabled
+    if cpp_path_enabled() and hdr["n_chunks"] > 1:
+        raw = decompress_all(
+            entries_bytes, hdr["n_chunks"], engine.decompress_chunk,
+            neural_batch_fn=engine.decompress_chunks_batched,
+        )
+    else:
+        from .worker_pool import DecompressWorkerPool, default_worker_count
+        n_workers = default_worker_count()
+        if n_workers > 1 and hdr["n_chunks"] > 1:
+            with DecompressWorkerPool(n_workers) as pool:
+                raw = decompress_all(
+                    entries_bytes, hdr["n_chunks"], engine.decompress_chunk,
+                    neural_batch_fn=pool.decompress_chunks,
+                )
+        else:
+            raw = decompress_all(
+                entries_bytes, hdr["n_chunks"], engine.decompress_chunk,
+            )
 
     # CRC check — skipped if header flags say "no CRC" (assembled-from-parts blobs)
     if not hdr["flags"] & 0x01:

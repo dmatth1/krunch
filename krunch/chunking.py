@@ -18,7 +18,7 @@ import os
 import struct
 import logging
 from concurrent.futures import ThreadPoolExecutor
-from typing import Callable
+from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -34,18 +34,35 @@ CHUNK_SIZE = int(os.environ.get("KRUNCH_CHUNK_SIZE", 1048576))  # 1 MB
 # concurrent stream maintains its own RNN state and AC decoder; threads
 # overlap their forward calls so the GPU isn't idle between Python steps.
 # Larger = more GPU utilization but more memory for state + logits.
-DECOMPRESS_BATCH = int(os.environ.get("KRUNCH_DECOMPRESS_BATCH", 16))
+# Default 1 (sequential): with the GPU AC kernel landing in v1.1, each
+# decode step ends in a `.item()` GPU sync that blocks the calling thread,
+# and 8 threads contending for one GPU + one Python GIL ran ~1.7× SLOWER
+# than sequential on T4 (32m vs 19m on a 3 MB / 3-chunk sample, 2026-04-28).
+# Per-thread CUDA streams didn't fix it — bottleneck is per-token
+# Python+launch overhead, not GPU SM occupancy. Set >1 only for the older
+# CPU-AC code path or for a future batched-WKV decode redesign.
+DECOMPRESS_BATCH = int(os.environ.get("KRUNCH_DECOMPRESS_BATCH", 1))
 
 # Per-chunk entry: orig_len(4) + comp_len(4) + neural_compressed_data
 
 
 def compress_all(raw: bytes,
-                 neural_fn: Callable[[bytes], bytes]) -> tuple[list[bytes], int]:
-    """Compress raw bytes chunk by chunk via the neural codec."""
-    entries = []
-    for i in range(0, len(raw), CHUNK_SIZE):
-        chunk = raw[i:i + CHUNK_SIZE]
-        entries.append(_compress_chunk(chunk, neural_fn))
+                 neural_fn: Callable[[bytes], bytes],
+                 neural_batch_fn: Optional[Callable[[list], list]] = None
+                 ) -> tuple[list[bytes], int]:
+    """Compress raw bytes chunk by chunk via the neural codec.
+    If `neural_batch_fn` is supplied (the chunks-batched encode path),
+    invoke it once with all chunks; otherwise per-chunk via `neural_fn`.
+    """
+    chunks = [raw[i:i + CHUNK_SIZE] for i in range(0, len(raw), CHUNK_SIZE)]
+    if neural_batch_fn is not None and len(chunks) > 1:
+        compressed = neural_batch_fn(chunks)
+        entries = [
+            struct.pack(">II", len(c), len(z)) + z
+            for c, z in zip(chunks, compressed)
+        ]
+        return entries, len(entries)
+    entries = [_compress_chunk(chunk, neural_fn) for chunk in chunks]
     return entries, len(entries)
 
 
@@ -60,14 +77,16 @@ def _compress_chunk(chunk: bytes,
 
 
 def decompress_all(entries_bytes: bytes, n_chunks: int,
-                   neural_fn: Callable[[bytes], bytes]) -> bytes:
+                   neural_fn: Callable[[bytes], bytes],
+                   neural_batch_fn: Optional[Callable[[list], list]] = None
+                   ) -> bytes:
     """
-    Decompress all chunks. Up to DECOMPRESS_BATCH chunks run concurrently
-    via a ThreadPoolExecutor — each thread runs its own AC decoder + RNN
-    forward loop. The rwkv package's forward() releases the GIL during
-    CUDA work, so threads overlap Python (AC + bookkeeping) and CUDA
-    (kernel launches) latency across chunks. Output is byte-identical
-    to the sequential path.
+    Decompress all chunks. If `neural_batch_fn` is supplied (the
+    GPU-batched chunk path), invoke it once with all chunks; otherwise
+    fall back to per-chunk via `neural_fn` (sequential or, when
+    `KRUNCH_DECOMPRESS_BATCH > 1`, ThreadPoolExecutor — only useful for
+    the legacy CPU-AC path; see chunking.py module docstring + V1_PLAN
+    for why we default sequential under GPU AC).
     """
     # Pre-parse all chunks (cheap — just slicing + 8 bytes per entry)
     pos = 0
@@ -77,6 +96,15 @@ def decompress_all(entries_bytes: bytes, n_chunks: int,
         pos += 8
         chunks.append((orig_len, entries_bytes[pos:pos + comp_len]))
         pos += comp_len
+
+    # neural_batch_fn signature: list[encoded_bytes] -> list[decoded_bytes].
+    # Two implementations:
+    #   - DecompressWorkerPool.decompress_chunks (multi-process, recommended)
+    #   - InferenceEngine.decompress_chunks_batched (single-process lockstep)
+    if neural_batch_fn is not None and len(chunks) > 1:
+        encs = [enc for _, enc in chunks]
+        decoded_full = neural_batch_fn(encs)
+        return b"".join(d[:ol] for (ol, _), d in zip(chunks, decoded_full))
 
     if DECOMPRESS_BATCH <= 1 or len(chunks) <= 1:
         # Sequential path — used for tiny inputs and for tests that mock

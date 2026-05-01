@@ -136,3 +136,102 @@ void launch_encode_finalize(
 {
     encode_finalize_kernel<<<1, 1, 0, stream>>>(output_buf, state);
 }
+
+// ---------------------------------------------------------------------------
+// Batched encode — B independent AC streams, one symbol per stream per call.
+// Each stream owns its own (low, high, pending, bit_offset) state and writes
+// into its own output sub-buffer at base_byte_offsets[stream]. Used by
+// `compress_chunks_batched` to encode N chunks in lockstep symmetric to
+// `decompress_chunks_batched`.
+// ---------------------------------------------------------------------------
+
+extern "C" __global__ void encode_step_batched_kernel(
+    const int32_t* __restrict__ cdfs,         // [B, V+1]
+    int V,
+    const int32_t* __restrict__ symbols,      // [B]
+    uint8_t* __restrict__ output_buf,
+    const int32_t* __restrict__ base_byte_offsets,  // [B]
+    RangeState* states,                       // [B]
+    int B)
+{
+    const int stream = blockIdx.x * blockDim.x + threadIdx.x;
+    if (stream >= B) return;
+
+    const int32_t* cdf = cdfs + (size_t)stream * (size_t)(V + 1);
+    uint8_t* out = output_buf + base_byte_offsets[stream];
+
+    uint32_t low = states[stream].low;
+    uint32_t high = states[stream].high;
+    uint32_t pending = states[stream].pending;
+    uint32_t bit_offset = states[stream].bit_offset;
+
+    const int sym = symbols[stream];
+    const uint32_t sym_lo = (uint32_t)cdf[sym];
+    const uint32_t sym_hi = (uint32_t)cdf[sym + 1];
+    const uint64_t rng = (uint64_t)(high - low) + 1ULL;
+    high = low + (uint32_t)((rng * (uint64_t)sym_hi) >> CDF_PRECISION) - 1u;
+    low  = low + (uint32_t)((rng * (uint64_t)sym_lo) >> CDF_PRECISION);
+
+    while (true) {
+        if (high < HALF) {
+            emit_bit_with_pending(out, bit_offset, pending, 0u);
+            low <<= 1;
+            high = (high << 1) | 1u;
+        } else if (low >= HALF) {
+            emit_bit_with_pending(out, bit_offset, pending, 1u);
+            low = (low - HALF) << 1;
+            high = ((high - HALF) << 1) | 1u;
+        } else if (low >= QTR && high < THREE_QTR) {
+            pending++;
+            low = (low - QTR) << 1;
+            high = ((high - QTR) << 1) | 1u;
+        } else {
+            break;
+        }
+    }
+
+    states[stream].low = low;
+    states[stream].high = high;
+    states[stream].pending = pending;
+    states[stream].bit_offset = bit_offset;
+}
+
+extern "C" __global__ void encode_finalize_batched_kernel(
+    uint8_t* __restrict__ output_buf,
+    const int32_t* __restrict__ base_byte_offsets,  // [B]
+    RangeState* states,                             // [B]
+    int B)
+{
+    const int stream = blockIdx.x * blockDim.x + threadIdx.x;
+    if (stream >= B) return;
+
+    uint8_t* out = output_buf + base_byte_offsets[stream];
+    uint32_t low = states[stream].low;
+    uint32_t pending = states[stream].pending + 1u;
+    uint32_t bit_offset = states[stream].bit_offset;
+    const uint32_t bit = (low < QTR) ? 0u : 1u;
+    emit_bit_with_pending(out, bit_offset, pending, bit);
+    states[stream].bit_offset = bit_offset;
+}
+
+void launch_encode_step_batched(
+    const int32_t* cdfs, int V,
+    const int32_t* symbols,
+    uint8_t* output_buf, const int32_t* base_byte_offsets,
+    RangeState* states, int B, cudaStream_t stream)
+{
+    const int threads = 32;
+    const int blocks = (B + threads - 1) / threads;
+    encode_step_batched_kernel<<<blocks, threads, 0, stream>>>(
+        cdfs, V, symbols, output_buf, base_byte_offsets, states, B);
+}
+
+void launch_encode_finalize_batched(
+    uint8_t* output_buf, const int32_t* base_byte_offsets,
+    RangeState* states, int B, cudaStream_t stream)
+{
+    const int threads = 32;
+    const int blocks = (B + threads - 1) / threads;
+    encode_finalize_batched_kernel<<<blocks, threads, 0, stream>>>(
+        output_buf, base_byte_offsets, states, B);
+}
