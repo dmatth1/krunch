@@ -468,12 +468,16 @@ T4 numbers extrapolate to A10G ~3× → ~87 / 54 KB/s.
 
 **Plan (in order):**
 
-1. **Encoder fusion first (cuBLAS algo pin)** — replace det_matmul_tc
-   on layer matmuls with `cublasGemmEx` pinned to a specific algo
-   (CUBLAS_GEMM_ALGO* enum, not DEFAULT which auto-selects). cuBLAS
-   with fixed algo is shape-stable AND uses tuned tile schedules →
-   2-3× compress on A10G expected. Single C++ file change. Verify
-   bit-exact vs det_matmul_tc on T4 first.
+1. ~~Encoder fusion via cuBLAS algo pin~~ **DEAD END (2026-05-01).**
+   Swept all 16 `CUBLAS_GEMM_ALGO*_TENSOR_OP` enums on A10G; ZERO
+   are bit-stable across M (all show ~10⁻³ abs diff between M=1
+   and M=N for the same algo enum). The enum is a HINT to cuBLAS,
+   not a binding — cuBLAS picks the actual kernel based on M
+   regardless. Encoder fusion via cuBLAS is impossible without
+   per-arch tuning + risking shape-dep on next cuBLAS version.
+   See `scripts/test_cublas_pinned.py` SWEEP=1 output. Live
+   det_matmul_cublas + KRUNCH_CUBLAS_PINNED env are kept in tree
+   as opt-in for benchmark comparison only.
 
 2. **Bigger-sample T3 measurement** — re-run on 100 MB+ WildChat
    slice with the encoder fusion live. Decompress gate may be
