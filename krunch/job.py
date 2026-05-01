@@ -1,78 +1,94 @@
 """
-Batch job runner — called when the container starts in job mode.
+Worker job runner — entry point for distributed compress/decompress.
 
-Two job types, selected by KRUNCH_JOB_TYPE env var:
+Container starts in worker mode by setting `KRUNCH_MODE`. The runner
+reads the env-var contract that every `krunch plan` template
+populates, computes its byte range from `KRUNCH_PART_INDEX` /
+`KRUNCH_PART_COUNT`, performs compress or decompress on its slice,
+and writes the partial result to `<KRUNCH_OUTPUT_URL>.parts/<index>`.
+A subsequent `finalize` invocation stitches all parts into the final
+output.
 
-  compress  — reads one byte range from source URL, compresses it,
-              writes a partial blob to S3. Array job: each task uses
-              AWS_BATCH_JOB_ARRAY_INDEX to compute its own byte range.
+The same contract works on every batch system because it doesn't
+depend on the orchestrator-specific env vars (AWS_BATCH_JOB_ARRAY_INDEX,
+JOB_COMPLETION_INDEX in k8s, MODAL_TASK_ID, etc). `krunch plan` per
+target maps the orchestrator var → KRUNCH_PART_INDEX in the launch
+artifact.
 
-  assemble  — reads all partial blobs from S3 prefix, stitches into
-              one master blob, writes to dest URL. Single (non-array) job.
+Env-var contract (read by the runner):
 
-Environment variables:
+  KRUNCH_MODE          compress | decompress | finalize
+  KRUNCH_INPUT_URL     URL of the source object (s3://, http://, file://)
+  KRUNCH_OUTPUT_URL    URL of the final output. Parts written to
+                        <KRUNCH_OUTPUT_URL>.parts/<index>
+  KRUNCH_PART_INDEX    0-based index of this worker (compress + decompress)
+  KRUNCH_PART_COUNT    Total worker count (compress + decompress)
+  KRUNCH_INPUT_LEN     Total byte size of input (compress only — workers
+                        compute their byte range from this; finalize
+                        passes through to the master header)
 
-  compress job:
-    KRUNCH_JOB_TYPE=compress
-    KRUNCH_SOURCE          URL to read from (s3://, http://, file://)
-    KRUNCH_TOTAL_SIZE      Total byte size of source (int)
-    KRUNCH_TOTAL_TASKS     Number of array tasks (= array size)
-    KRUNCH_PARTS_PREFIX    S3 prefix to write partial blobs (e.g. s3://b/parts/job-abc/)
-    AWS_BATCH_JOB_ARRAY_INDEX  injected by Batch
+The orchestrator template is responsible for setting KRUNCH_PART_INDEX
+correctly per task. Common mappings:
 
-  assemble job:
-    KRUNCH_JOB_TYPE=assemble
-    KRUNCH_PARTS_PREFIX    Same prefix used by compress jobs
-    KRUNCH_N_PARTS         Number of parts to assemble (= KRUNCH_TOTAL_TASKS)
-    KRUNCH_DEST            Final output URL
-    KRUNCH_ORIGINAL_LEN    Total original byte count (int)
+  AWS Batch:    KRUNCH_PART_INDEX=$AWS_BATCH_JOB_ARRAY_INDEX
+  k8s Indexed:  KRUNCH_PART_INDEX=$JOB_COMPLETION_INDEX
+  Slurm array:  KRUNCH_PART_INDEX=$SLURM_ARRAY_TASK_ID
+  Modal:        KRUNCH_PART_INDEX=$MODAL_TASK_ID  (or pass explicitly)
+  Ray:          set explicitly per task
+  Local:        bash loop sets KRUNCH_PART_INDEX=$i
 """
 
 import os
 import sys
 import zlib
 import logging
-import struct
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
 def run():
-    job_type = os.environ.get("KRUNCH_JOB_TYPE", "").lower()
-    if job_type == "compress":
-        _run_compress()
-    elif job_type == "assemble":
-        _run_assemble()
+    mode = os.environ.get("KRUNCH_MODE", "").lower()
+    if mode == "compress":
+        _run_compress_worker()
+    elif mode == "decompress":
+        _run_decompress_worker()
+    elif mode == "finalize":
+        _run_finalize()
     else:
-        logger.error("KRUNCH_JOB_TYPE must be 'compress' or 'assemble', got %r", job_type)
+        logger.error("KRUNCH_MODE must be 'compress'|'decompress'|'finalize', "
+                     "got %r", mode)
         sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
-# Compress job
+# Compress worker
 # ---------------------------------------------------------------------------
 
-def _run_compress():
+def _run_compress_worker():
     from . import url_io
-    from .chunking import compress_all, CHUNK_SIZE
+    from .chunking import compress_all
     from .inference import encode_header, engine
 
-    source = os.environ["KRUNCH_SOURCE"]
-    total_size = int(os.environ["KRUNCH_TOTAL_SIZE"])
-    total_tasks = int(os.environ["KRUNCH_TOTAL_TASKS"])
-    parts_prefix = os.environ["KRUNCH_PARTS_PREFIX"].rstrip("/")
-    task_idx = int(os.environ.get("AWS_BATCH_JOB_ARRAY_INDEX", "0"))
+    src = os.environ["KRUNCH_INPUT_URL"]
+    dst = os.environ["KRUNCH_OUTPUT_URL"]
+    total_size = int(os.environ["KRUNCH_INPUT_LEN"])
+    part_count = int(os.environ["KRUNCH_PART_COUNT"])
+    part_index = int(os.environ["KRUNCH_PART_INDEX"])
+    parts_prefix = _parts_prefix(dst)
+    part_url = f"{parts_prefix}/part-{part_index:06d}"
 
-    start, end = _byte_range(task_idx, total_tasks, total_size)
-    part_url = f"{parts_prefix}/part-{task_idx:06d}"
+    start, end = _byte_range(part_index, part_count, total_size)
+    logger.info("compress part %d/%d: bytes [%d, %d) → %s",
+                part_index, part_count, start, end, part_url)
 
-    logger.info("compress task %d/%d: bytes [%d, %d) → %s",
-                task_idx, total_tasks, start, end, part_url)
-
-    raw = url_io.read_range(source, start, end)
-    logger.info("read %d bytes from %s", len(raw), source)
+    raw = url_io.read_range(src, start, end)
+    logger.info("read %d bytes", len(raw))
 
     engine.load()
     chunk_entries, n_chunks = compress_all(raw, engine.compress_chunk)
@@ -81,62 +97,148 @@ def _run_compress():
     blob = encode_header(len(raw), n_chunks, crc) + entries_bytes
 
     url_io.write(part_url, blob)
-    ratio = len(blob) / len(raw) if raw else 0
+    ratio = len(blob) / len(raw) if raw else 0.0
     logger.info("wrote %d bytes (ratio=%.3f, %d chunks) to %s",
                 len(blob), ratio, n_chunks, part_url)
 
 
 # ---------------------------------------------------------------------------
-# Assemble job
+# Decompress worker
 # ---------------------------------------------------------------------------
 
-def _run_assemble():
+def _run_decompress_worker():
+    """Decompress a chunk-index range from the input .krunch blob.
+
+    Each worker handles roughly `n_chunks / part_count` chunks. Reads
+    only its own chunk-index range from the input (no need to download
+    the whole file), decompresses to raw bytes, and writes a partial
+    raw output to the parts prefix. Finalize concatenates them.
+    """
+    from . import url_io
+    from .chunking import decompress_all
+    from .inference import decode_header, HEADER_SIZE, engine
+    import struct
+
+    src = os.environ["KRUNCH_INPUT_URL"]
+    dst = os.environ["KRUNCH_OUTPUT_URL"]
+    part_count = int(os.environ["KRUNCH_PART_COUNT"])
+    part_index = int(os.environ["KRUNCH_PART_INDEX"])
+    parts_prefix = _parts_prefix(dst)
+    part_url = f"{parts_prefix}/part-{part_index:06d}"
+
+    # Read only the header first, then compute which chunk-byte range
+    # this worker owns. We can't seek inside the chunk-stream without
+    # reading the variable-length entries, so for v1 we read the whole
+    # blob — small overhead given decompress is dominated by the model
+    # forward, not download. v2 will add a chunk-index sidecar so
+    # workers can seek directly to their byte range.
+    blob = url_io.read_all(src)
+    hdr = decode_header(blob)
+    entries_bytes = blob[HEADER_SIZE:]
+
+    # Slice into per-chunk (orig_len, encoded) tuples so we can pick
+    # this worker's range without repeating the parse.
+    pos = 0
+    chunks: list[tuple[int, bytes]] = []
+    for _ in range(hdr["n_chunks"]):
+        orig_len, comp_len = struct.unpack(">II", entries_bytes[pos:pos + 8])
+        pos += 8
+        chunks.append((orig_len, entries_bytes[pos:pos + comp_len]))
+        pos += comp_len
+
+    n_chunks = len(chunks)
+    chunks_per = (n_chunks + part_count - 1) // part_count
+    lo = part_index * chunks_per
+    hi = min(lo + chunks_per, n_chunks)
+    my_chunks = chunks[lo:hi]
+    logger.info("decompress part %d/%d: chunks [%d, %d) of %d → %s",
+                part_index, part_count, lo, hi, n_chunks, part_url)
+
+    engine.load()
+    # Re-encode my chunk slice as a self-contained entries blob so we
+    # can reuse decompress_all.
+    my_entries = b"".join(struct.pack(">II", ol, len(enc)) + enc
+                           for ol, enc in my_chunks)
+    raw = decompress_all(my_entries, len(my_chunks),
+                         engine.decompress_chunk,
+                         neural_batch_fn=engine.decompress_chunks_batched)
+    url_io.write(part_url, raw)
+    logger.info("wrote %d raw bytes (%d chunks) to %s",
+                len(raw), len(my_chunks), part_url)
+
+
+# ---------------------------------------------------------------------------
+# Finalize
+# ---------------------------------------------------------------------------
+
+def _run_finalize():
+    """Stitch partial blobs/raw into the single final output, then clean up
+    parts. Compress finalize → produces a .krunch master blob (with
+    flag=0x01 indicating no full-file CRC). Decompress finalize →
+    produces the raw output bytes (concatenation in part-index order).
+    """
     from . import url_io
     from .inference import encode_header, decode_header, HEADER_SIZE
 
-    parts_prefix = os.environ["KRUNCH_PARTS_PREFIX"].rstrip("/")
-    n_parts = int(os.environ["KRUNCH_N_PARTS"])
-    dest = os.environ["KRUNCH_DEST"]
-    original_len = int(os.environ["KRUNCH_ORIGINAL_LEN"])
+    submode = os.environ.get("KRUNCH_FINALIZE_OF", "compress").lower()
+    dst = os.environ["KRUNCH_OUTPUT_URL"]
+    part_count = int(os.environ["KRUNCH_PART_COUNT"])
+    parts_prefix = _parts_prefix(dst)
 
-    logger.info("assemble %d parts from %s → %s", n_parts, parts_prefix, dest)
+    if submode == "compress":
+        original_len = int(os.environ["KRUNCH_INPUT_LEN"])
+        all_entries = []
+        total_chunks = 0
+        for i in range(part_count):
+            blob = url_io.read_all(f"{parts_prefix}/part-{i:06d}")
+            hdr = decode_header(blob)
+            all_entries.append(blob[HEADER_SIZE:])
+            total_chunks += hdr["n_chunks"]
+            logger.info("  part %d: %d chunks, %d bytes",
+                        i, hdr["n_chunks"], len(blob))
+        master = (encode_header(original_len, total_chunks, crc32=0, flags=0x01)
+                  + b"".join(all_entries))
+        url_io.write(dst, master)
+        logger.info("assembled %d bytes (%d chunks) → %s",
+                    len(master), total_chunks, dst)
+    elif submode == "decompress":
+        # Concatenate raw parts in index order
+        out = bytearray()
+        for i in range(part_count):
+            blob = url_io.read_all(f"{parts_prefix}/part-{i:06d}")
+            out.extend(blob)
+            logger.info("  part %d: %d bytes", i, len(blob))
+        url_io.write(dst, bytes(out))
+        logger.info("assembled %d raw bytes → %s", len(out), dst)
+    else:
+        logger.error("KRUNCH_FINALIZE_OF must be 'compress'|'decompress', "
+                     "got %r", submode)
+        sys.exit(1)
 
-    all_entries = []
-    total_chunks = 0
-
-    for i in range(n_parts):
-        part_url = f"{parts_prefix}/part-{i:06d}"
-        blob = url_io.read_all(part_url)
-        hdr = decode_header(blob)
-        all_entries.append(blob[HEADER_SIZE:])
-        total_chunks += hdr["n_chunks"]
-        logger.info("  part %d: %d chunks, %d bytes", i, hdr["n_chunks"], len(blob))
-
-    entries_bytes = b"".join(all_entries)
-    # CRC32 of the full original is unavailable here without re-reading source;
-    # flag=0x01 in the header signals "no CRC" — decompress skips the check.
-    master = encode_header(original_len, total_chunks, crc32=0, flags=0x01) + entries_bytes
-
-    url_io.write(dest, master)
-    ratio = len(master) / original_len if original_len else 0
-    logger.info("assembled %d bytes → %s (ratio=%.3f)", len(master), dest, ratio)
-
-    # Clean up parts
-    for i in range(n_parts):
-        url_io.delete(f"{parts_prefix}/part-{i:06d}")
-    logger.info("cleaned up %d part files", n_parts)
+    # Clean up parts.
+    for i in range(part_count):
+        try:
+            url_io.delete(f"{parts_prefix}/part-{i:06d}")
+        except Exception as e:  # noqa: BLE001
+            logger.warning("part cleanup failed: %s", e)
+    logger.info("cleaned up %d parts", part_count)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _byte_range(task_idx: int, total_tasks: int,
+def _parts_prefix(output_url: str) -> str:
+    """parts/<i> live alongside the final output URL."""
+    return output_url.rstrip("/") + ".parts"
+
+
+def _byte_range(part_index: int, part_count: int,
                 total_size: int) -> tuple[int, int]:
-    """Compute [start, end) for this task, aligned to CHUNK_SIZE."""
+    """Compute [start, end) for this part, aligned to chunking.CHUNK_SIZE."""
     from .chunking import CHUNK_SIZE
-    per_task = (total_size // total_tasks // CHUNK_SIZE) * CHUNK_SIZE
-    per_task = max(per_task, CHUNK_SIZE)
-    start = task_idx * per_task
-    end = start + per_task if task_idx < total_tasks - 1 else total_size
+    per_part = (total_size // part_count // CHUNK_SIZE) * CHUNK_SIZE
+    per_part = max(per_part, CHUNK_SIZE)
+    start = part_index * per_part
+    end = start + per_part if part_index < part_count - 1 else total_size
     return start, min(end, total_size)

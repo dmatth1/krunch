@@ -55,3 +55,11 @@ jobs:
           ./scripts/krunch submit \
             --source s3://test/in --dest s3://test/out \
             --workers 4 --dry-run | head -40
+
+      - name: krunch plan --dry-run for every target
+        run: |
+          pip install pytest
+          # Render + schema-validate every plan target directly against
+          # the krunch package. Catches template syntax errors, missing
+          # placeholders, malformed JSON/YAML before they reach ghcr.io.
+          PYTHONPATH=. pytest tests/test_plan.py -v

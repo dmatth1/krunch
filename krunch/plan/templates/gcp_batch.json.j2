@@ -1,0 +1,72 @@
+{
+  "_about": "krunch plan --target gcp-batch — submit with: gcloud batch jobs submit krunch-{{ run_id }} --location=us-central1 --config=this_file. Emits both the parallel worker job and the finalize job (BATCH_TASK_INDEX is auto-set per task).",
+  "main": {
+    "name": "krunch-{{ mode }}-{{ run_id }}",
+    "taskGroups": [{
+      "taskCount": "{{ n_workers }}",
+      "parallelism": "{{ n_workers }}",
+      "taskSpec": {
+        "runnables": [{
+          "container": {
+            "imageUri": "{{ image }}",
+            "entrypoint": "python",
+            "commands": ["-m", "krunch.job"]
+          },
+          "environment": {
+            "variables": {
+              "KRUNCH_MODE":       "{{ mode }}",
+              "KRUNCH_INPUT_URL":  "{{ input_url }}",
+              "KRUNCH_OUTPUT_URL": "{{ output_url }}",
+              "KRUNCH_INPUT_LEN":  "{{ input_len }}",
+              "KRUNCH_PART_COUNT": "{{ n_workers }}",
+              "KRUNCH_PART_INDEX": "$BATCH_TASK_INDEX"
+            }
+          }
+        }],
+        "computeResource": {
+          "cpuMilli": "{{ cpus }}000",
+          "memoryMib": "{{ memory_mb }}"
+        },
+        "maxRunDuration": "{{ timeout_s }}s"
+      }
+    }],
+    "allocationPolicy": {
+      "instances": [{
+        "policy": {
+          "machineType": "g2-standard-4",
+          "accelerators": [{"type": "nvidia-l4", "count": "{{ gpus }}"}]
+        },
+        "installGpuDrivers": true
+      }]
+    },
+    "logsPolicy": {"destination": "CLOUD_LOGGING"}
+  },
+  "finalize": {
+    "name": "krunch-finalize-{{ run_id }}",
+    "taskGroups": [{
+      "taskCount": "1",
+      "taskSpec": {
+        "runnables": [{
+          "container": {
+            "imageUri": "{{ image }}",
+            "entrypoint": "python",
+            "commands": ["-m", "krunch.job"]
+          },
+          "environment": {
+            "variables": {
+              "KRUNCH_MODE":         "finalize",
+              "KRUNCH_FINALIZE_OF":  "{{ mode }}",
+              "KRUNCH_INPUT_URL":    "{{ input_url }}",
+              "KRUNCH_OUTPUT_URL":   "{{ output_url }}",
+              "KRUNCH_INPUT_LEN":    "{{ input_len }}",
+              "KRUNCH_PART_COUNT":   "{{ n_workers }}"
+            }
+          }
+        }],
+        "computeResource": {"cpuMilli": "2000", "memoryMib": "4096"},
+        "maxRunDuration": "1800s"
+      }
+    }],
+    "logsPolicy": {"destination": "CLOUD_LOGGING"}
+  }
+}

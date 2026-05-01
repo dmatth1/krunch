@@ -1,0 +1,49 @@
+{
+  "_about": "krunch plan --target aws-batch — emit two AWS Batch submit-job specs (worker array + finalize). Submit in order: worker first, then finalize with dependsOn=[{jobId:<workerJobId>, type:SEQUENTIAL}].",
+  "main": {
+    "jobName": "krunch-{{ mode }}-{{ run_id }}",
+    "jobQueue": "{{ queue }}",
+    "jobDefinition": "{{ job_definition }}",
+    "arrayProperties": {"size": {{ n_workers }}},
+    "containerOverrides": {
+      "image": "{{ image }}",
+      "command": ["python", "-m", "krunch.job"],
+      "environment": [
+        {"name": "KRUNCH_MODE",       "value": "{{ mode }}"},
+        {"name": "KRUNCH_INPUT_URL",  "value": "{{ input_url }}"},
+        {"name": "KRUNCH_OUTPUT_URL", "value": "{{ output_url }}"},
+        {"name": "KRUNCH_INPUT_LEN",  "value": "{{ input_len }}"},
+        {"name": "KRUNCH_PART_COUNT", "value": "{{ n_workers }}"},
+        {"name": "KRUNCH_PART_INDEX", "value": "Ref::AWS_BATCH_JOB_ARRAY_INDEX"}
+      ],
+      "resourceRequirements": [
+        {"type": "VCPU",   "value": "{{ cpus }}"},
+        {"type": "MEMORY", "value": "{{ memory_mb }}"},
+        {"type": "GPU",    "value": "{{ gpus }}"}
+      ]
+    },
+    "timeout": {"attemptDurationSeconds": {{ timeout_s }}}
+  },
+  "finalize": {
+    "jobName": "krunch-finalize-{{ run_id }}",
+    "jobQueue": "{{ queue }}",
+    "jobDefinition": "{{ job_definition }}",
+    "containerOverrides": {
+      "image": "{{ image }}",
+      "command": ["python", "-m", "krunch.job"],
+      "environment": [
+        {"name": "KRUNCH_MODE",        "value": "finalize"},
+        {"name": "KRUNCH_FINALIZE_OF", "value": "{{ mode }}"},
+        {"name": "KRUNCH_INPUT_URL",   "value": "{{ input_url }}"},
+        {"name": "KRUNCH_OUTPUT_URL",  "value": "{{ output_url }}"},
+        {"name": "KRUNCH_INPUT_LEN",   "value": "{{ input_len }}"},
+        {"name": "KRUNCH_PART_COUNT",  "value": "{{ n_workers }}"}
+      ],
+      "resourceRequirements": [
+        {"type": "VCPU",   "value": "2"},
+        {"type": "MEMORY", "value": "4096"}
+      ]
+    },
+    "timeout": {"attemptDurationSeconds": 1800}
+  }
+}

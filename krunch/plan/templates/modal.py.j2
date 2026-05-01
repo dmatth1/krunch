@@ -1,0 +1,49 @@
+# krunch plan --target modal — Modal app: workers + finalize.
+# Run:  modal run this_file
+import modal
+
+app = modal.App("krunch-{{ mode }}-{{ run_id }}")
+
+image = modal.Image.from_registry("{{ image }}").entrypoint([])
+
+INPUT_URL  = "{{ input_url }}"
+OUTPUT_URL = "{{ output_url }}"
+INPUT_LEN  = {{ input_len }}
+N_WORKERS  = {{ n_workers }}
+MODE       = "{{ mode }}"
+
+
+@app.function(image=image, gpu="A10G", timeout={{ timeout_s }})
+def worker(part_index: int):
+    import os, subprocess
+    env = {
+        **os.environ,
+        "KRUNCH_MODE":       MODE,
+        "KRUNCH_INPUT_URL":  INPUT_URL,
+        "KRUNCH_OUTPUT_URL": OUTPUT_URL,
+        "KRUNCH_INPUT_LEN":  str(INPUT_LEN),
+        "KRUNCH_PART_COUNT": str(N_WORKERS),
+        "KRUNCH_PART_INDEX": str(part_index),
+    }
+    subprocess.check_call(["python", "-m", "krunch.job"], env=env)
+
+
+@app.function(image=image, timeout=1800)
+def finalize():
+    import os, subprocess
+    env = {
+        **os.environ,
+        "KRUNCH_MODE":         "finalize",
+        "KRUNCH_FINALIZE_OF":  MODE,
+        "KRUNCH_INPUT_URL":    INPUT_URL,
+        "KRUNCH_OUTPUT_URL":   OUTPUT_URL,
+        "KRUNCH_INPUT_LEN":    str(INPUT_LEN),
+        "KRUNCH_PART_COUNT":   str(N_WORKERS),
+    }
+    subprocess.check_call(["python", "-m", "krunch.job"], env=env)
+
+
+@app.local_entrypoint()
+def main():
+    list(worker.map(range(N_WORKERS)))
+    finalize.remote()

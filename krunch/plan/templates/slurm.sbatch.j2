@@ -1,0 +1,42 @@
+#!/bin/bash
+# krunch plan --target slurm (run-id {{ run_id }}) — Slurm array + finalize.
+# Submit:  jid=$(sbatch --parsable this_file); sbatch --dependency=afterok:$jid this_file finalize
+#
+# Two-step submission: this script handles BOTH the worker array (default)
+# and the finalize task (when invoked with arg "finalize").
+
+#SBATCH --job-name=krunch-{{ mode }}-{{ run_id }}
+#SBATCH --array=0-{{ n_workers_minus_1 }}
+#SBATCH --gres=gpu:{{ gpus }}
+#SBATCH --cpus-per-task={{ cpus }}
+#SBATCH --mem={{ memory_mb }}M
+#SBATCH --time={{ slurm_time }}
+
+set -euo pipefail
+
+IMAGE="{{ image }}"
+INPUT_URL="{{ input_url }}"
+OUTPUT_URL="{{ output_url }}"
+INPUT_LEN="{{ input_len }}"
+N_WORKERS={{ n_workers }}
+MODE="{{ mode }}"
+
+if [[ "${1:-}" == "finalize" ]]; then
+  exec docker run --rm \
+    -e KRUNCH_MODE=finalize \
+    -e KRUNCH_FINALIZE_OF="${MODE}" \
+    -e KRUNCH_INPUT_URL="${INPUT_URL}" \
+    -e KRUNCH_OUTPUT_URL="${OUTPUT_URL}" \
+    -e KRUNCH_INPUT_LEN="${INPUT_LEN}" \
+    -e KRUNCH_PART_COUNT="${N_WORKERS}" \
+    --entrypoint python "${IMAGE}" -m krunch.job
+fi
+
+exec docker run --rm --gpus all \
+  -e KRUNCH_MODE="${MODE}" \
+  -e KRUNCH_INPUT_URL="${INPUT_URL}" \
+  -e KRUNCH_OUTPUT_URL="${OUTPUT_URL}" \
+  -e KRUNCH_INPUT_LEN="${INPUT_LEN}" \
+  -e KRUNCH_PART_COUNT="${N_WORKERS}" \
+  -e KRUNCH_PART_INDEX="${SLURM_ARRAY_TASK_ID}" \
+  --entrypoint python "${IMAGE}" -m krunch.job

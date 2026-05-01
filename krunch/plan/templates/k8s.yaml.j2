@@ -1,0 +1,73 @@
+# krunch plan --target k8s — Kubernetes Indexed Job (workers + finalize).
+# Submit:
+#   kubectl apply -f this_file
+# JOB_COMPLETION_INDEX is automatically populated per worker pod.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: krunch-{{ mode }}-{{ run_id }}
+spec:
+  parallelism: {{ n_workers }}
+  completions: {{ n_workers }}
+  completionMode: Indexed
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: krunch-worker
+          image: "{{ image }}"
+          command: ["python", "-m", "krunch.job"]
+          env:
+            - name: KRUNCH_MODE
+              value: "{{ mode }}"
+            - name: KRUNCH_INPUT_URL
+              value: "{{ input_url }}"
+            - name: KRUNCH_OUTPUT_URL
+              value: "{{ output_url }}"
+            - name: KRUNCH_INPUT_LEN
+              value: "{{ input_len }}"
+            - name: KRUNCH_PART_COUNT
+              value: "{{ n_workers }}"
+            - name: KRUNCH_PART_INDEX
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+          resources:
+            requests:
+              cpu: "{{ cpus }}"
+              memory: "{{ memory_mb }}Mi"
+              nvidia.com/gpu: "{{ gpus }}"
+            limits:
+              nvidia.com/gpu: "{{ gpus }}"
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: krunch-finalize-{{ run_id }}
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: krunch-finalize
+          image: "{{ image }}"
+          command: ["python", "-m", "krunch.job"]
+          env:
+            - name: KRUNCH_MODE
+              value: "finalize"
+            - name: KRUNCH_FINALIZE_OF
+              value: "{{ mode }}"
+            - name: KRUNCH_INPUT_URL
+              value: "{{ input_url }}"
+            - name: KRUNCH_OUTPUT_URL
+              value: "{{ output_url }}"
+            - name: KRUNCH_INPUT_LEN
+              value: "{{ input_len }}"
+            - name: KRUNCH_PART_COUNT
+              value: "{{ n_workers }}"
+          resources:
+            requests:
+              cpu: "2"
+              memory: "4096Mi"

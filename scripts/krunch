@@ -150,6 +150,39 @@ def _has_docker() -> bool:
 
 
 # ---------------------------------------------------------------------------
+# plan — render a runnable artifact for the user's batch system
+# ---------------------------------------------------------------------------
+
+def cmd_plan(args):
+    """Render a per-target launch artifact via the in-image plan
+    renderer. Templates live in the Docker image so we never have to
+    keep host-side and image-side copies in sync."""
+    docker_args = [
+        "docker", "run", "--rm",
+        "--entrypoint", "python",
+        DEFAULT_IMAGE, "-m", "krunch.plan_cli",
+        "--target", args.target,
+        "--mode", args.mode,
+        "--source", args.input_url,
+        "--dest", args.output_url,
+        "--workers", str(args.workers),
+        "--image", args.image,
+        "--queue", args.queue,
+        "--job-definition", args.job_definition,
+        "--cpus", str(args.cpus),
+        "--gpus", str(args.gpus),
+        "--memory-mb", str(args.memory_mb),
+        "--timeout-s", str(args.timeout_s),
+        "--input-len", str(args.input_len),
+    ]
+    if args.run_id:
+        docker_args += ["--run-id", args.run_id]
+    if args.dry_run:
+        docker_args += ["--dry-run"]
+    return subprocess.call(docker_args)
+
+
+# ---------------------------------------------------------------------------
 # submit
 # ---------------------------------------------------------------------------
 
@@ -424,6 +457,41 @@ def main():
     p_status = sub.add_parser("status", help="Check job status")
     p_status.add_argument("--job-id", required=True)
 
+    # plan — emit a runnable artifact for the user's batch system
+    p_plan = sub.add_parser(
+        "plan",
+        help="Render a runnable artifact for any batch system (aws-batch, k8s, modal, ray, slurm, gcp-batch, local)")
+    p_plan.add_argument("--target", required=True,
+                        choices=["aws-batch", "k8s", "modal", "ray",
+                                 "slurm", "gcp-batch", "local"])
+    p_plan.add_argument("--mode", default="compress",
+                        choices=["compress", "decompress"],
+                        help="Whether workers compress or decompress (default: compress)")
+    p_plan.add_argument("--source", "--input", dest="input_url", required=True,
+                        help="Input URL (s3://, http://, file://)")
+    p_plan.add_argument("--dest", "--output", dest="output_url", required=True,
+                        help="Output URL")
+    p_plan.add_argument("--workers", type=int, default=4,
+                        help="Number of parallel workers (default: 4)")
+    p_plan.add_argument("--image", default=DEFAULT_IMAGE,
+                        help=f"Docker image (default: {DEFAULT_IMAGE})")
+    p_plan.add_argument("--queue", default="krunch-queue",
+                        help="Orchestrator queue name (default: krunch-queue)")
+    p_plan.add_argument("--job-definition", default="krunch-job",
+                        help="AWS Batch job definition (default: krunch-job)")
+    p_plan.add_argument("--cpus", type=int, default=4)
+    p_plan.add_argument("--gpus", type=int, default=1)
+    p_plan.add_argument("--memory-mb", type=int, default=16384)
+    p_plan.add_argument("--timeout-s", type=int, default=3600)
+    p_plan.add_argument("--input-len", type=int, default=0,
+                        help="Input byte size; auto-detected if --source is "
+                             "a real URL the CLI can stat")
+    p_plan.add_argument("--run-id",
+                        help="Unique run id (default: auto from time)")
+    p_plan.add_argument("--dry-run", action="store_true",
+                        help="Validate the artifact against schema; "
+                             "print nothing if valid, error otherwise")
+
     args = parser.parse_args()
     handlers = {
         "compress":   cmd_compress,
@@ -431,6 +499,7 @@ def main():
         "warmup":     cmd_warmup,
         "submit":     cmd_submit,
         "status":     cmd_status,
+        "plan":       cmd_plan,
     }
     rc = handlers[args.command](args)
     sys.exit(rc if isinstance(rc, int) else 0)

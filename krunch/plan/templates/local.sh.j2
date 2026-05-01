@@ -1,0 +1,55 @@
+#!/bin/bash
+# krunch plan --target local — single-machine N-worker run via docker.
+#
+# Usage:  bash this_file
+#
+# Each worker runs in its own container, all bound to the same GPU.
+# Useful for one-host bench / tier-3 dry runs. For real distributed
+# workloads use a target with a cluster scheduler (aws-batch, k8s,
+# modal, ray, slurm).
+
+set -euo pipefail
+
+IMAGE="{{ image }}"
+INPUT_URL="{{ input_url }}"
+OUTPUT_URL="{{ output_url }}"
+INPUT_LEN="{{ input_len }}"
+N_WORKERS={{ n_workers }}
+MODE="{{ mode }}"
+
+echo "krunch plan/local run-id={{ run_id }}: ${MODE} ${INPUT_URL} → ${OUTPUT_URL} (N=${N_WORKERS})"
+
+# Workers in parallel.
+PIDS=()
+for i in $(seq 0 $((N_WORKERS - 1))); do
+  docker run --rm --gpus all \
+    -e KRUNCH_MODE="${MODE}" \
+    -e KRUNCH_INPUT_URL="${INPUT_URL}" \
+    -e KRUNCH_OUTPUT_URL="${OUTPUT_URL}" \
+    -e KRUNCH_INPUT_LEN="${INPUT_LEN}" \
+    -e KRUNCH_PART_COUNT="${N_WORKERS}" \
+    -e KRUNCH_PART_INDEX="${i}" \
+    -e AWS_REGION="${AWS_REGION:-us-east-1}" \
+    --entrypoint python \
+    "${IMAGE}" -m krunch.job &
+  PIDS+=($!)
+done
+
+# Wait for all workers.
+for pid in "${PIDS[@]}"; do
+  wait "${pid}" || { echo "worker pid=${pid} failed"; exit 1; }
+done
+echo "all ${N_WORKERS} workers done; running finalize..."
+
+# Finalize.
+docker run --rm \
+  -e KRUNCH_MODE=finalize \
+  -e KRUNCH_FINALIZE_OF="${MODE}" \
+  -e KRUNCH_INPUT_URL="${INPUT_URL}" \
+  -e KRUNCH_OUTPUT_URL="${OUTPUT_URL}" \
+  -e KRUNCH_INPUT_LEN="${INPUT_LEN}" \
+  -e KRUNCH_PART_COUNT="${N_WORKERS}" \
+  -e AWS_REGION="${AWS_REGION:-us-east-1}" \
+  --entrypoint python \
+  "${IMAGE}" -m krunch.job
+echo "finalize complete: ${OUTPUT_URL}"
