@@ -345,7 +345,7 @@ Validation tiers (cheapest → most expensive, gate each before the next):
 |---|---|---|
 | **T1: Quick checks** (free) | unit tests (`test_blob.py`), `krunch plan --target … --dry-run` artifact-validation for every supported target, plan-template lint. CI-equivalent. | ✅ |
 | **T2: Local CPU integration** (free) | `tests/integration.sh`: full neural path on CPU, byte-exact roundtrip on 224 B sample. Validates the single-shot CLI before spending GPU $. | ✅ |
-| **T3: Single-instance speed** (~$0.10–$5, hours) | `tests/gpu.sh` on g4dn (T4 cheap) or g5 (A10G full): ratio + **compress AND decompress** wall on a real WildChat sample. **Gate (tightened 2026-04-30 per Dan): ratio ≤ 0.11, byte-exact roundtrip, compress AND decompress avg ≥ 200 KB/s on A10G.** Path forward: cross-chunk batched stepped forward (process B chunks in parallel through one C++ layer call). All other levers (worker pool, CUDA graphs, single-stream fusion) measured insufficient on T4/A10G this session. | ⏳ |
+| **T3: Single-instance speed** (~$0.10–$5, hours) | `tests/gpu.sh` on g4dn (T4 cheap) or g5 (A10G full): ratio + **compress AND decompress** wall on a real WildChat sample. **Gate (tightened 2026-04-30 per Dan): ratio ≤ 0.11, byte-exact roundtrip, compress AND decompress avg ≥ 200 KB/s on A10G.** Cross-chunk batched stepped forward landed; correctness bug at multi-chunk decompress remains (see "T3 first-run findings" below). | 🚧 in progress |
 | **T4: `krunch plan` end-to-end** (~$2-5, ~30 min) | Build `krunch plan` for AWS Batch + k8s + Modal + local. Validate each emits a syntactically-valid artifact, then run **at least one target end-to-end** on the WildChat sample (likely AWS Batch since we already have the reference CDK + spike-6 validated path). Gates: same ratio, ~N× wall reduction at N=2, partial-blob cleanup happens, finalize task succeeds. Validates the "any batch system" README claim by exercising the env-var contract through one real scheduler. | 🚧 scaffolding shipped 2026-04-30 (templates + CLI + worker + CI dry-run); blocked on T3 green for e2e run |
 | Docs | README, architecture.md, tuning.md, operations.md, benchmarks.md. 3-4 ratio benchmarks on public corpora (chat, support tickets, wiki, code) | ⏳ |
 | Polish | typed Python client SDK, CI (lint + smoke), SECURITY.md, CONTRIBUTING.md | ⏳ |
@@ -442,6 +442,44 @@ No paid customers in v1 — that's v2's job.
 **Goal:** ratio holds, byte-exact roundtrip, **decompress within 2-3× of
 compress wall on a single A10G**. The 30× compress/decompress asymmetry
 is the gate.
+
+**T3 first-run findings (2026-04-30, A10G g5.xlarge, 10 MB WildChat
+via `tests/gpu.sh`-equivalent path):**
+
+| Run | Chunk | B | Compress KB/s | Decompress KB/s | Ratio | Roundtrip |
+|---|---|---|---|---|---|---|
+| 1 | 1 MB | 10 | 105 | aborted | 0.1162 | not tested |
+| 2 | 64 KB | 128 | 109 | 35 | 0.1166 | ❌ CRC fail |
+| 3 | 64 KB | 8   | n/a | 6 | n/a | ❌ same CRC |
+
+Both batched-decompress runs produced the **same wrong CRC**
+(`0xc9a5f1d0` vs expected `0x928aa11b`) → the bug is **not** a B-scale
+issue. Cross-chunk batched decompress is bit-deterministic but
+disagrees with the streaming compress at multi-window boundaries.
+
+Most likely culprit: `cpp_path.forward_packed_window` (added
+2026-04-30 to fix OOM at 1 MB chunks) doesn't preserve bit-exact
+state-carry across SEQ_BATCH=1024 boundaries. Existing roundtrip
+unit test (scripts/test_engine_cpp_roundtrip.py) only used T<2K
+tokens (one window) — never exercised the multi-window code path.
+
+**Open T3 bugs / gaps to close:**
+1. **CRC mismatch on multi-window compress + batched decompress.**
+   Repro test landing as `scripts/test_multi_window_roundtrip.py`
+   (no GPU dependency at write time; runs against the live image).
+   Fix path: bisect compress side (compare logits per-token between
+   forward_packed_window in N windows vs N×T=1 stepped) to localize
+   the state-carry mismatch.
+2. **Decompress speed 35 KB/s ≪ 200 target.** Even with bigger B
+   (256, 512), per-step compute floor on A10G caps around 50-100
+   KB/s for a single GPU. Full decompress speedup requires the
+   persistent kernel work (V1_PLAN backlog, multi-day).
+3. **Compress speed 109 KB/s ≪ 200 target.** Encoder fusion
+   (cuBLAS algo pin + ATen fusion) was the agreed lever but
+   deferred until T3 correctness lands.
+4. **Ratio 0.1166 vs 0.11 target.** ~6% over. Mostly model
+   numerics with cpp_path; may also be the +0.04% chunk-size cost
+   from 64 KB. Defer revisit until correctness + speed land.
 
 **Shipped (in tree, exercised by tests/gpu.sh):**
 
