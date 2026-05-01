@@ -241,7 +241,9 @@ at::Tensor rwkv4_layer_step_cpp(
     const int64_t B = x.size(0);
     const int64_t T = x.size(1);
     const int64_t C = x.size(2);
-    TORCH_CHECK(B == 1, "rwkv4_layer_step_cpp: B must be 1");
+    // B>1 supported as of 2026-04-30 for cross-chunk batched decode.
+    // Premix kernel + WKV op + matmul tile schedules all generalize
+    // over B; state tensors must be [B, C] / [B, n_att].
 
     // LayerNorm 1
     auto xx = at::layer_norm(x, {C}, ln1_w, ln1_b);                // [1, T, C]

@@ -346,7 +346,7 @@ Validation tiers (cheapest → most expensive, gate each before the next):
 |---|---|---|
 | **T1: Quick checks** (free) | unit tests (`test_blob.py`), `krunch plan --target … --dry-run` artifact-validation for every supported target, plan-template lint. CI-equivalent. | ✅ |
 | **T2: Local CPU integration** (free) | `tests/integration.sh`: full neural path on CPU, byte-exact roundtrip on 224 B sample. Validates the single-shot CLI before spending GPU $. | ✅ |
-| **T3: Single-instance speed** (~$0.10–$5, hours) | `tests/gpu.sh` on g4dn (T4 cheap) or g5 (A10G full): ratio + **compress AND decompress** wall on a real WildChat sample. **Gate: ratio ≤ 0.165, byte-exact roundtrip, decompress within 2-3× of compress wall.** Currently re-running with the worker-pool + chunk-size wins shipped 2026-04-30; the fused single-step kernel is the open work to close the remaining ~10× compress/decompress gap. | ⏳ |
+| **T3: Single-instance speed** (~$0.10–$5, hours) | `tests/gpu.sh` on g4dn (T4 cheap) or g5 (A10G full): ratio + **compress AND decompress** wall on a real WildChat sample. **Gate (tightened 2026-04-30 per Dan): ratio ≤ 0.11, byte-exact roundtrip, compress AND decompress avg ≥ 200 KB/s on A10G.** Path forward: cross-chunk batched stepped forward (process B chunks in parallel through one C++ layer call). All other levers (worker pool, CUDA graphs, single-stream fusion) measured insufficient on T4/A10G this session. | ⏳ |
 | **T4: `krunch plan` end-to-end** (~$2-5, ~30 min) | Build `krunch plan` for AWS Batch + k8s + Modal + local. Validate each emits a syntactically-valid artifact, then run **at least one target end-to-end** on the WildChat sample (likely AWS Batch since we already have the reference CDK + spike-6 validated path). Gates: same ratio, ~N× wall reduction at N=2, partial-blob cleanup happens, finalize task succeeds. Validates the "any batch system" README claim by exercising the env-var contract through one real scheduler. | ⏳ blocked on T3 green |
 | Docs | README, architecture.md, tuning.md, operations.md, benchmarks.md. 3-4 ratio benchmarks on public corpora (chat, support tickets, wiki, code) | ⏳ |
 | Polish | typed Python client SDK, Go client SDK, CI (lint + smoke), SECURITY.md, CONTRIBUTING.md | ⏳ |
@@ -785,9 +785,72 @@ Scaffolding in `krunch_ac/cuda/rwkv_step.cu`. Plan, ~1-2 weeks:
    Distance to "decompress = compress at 200 KB/s" goal:
    - Compress: 132 KB/s on A10G — need 1.5× more (close).
    - Decompress: 1.2 KB/s on A10G — need 167× more.
-   The decompress gap requires the persistent kernel + graph-safe
-   forward rewrite (5-7 day item). No GPU upgrade or worker pool
-   shortcut closes it.
+   No single-stream optimization closes this gap. **Cross-chunk
+   batched decode is the only viable lever.**
+
+   **Path forward (2026-04-30) — cross-chunk batched stepped
+   forward.** Per-timestep launch overhead (~4 ms) is independent
+   of B (matmul work scales but launches don't), so processing B
+   chunks in parallel through one batched layer call gives near-
+   linear throughput scaling until TC matmul utilization saturates.
+
+   Math at B=128 chunks in parallel:
+   - 4 ms/timestep × ~6000 timesteps/chunk = 24 s for one whole
+     batch
+   - 128 chunks × 32 KB = 4 MB in 24 s = **170 KB/s decode** on T4
+   - On A10G with better TC utilization at M=128: extrapolate
+     ~250-400 KB/s. Comfortably over the 200 target.
+
+   Implementation plan:
+   1. Drop B==1 assert in rwkv4_layer_step_cpp; verify it works
+      at B>1, T=1 (the kernel already takes (B, T, C) flat
+      [B*T, C] internally).
+   2. Add cpp_path.forward_stepped_batched(weights, last_tokens
+      [B], states[B]) wrapper.
+   3. Verify bit-exact: B chunks decoded batched produces the
+      same per-chunk tokens as B chunks decoded sequentially.
+   4. Wire decompress_all to dispatch all chunks of a file as
+      one batched stream (or in batches of MAX_B if memory
+      caps).
+   5. Bench WildChat sample on A10G end-to-end. Target: avg
+      compress ≥ 200 KB/s, avg decompress ≥ 200 KB/s, ratio
+      ≤ 0.11, byte-exact roundtrip.
+
+   Estimated effort: 2-3 days focused.
+
+   **Compress speedup plan (parallel track, 2026-04-30 — to hit
+   ≥200 KB/s on A10G; stretch 700 KB/s).**
+
+   Current A10G measured: 132 KB/s @ 8 KB chunks, 99 KB/s @ 32 KB
+   (memory-bandwidth bound on the head matmul at large T). Need
+   ~1.5-2× to hit 200, ~5× for 700.
+
+   Levers ranked by leverage:
+   | Lever | Est. gain | Effort |
+   |---|---|---|
+   | Pin `cublasGemmEx` algo + replace det_matmul_tc on layer
+     matmuls (still shape-stable because algo is fixed) | 2-4× layer
+     matmuls | 1 day |
+   | Bigger TC tiles (128×128 + async copy + double buffer) in
+     det_matmul_tc | 2-3× | 2 days |
+   | Encoder ATen → custom kernels (layer_norm + sigmoid + residual
+     add fused, kills dispatch overhead) | 20-40% | 2 days |
+   | Stream pipelining (forward / softmax / AC encode overlap) |
+     15-25% | 1 day |
+   | Cross-chunk batched encoder for small chunks (amortize
+     per-launch overhead at small T) | 1.5-2× | 2 days |
+
+   Plan to 200 KB/s on A10G: cuBLAS-algo-pin + stream pipelining.
+   Cumulative ~2-2.5×. **3-4 day estimate.**
+
+   Plan to 700 KB/s: all five stacked. Cumulative ~5-7×. ~1.5-2
+   weeks. A10G memory bandwidth on the head matmul likely caps
+   real-world around 400-500 KB/s; 700 KB/s is more comfortable on
+   A100/H100. If 700 is hard requirement, recommend a bigger GPU
+   for v1 ship vs further encoder work.
+
+   Order of attack: starting with cuBLAS-algo-pinning since it's the
+   highest-impact, lowest-risk single change.
 
    **Worker-pool decode is dead as a lever for cpp_path.** Measured
    4-worker aggregate at 0.9 KB/s vs single-stream 1.3 KB/s — workers

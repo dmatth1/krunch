@@ -275,6 +275,57 @@ def forward_stepped_graphed(weights: dict, last_token: int, state):
     return logits
 
 
+def fresh_state_batched(weights: dict, B: int):
+    """B-way batched RWKV state (att_xx[B,C], aa/bb/pp[B,n_att],
+    ffn_xx[B,C]) per layer."""
+    import torch
+    device = weights["device"]
+    n_embd = weights["n_embd"]
+    n_att = weights["n_att"]
+    return (
+        [torch.zeros(B, n_embd, dtype=torch.float16, device=device) for _ in range(N_LAYER)],
+        [torch.zeros(B, n_att, dtype=torch.float32, device=device) for _ in range(N_LAYER)],
+        [torch.zeros(B, n_att, dtype=torch.float32, device=device) for _ in range(N_LAYER)],
+        [torch.full((B, n_att), -1e30, dtype=torch.float32, device=device) for _ in range(N_LAYER)],
+        [torch.zeros(B, n_embd, dtype=torch.float16, device=device) for _ in range(N_LAYER)],
+    )
+
+
+def forward_stepped_batched(weights: dict, last_tokens, state):
+    """Run all 12 layers stepped (T=1) for B chunks in parallel.
+    `last_tokens`: int32/long tensor [B] with each chunk's previous
+    decoded token. Returns logits [B, V]. Mutates state in place.
+
+    Bit-identical per-chunk to running forward_stepped sequentially
+    on each chunk (verified via test_batched_stepped.py).
+    """
+    import torch
+    import krunch_ac_cuda
+    import torch.nn.functional as F
+    n_embd = weights["n_embd"]
+    layers = weights["layers"]
+    emb_w = weights["emb_w"]
+    ln_out_w = weights["ln_out_w"]
+    ln_out_b = weights["ln_out_b"]
+    head_w = weights["head_w"]
+
+    if not isinstance(last_tokens, torch.Tensor):
+        last_tokens = torch.as_tensor(last_tokens, dtype=torch.long,
+                                       device=weights["device"])
+    B = int(last_tokens.shape[0])
+    x = emb_w[last_tokens].view(B, 1, n_embd).contiguous()
+    for i in range(N_LAYER):
+        x = krunch_ac_cuda.rwkv4_layer_step_cpp(
+            x.contiguous(),
+            state[0][i], state[1][i], state[2][i], state[3][i], state[4][i],
+            *layers[i],
+        )
+    xn = F.layer_norm(x.view(B, n_embd), (n_embd,),
+                      weight=ln_out_w, bias=ln_out_b)
+    logits = krunch_ac_cuda.det_matmul(xn.contiguous(), head_w.contiguous())
+    return logits  # [B, V]
+
+
 def forward_stepped(weights: dict, last_token: int, state):
     """Run all 12 layers for one new token. Returns logits [V].
     Mutates state in place."""
