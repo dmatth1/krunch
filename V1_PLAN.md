@@ -494,19 +494,29 @@ T4 numbers extrapolate to A10G ~3× → ~87 / 54 KB/s.
 
    **Arch-agnostic compress levers (in order):**
 
-   1. Tune the existing `det_matmul_tc` (still arch-agnostic via
-      WMMA sm_70+). Larger output tiles (32×32 = 4 WMMA frags per
-      block), async copy (`cp.async`, sm_80+ with sm_75 fallback),
-      double-buffered shared memory pipeline. ~2-3 days. Estimate
-      1.5-2× compress speedup on every arch.
+   1. ~~Tune the existing `det_matmul_tc`~~ **Tried 2026-05-01.**
+      Built `det_matmul_tc_v2` (32×32 tile, 4 WMMA frags per block)
+      — bit-stable across M (verified at M={1,8,16,32,64,128,1024,
+      4096} on T4), microbench 1.7-2× faster. **End-to-end neutral**:
+      compress 374s vs 356s baseline on T4 (~5% slower, in noise),
+      66 KB/s on A10G — same as v1. Reason: profile shows forward =
+      98% of compress wall and matmul is NOT the dominant cost in
+      forward. Premix kernel + WKV + layer_norm + sigmoid + add
+      add up to most of the per-step time. v2 kept in tree as
+      `KRUNCH_TC_V2=1` opt-in for future use (e.g., bigger models
+      where matmul dominates more).
 
-   2. CUTLASS-based GEMM with fixed tile-schedule template.
-      Compile-time arch specialization; bit-stable across M for
-      any given template choice. ~3-5 days. Estimate 2-3× compress
-      everywhere.
+   2. ~~CUTLASS-based GEMM~~ **Skipped.** Same diagnosis as (1):
+      better matmul doesn't move forward wall when matmul isn't the
+      bottleneck. Won't help here.
 
-   Decompress lever (persistent kernel for the per-token forward)
-   is independent and runs in parallel.
+   **Real compress lever (= same as decompress):** persistent kernel
+   that fuses many ops per launch + reduces ATen overhead. Compress
+   forward at A10G is 530ms / chunk = 35 µs / token. To hit 200 KB/s
+   = ~12 µs / token (~3× faster), need to fold the ~15 ATen ops per
+   layer into one or two larger custom kernels. This is the same
+   fused-kernel work needed for decompress; should design once and
+   apply to both paths.
 
 2. **Bigger-sample T3 measurement** — re-run on 100 MB+ WildChat
    slice with the encoder fusion live. Decompress gate may be

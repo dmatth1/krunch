@@ -42,6 +42,10 @@ void launch_det_matmul_cublas(const void* x, const void* W, void* y,
                                int write_fp32, int M, int K, int N,
                                cudaStream_t stream);
 void set_det_matmul_cublas_algo(int algo_id);
+// 32×32-tile WMMA matmul — see det_matmul_tc_v2.cu.
+void launch_det_matmul_tc_v2(const void* A, const void* B, void* C,
+                              int write_fp32, int M, int K, int N,
+                              cudaStream_t stream);
 // Deterministic softmax + CDF — see det_softmax_cdf.cu.
 void launch_det_softmax_cdf(const void* logits, void* cdf,
                              int T, int V, int cdf_T_value,
@@ -73,21 +77,28 @@ static at::Tensor gemm_fp16(at::Tensor x, at::Tensor w,
     if (USE_DET) {
         cudaStream_t stream = at::cuda::getCurrentCUDAStream();
         const int write_fp32 = (dtype == at::kFloat) ? 1 : 0;
-        // Pinned-algo cuBLAS path is faster on A10G (uses tuned TC
-        // tile schedules) AND shape-stable (algo enum is fixed across
-        // M values). Default ON; disable via KRUNCH_CUBLAS_PINNED=0
-        // for benchmark comparison or if a future cuBLAS version
-        // drops the chosen algo.
+        // Default v1 (16×16 WMMA). v2 (32×32) measured neutral on T4
+        // and A10G end-to-end despite 1.7-2× microbench wins because
+        // matmul isn't the layer-step bottleneck (premix/WKV/elementwise
+        // dominate). Opt into via KRUNCH_TC_V2=1; cuBLAS pinned via
+        // KRUNCH_CUBLAS_PINNED=1 (NOT bit-stable across M — bench only).
         static const bool USE_CUBLAS_PIN = []{
             const char* e = std::getenv("KRUNCH_CUBLAS_PINNED");
-            return e == nullptr || std::string(e) != "0";
+            return e != nullptr && std::string(e) == "1";
+        }();
+        static const bool USE_TC_V2 = []{
+            const char* e = std::getenv("KRUNCH_TC_V2");
+            return e != nullptr && std::string(e) == "1";
         }();
         if (USE_CUBLAS_PIN) {
             launch_det_matmul_cublas(x_c.data_ptr(), w_c.data_ptr(),
                                       out.data_ptr(), write_fp32,
                                       M, K, N, stream);
+        } else if (USE_TC_V2 && (K == 768 || K == 3072)) {
+            launch_det_matmul_tc_v2(x_c.data_ptr(), w_c.data_ptr(),
+                                     out.data_ptr(), write_fp32,
+                                     M, K, N, stream);
         } else {
-            // Fallback WMMA kernel — bit-identical across M, slower.
             launch_det_matmul_tc(x_c.data_ptr(), w_c.data_ptr(),
                                   out.data_ptr(), write_fp32, M, K, N, stream);
         }
@@ -464,9 +475,19 @@ static at::Tensor det_matmul_py(at::Tensor x, at::Tensor W,
     auto out = at::empty({M, N}, xc.options().dtype(dtype));
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     const int write_fp32 = (dtype == at::kFloat) ? 1 : 0;
-    // Use TC kernel (handles arbitrary M/N via shared-mem staging).
-    launch_det_matmul_tc(xc.data_ptr(), Wc.data_ptr(), out.data_ptr(),
-                          write_fp32, M, K, N, stream);
+    // Default v1 (16×16). v2 microbench-faster but neutral end-to-end;
+    // opt-in via KRUNCH_TC_V2=1 (matches the gemm_fp16 default).
+    static const bool USE_TC_V2 = []{
+        const char* e = std::getenv("KRUNCH_TC_V2");
+        return e != nullptr && std::string(e) == "1";
+    }();
+    if (USE_TC_V2 && (K == 768 || K == 3072)) {
+        launch_det_matmul_tc_v2(xc.data_ptr(), Wc.data_ptr(), out.data_ptr(),
+                                 write_fp32, M, K, N, stream);
+    } else {
+        launch_det_matmul_tc(xc.data_ptr(), Wc.data_ptr(), out.data_ptr(),
+                              write_fp32, M, K, N, stream);
+    }
     return out;
 }
 
@@ -513,6 +534,27 @@ void register_layer_cpp(pybind11::module& m) {
     }, "Override the cuBLAS algo enum used by det_matmul_cublas_pinned + "
        "the in-engine cuBLAS path. Useful for sweeping algos.",
        pybind11::arg("algo_id"));
+    m.def("det_matmul_tc_v2", [](at::Tensor x, at::Tensor W,
+                                  c10::optional<at::ScalarType> out_dtype) {
+        // 32×32-tile WMMA. Bit-stable across M; produces DIFFERENT bits
+        // than det_matmul (16×16 tile). Used for testing the v2 kernel
+        // shape-stability + speed.
+        auto xc = x.contiguous();
+        auto Wc = W.contiguous();
+        const int M = (int)xc.size(0);
+        const int K = (int)xc.size(1);
+        const int N = (int)Wc.size(-1);
+        const auto dtype = out_dtype.has_value() ? out_dtype.value() : xc.scalar_type();
+        auto out = at::empty({M, N}, xc.options().dtype(dtype));
+        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+        const int write_fp32 = (dtype == at::kFloat) ? 1 : 0;
+        launch_det_matmul_tc_v2(xc.data_ptr(), Wc.data_ptr(),
+                                 out.data_ptr(), write_fp32,
+                                 M, K, N, stream);
+        return out;
+    }, "32x32-tile WMMA matmul, bit-stable across M.",
+       pybind11::arg("x"), pybind11::arg("W"),
+       pybind11::arg("out_dtype") = c10::nullopt);
     m.def("det_softmax_cdf", [](at::Tensor logits_TxV, int cdf_T_value) {
         TORCH_CHECK(logits_TxV.dim() == 2 && logits_TxV.scalar_type() == at::kHalf);
         auto x = logits_TxV.contiguous();
