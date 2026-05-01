@@ -384,8 +384,9 @@ static at::Tensor det_matmul_py(at::Tensor x, at::Tensor W,
     auto out = at::empty({M, N}, xc.options().dtype(dtype));
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     const int write_fp32 = (dtype == at::kFloat) ? 1 : 0;
-    launch_det_matmul(xc.data_ptr(), Wc.data_ptr(), out.data_ptr(),
-                       write_fp32, M, K, N, stream);
+    // Use TC kernel (handles arbitrary M/N via shared-mem staging).
+    launch_det_matmul_tc(xc.data_ptr(), Wc.data_ptr(), out.data_ptr(),
+                          write_fp32, M, K, N, stream);
     return out;
 }
 
