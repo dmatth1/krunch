@@ -364,7 +364,7 @@ class InferenceEngine:
         """Bit-exact cross-chunk batched decompress.
 
         Decodes up to B_MAX chunks in parallel per batched stepped
-        forward call (B_MAX picked per-GPU by cpp_path.pick_decompress_batch).
+        forward call (B_MAX picked per-GPU by cpp_path.compute_decompress_batch).
         If the input exceeds B_MAX, splits into B_MAX-sized groups and
         processes them sequentially. Each group's per-timestep launch
         overhead is fixed; the GPU is saturated within each group.
@@ -377,8 +377,10 @@ class InferenceEngine:
         import krunch_ac_cuda
         from krunch import cpp_path
 
-        # Auto-pick per-GPU batch size; split input into B_MAX-sized groups.
-        B_MAX = cpp_path.pick_decompress_batch()
+        # Pick per-GPU batch size from runtime SM count + memory; clamped
+        # by n_chunks. Replaces the prior static per-GPU table — see
+        # cpp_path.compute_decompress_batch.
+        B_MAX = cpp_path.compute_decompress_batch(n_chunks=len(encoded_chunks))
         if len(encoded_chunks) > B_MAX:
             out: list[bytes] = []
             for i in range(0, len(encoded_chunks), B_MAX):

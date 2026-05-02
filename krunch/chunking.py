@@ -30,10 +30,12 @@ logger = logging.getLogger(__name__)
 # chunk is one batch slot in the stepped forward).
 _CHUNK_SIZE_FLOOR = 64 * 1024
 
-# Cross-chunk batch size hint used to size chunks. Workers auto-tune their
-# actual decompress B at runtime (T4=64, A10G=128, A100/L40S=256, H100=512);
-# 128 here is the planning hint for the dominant production GPU class. We
-# aim for 4× target_B chunks per file so the decompress GPU stays saturated.
+# Cross-chunk batch size hint used to size chunks. Workers auto-tune
+# their actual decompress B at runtime via cpp_path.compute_decompress_batch
+# (formula derived from SM count: A10G ~640, L40S ~1136, H100 ~1056).
+# This planning hint is conservative — it sizes chunks so even older GPU
+# classes get full target_B parallelism. We aim for 4× target_B chunks per
+# file so the decompress GPU stays saturated.
 _DEFAULT_TARGET_B = 128
 
 

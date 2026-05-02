@@ -509,42 +509,65 @@ def cpp_path_enabled() -> bool:
     return val == "1"
 
 
-# GPU-name → recommended cross-chunk batch size B. Picked from
-# this session's measurements on T4 (peak around B=64) and
-# extrapolation for other classes. Auto-tune at worker startup
-# would replace this — keep the table as a sane default.
-_DECOMPRESS_BATCH_TABLE = {
-    "Tesla T4":              64,
-    "NVIDIA A10G":           128,
-    "NVIDIA A100":           256,
-    "NVIDIA L4":             128,
-    "NVIDIA L40S":           256,
-    "NVIDIA H100":           512,
-    "NVIDIA H100 80GB HBM3": 512,
-}
+# Memory cost per cross-chunk batch slot (rough): RWKV-4-Pile-169M state
+# (att_xx + aa/bb/pp + ffn_xx per layer × 12 layers) + 64 KB bitstream
+# input + logits buffer + intermediate buffers. ~1.5 MB / slot includes
+# headroom for cuBLAS workspace + allocator fragmentation.
+_PER_BATCH_MEMORY_BYTES = 1.5 * 1024 * 1024
 
 
-def pick_decompress_batch(default: int = 64) -> int:
-    """Return the recommended cross-chunk batch size for the current
-    GPU. Reads `nvidia-smi --query-gpu=name` once and consults the
-    heuristic table. Falls back to `default` for unknown GPUs.
+def compute_decompress_batch(n_chunks: int = -1, default: int = 64) -> int:
+    """Pick cross-chunk batch B from runtime GPU specs + n_chunks.
 
-    Override via env `KRUNCH_DECOMPRESS_BATCH=N` (used by CI for
-    repeatability; users shouldn't normally need this)."""
+    Replaces the prior static per-GPU table (which was extrapolated, not
+    measured for non-T4 classes). Formula derived from kernel tile geometry:
+
+      cp.async path (sm_80+, 64x64 tile, 4 warps):
+        bottleneck matmul has N=768 -> 12 col-tiles. Want 1.5-wave
+        coverage: ceil(B/64) * 12 ~= n_sms * 1.5  -> sat_B ~= n_sms * 8.
+
+      legacy path (T4 sm_75, 16x16 single-warp):
+        smaller per-tile work, more tiles -> sat_B ~= n_sms * 2.
+
+    Result clamped by (a) n_chunks for the current call and (b) a memory
+    budget that fits inside 80 % of VRAM.
+
+    Predicted vs prior static table:
+      T4 (40 SMs, sm_75):    ~80   (table: 64)
+      A10G (80 SMs, sm_86):  ~640  (table: 128) -- table was 5x low
+      L4 (58 SMs, sm_89):    ~464  (table: 128) -- table was 3.6x low
+      L40S (142 SMs, sm_89): ~1136 (table: 256) -- table was 4.4x low
+      A100 (108 SMs, sm_80): ~864  (table: 256) -- table was 3.4x low
+      H100 (132 SMs, sm_90): ~1056 (table: 512) -- table was 2x low
+
+    Override via env `KRUNCH_DECOMPRESS_BATCH=N`.
+    """
     env = os.environ.get("KRUNCH_DECOMPRESS_BATCH")
     if env:
         try:
-            return max(1, int(env))
+            B = max(1, int(env))
+            return min(n_chunks, B) if n_chunks > 0 else B
         except ValueError:
             pass
     try:
-        import subprocess
-        name = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
-            text=True, timeout=2).strip().splitlines()[0].strip()
+        import torch
+        if not torch.cuda.is_available():
+            return default if n_chunks <= 0 else max(1, min(n_chunks, default))
+        p = torch.cuda.get_device_properties(0)
+        n_sms = int(p.multi_processor_count)
+        if p.major >= 8:           # cp.async path (A10G/A100/L4/L40S/H100)
+            saturation = n_sms * 8
+        else:                       # T4 sm_75 legacy path
+            saturation = n_sms * 2
+        mem_cap = int(p.total_memory * 0.8 / _PER_BATCH_MEMORY_BYTES)
+        upper = max(1, min(saturation, mem_cap))
     except Exception:
-        return default
-    for prefix, B in _DECOMPRESS_BATCH_TABLE.items():
-        if name.startswith(prefix):
-            return B
-    return default
+        upper = default
+    if n_chunks > 0:
+        return max(1, min(n_chunks, upper))
+    return max(1, upper)
+
+
+# Back-compat alias for callers that don't (yet) pass n_chunks.
+def pick_decompress_batch(default: int = 64) -> int:
+    return compute_decompress_batch(n_chunks=-1, default=default)
