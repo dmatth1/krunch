@@ -25,19 +25,31 @@ _WEIGHTS_CACHE: dict[int, dict] = {}
 
 def init_weights(model, device: str = "cuda") -> dict:
     """Extract per-layer weights once per (model, device). Cached by
-    id(model)."""
+    id(model).
+
+    KRUNCH_BF16=1 converts the 7 layer matmul weights (Kw/Vw/Rw/Ow +
+    ffn_Kw/Vw/Rw) to bf16 — gemm_fp16 in layer_cpp.cpp detects bf16
+    weight dtype and routes through the bf16 cp.async WMMA kernel.
+    Bytes diverge from the fp16 codec → v2 model_id territory; encoder
+    + decoder must both set the flag for the AC roundtrip to hold.
+    Other weights (LN, time_mix, time_decay, head, emb) stay fp16/fp32.
+    """
     import torch
     key = id(model)
     if key in _WEIGHTS_CACHE:
         return _WEIGHTS_CACHE[key]
 
     w = model.w
+    use_bf16 = os.environ.get("KRUNCH_BF16") == "1"
 
     def fix(t, dt=None):
         t = t.to(device).contiguous()
         if dt is not None and t.dtype != dt:
             t = t.to(dtype=dt).contiguous()
         return t
+
+    def matmul_dtype():
+        return torch.bfloat16 if use_bf16 else torch.float16
 
     layers = []
     for i in range(N_LAYER):
@@ -52,17 +64,17 @@ def init_weights(model, device: str = "cuda") -> dict:
             fix(w[att+'time_mix_r'].squeeze(), torch.float16),
             fix(w[att+'time_decay'], torch.float32),
             fix(w[att+'time_first'], torch.float32),
-            fix(w[att+'key.weight'], torch.float16),
-            fix(w[att+'value.weight'], torch.float16),
-            fix(w[att+'receptance.weight'], torch.float16),
-            fix(w[att+'output.weight'], torch.float16),
+            fix(w[att+'key.weight'], matmul_dtype()),
+            fix(w[att+'value.weight'], matmul_dtype()),
+            fix(w[att+'receptance.weight'], matmul_dtype()),
+            fix(w[att+'output.weight'], matmul_dtype()),
             fix(w[bbb+'ln2.weight'], torch.float16),
             fix(w[bbb+'ln2.bias'], torch.float16),
             fix(w[ffn+'time_mix_k'].squeeze(), torch.float16),
             fix(w[ffn+'time_mix_r'].squeeze(), torch.float16),
-            fix(w[ffn+'key.weight'], torch.float16),
-            fix(w[ffn+'value.weight'], torch.float16),
-            fix(w[ffn+'receptance.weight'], torch.float16),
+            fix(w[ffn+'key.weight'], matmul_dtype()),
+            fix(w[ffn+'value.weight'], matmul_dtype()),
+            fix(w[ffn+'receptance.weight'], matmul_dtype()),
         ])
 
     bundle = {

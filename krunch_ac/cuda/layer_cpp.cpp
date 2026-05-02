@@ -221,6 +221,25 @@ static at::Tensor gemm_fp16(at::Tensor x, at::Tensor w,
     if (USE_DET) {
         cudaStream_t stream = at::cuda::getCurrentCUDAStream();
         const int write_fp32 = (dtype == at::kFloat) ? 1 : 0;
+
+        // bf16 weights signal: when init_weights converted layer matmul
+        // weights to bf16 (KRUNCH_BF16=1), cast x in / out around the
+        // bf16 kernel. Encoder + decoder must both set the flag — bytes
+        // diverge from fp16 codec → v2 model_id territory.
+        if (w_c.scalar_type() == at::kBFloat16
+            && (K == 768 || K == 3072) && (N % 8 == 0) && M >= 64) {
+            auto x_bf = (x_c.scalar_type() == at::kBFloat16)
+                ? x_c
+                : x_c.to(at::kBFloat16).contiguous();
+            const auto bf16_out_dtype = write_fp32 ? at::kFloat : at::kBFloat16;
+            auto out_bf = at::empty({M, N}, x_c.options().dtype(bf16_out_dtype));
+            launch_det_matmul_tc_async_bf16(
+                x_bf.data_ptr(), w_c.data_ptr(), out_bf.data_ptr(),
+                write_fp32, M, K, N, stream);
+            return (out_bf.scalar_type() == dtype)
+                ? out_bf
+                : out_bf.to(dtype).contiguous();
+        }
         // Routing precedence (T3.6/T3.7 fix 2026-05-01):
         //   1. cp.async kernel (sm_80+) — KRUNCH_HEAD_ASYNC default ON,
         //      runs at K∈{768,3072}, N % 8 == 0, M ≥ 64. Layer matmul
@@ -331,7 +350,11 @@ at::Tensor rwkv4_layer_step_cpp_t1(
         const char* e = std::getenv("KRUNCH_DETERMINISTIC_MATMUL");
         return e != nullptr && std::string(e) == "1";
     }();
-    if (USE_DET_3WAY && !DISABLE_3WAY) {
+    // bf16 weights skip the 3-way fused fp16 kernel (no bf16 variant yet);
+    // fall through to per-matmul gemm_fp16 which routes to the bf16 kernel
+    // when the weight dtype is bf16.
+    const bool bf16_weights = (Kw_c.scalar_type() == at::kBFloat16);
+    if (USE_DET_3WAY && !DISABLE_3WAY && !bf16_weights) {
         // n_att == C for RWKV-4 (768 == 768), so M=N=K=768; K dim of input
         // must match. Kw is [C, n_att], Vw is [C, n_att], Rw is [C, C].
         // All have K=C=768 and N=n_att=C=768 → same shape, batchable.
@@ -512,7 +535,10 @@ at::Tensor rwkv4_layer_step_cpp(
     const bool can_3way_async_p = USE_3WAY_ASYNC
                                    && (B * T) >= THREEWAY_ASYNC_M_MIN_P
                                    && (n_att_p == 768 || n_att_p == 3072);
-    if (USE_DET_3WAY_P && !DISABLE_3WAY_P && can_3way_async_p) {
+    // bf16 weights skip the 3-way fp16-only kernels; fall through to per-
+    // matmul gemm_fp16 which routes bf16 weights through the bf16 kernel.
+    const bool bf16_weights_p = (Kw_c_p.scalar_type() == at::kBFloat16);
+    if (USE_DET_3WAY_P && !DISABLE_3WAY_P && can_3way_async_p && !bf16_weights_p) {
         TORCH_CHECK(n_att_p == (int)C, "3-way fusion needs n_att == C");
         launch_det_matmul_tc_3way_async(
             kx_flat.data_ptr(), vx_flat.data_ptr(), rx_flat.data_ptr(),
@@ -520,7 +546,7 @@ at::Tensor rwkv4_layer_step_cpp(
             k.data_ptr(), v.data_ptr(), r_pre_flat.data_ptr(),
             /*wf0=*/1, /*wf1=*/1, /*wf2=*/0,
             /*M=*/(int)(B * T), /*K=*/(int)C, /*N=*/n_att_p, stream0);
-    } else if (USE_DET_3WAY_P && !DISABLE_3WAY_P) {
+    } else if (USE_DET_3WAY_P && !DISABLE_3WAY_P && !bf16_weights_p) {
         TORCH_CHECK(n_att_p == (int)C, "3-way fusion needs n_att == C");
         launch_det_matmul_tc_3way(
             kx_flat.data_ptr(), vx_flat.data_ptr(), rx_flat.data_ptr(),

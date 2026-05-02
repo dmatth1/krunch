@@ -94,6 +94,8 @@ krunch/
 - **Push fix → wait for `Publish image to ghcr.io` to succeed → re-run
   `tests/gpu.sh`.** Don't try to shortcut by building on the GPU
   instance; it diverges from what users run and accumulates drift.
+- **Build typically takes ~5 minutes** — short enough to wait, no need to
+  schedule long sleeps. Poll every minute or so.
 - Monitor publish via:
   `gh api repos/dmatth1/krunch/actions/runs --jq '.workflow_runs[0:3] | .[] | "\(.status)/\(.conclusion // "running") \(.head_sha[0:7])"'`
 
