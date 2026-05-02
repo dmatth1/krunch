@@ -46,6 +46,40 @@ void set_det_matmul_cublas_algo(int algo_id);
 void launch_det_matmul_tc_v2(const void* A, const void* B, void* C,
                               int write_fp32, int M, int K, int N,
                               cudaStream_t stream);
+// Multi-warp 64x64-tile WMMA matmul — see det_matmul_tc_mw.cu.
+// Only K=768 and K=3072 are supported; intended for the head matmul shape.
+void launch_det_matmul_tc_mw(const void* A, const void* B, void* C,
+                              int write_fp32, int M, int K, int N,
+                              cudaStream_t stream);
+// 128x128-tile / 8-warp WMMA matmul — see det_matmul_tc_xl.cu.
+void launch_det_matmul_tc_xl(const void* A, const void* B, void* C,
+                              int write_fp32, int M, int K, int N,
+                              cudaStream_t stream);
+// cp.async double-buffered K-loop (sm_80+ only) — see det_matmul_tc_async.cu.
+// Closes the cuBLAS gap on A10G/L40S/A100/H100. K∈{768,3072}, M+N must be
+// multiples of 64 (or partial-tile masking handles bounds).
+void launch_det_matmul_tc_async(const void* A, const void* B, void* C,
+                                 int write_fp32, int M, int K, int N,
+                                 cudaStream_t stream);
+// bf16 variant of det_matmul_tc_async — see det_matmul_tc_bf16.cu.
+void launch_det_matmul_tc_async_bf16(
+    const void* A, const void* B, void* C,
+    int write_fp32, int M, int K, int N, cudaStream_t stream);
+// uint8 weights + inline dequant + fp16 WMMA — see det_matmul_tc_uint8.cu.
+void launch_det_matmul_tc_uint8(
+    const void* A, const void* W_u8, const void* scale, const void* offset,
+    void* C, int write_fp32, int M, int K, int N, cudaStream_t stream);
+// 3-way fused cp.async + WMMA matmul — see det_matmul_tc_3way_async.cu.
+// Computes (Y0=A0@B0, Y1=A1@B1, Y2=A2@B2) in one kernel launch.
+// All inputs/outputs share shape; saves 2 launches + amortizes K-axis
+// memory load latency. Used by KVR matmul (kx, vx, rx all M=B, K=n_embd,
+// N=n_att). sm_80+ only.
+void launch_det_matmul_tc_3way_async(
+    const void* A0, const void* A1, const void* A2,
+    const void* B0, const void* B1, const void* B2,
+    void* Y0, void* Y1, void* Y2,
+    int wf0, int wf1, int wf2,
+    int M, int K, int N, cudaStream_t stream);
 // Custom row-wise LayerNorm — see layer_norm.cu.
 void launch_layer_norm(const void* x, const void* gamma, const void* beta,
                         void* y, int N, int C, float eps,
@@ -54,6 +88,72 @@ void launch_layer_norm(const void* x, const void* gamma, const void* beta,
 void launch_det_softmax_cdf(const void* logits, void* cdf,
                              int T, int V, int cdf_T_value,
                              cudaStream_t stream);
+// Graph-safe WKV — see wkv_kernel.cu.
+void launch_krunch_wkv_forward(
+    int B, int T, int C,
+    const float* time_decay, const float* time_first,
+    const float* k, const float* v, float* y,
+    float* aa, float* bb, float* pp,
+    cudaStream_t stream);
+}
+
+// Toggle our own graph-safe WKV via KRUNCH_OWN_WKV=1. Default OFF — only
+// flip when we need CUDA-graph capture of the layer step (KRUNCH_CPP_GRAPH=1).
+// MUST match across encoder + decoder or AC roundtrip breaks.
+static bool use_own_wkv() {
+    static const bool USE = []{
+        const char* e = std::getenv("KRUNCH_OWN_WKV");
+        return e != nullptr && std::string(e) == "1";
+    }();
+    return USE;
+}
+
+// =============================================================================
+// Phase profiler (T3.7) — gated by KRUNCH_PHASE_PROFILE=1.
+//
+// Records cudaEvents between phases of rwkv4_layer_step_cpp; sums elapsed
+// times across all calls. Read via `read_phase_times()`. Adds per-call
+// stream sync overhead (~50 µs) — only enable for diagnostic runs.
+// =============================================================================
+
+constexpr int N_PHASES = 11;
+static const char* PHASE_NAMES[N_PHASES] = {
+    "ln1", "premix3", "kvr_matmul", "sigmoid_r",
+    "wkv", "ow_matmul_residual", "ln2", "premix2",
+    "ffn_R_matmul_sigmoid", "ffn_K_matmul_relu", "ffn_V_matmul_residual"
+};
+
+static cudaEvent_t g_phase_events[N_PHASES + 1];
+static double g_phase_sum_ms[N_PHASES] = {0};
+static int g_phase_call_count = 0;
+static bool g_phase_events_init = false;
+
+static bool phase_profile_on() {
+    static const bool E = []{
+        const char* e = std::getenv("KRUNCH_PHASE_PROFILE");
+        return e != nullptr && std::string(e) == "1";
+    }();
+    return E;
+}
+
+static inline void rec_phase(int idx, cudaStream_t s) {
+    if (!phase_profile_on()) return;
+    if (!g_phase_events_init) {
+        for (int i = 0; i <= N_PHASES; i++) cudaEventCreate(&g_phase_events[i]);
+        g_phase_events_init = true;
+    }
+    cudaEventRecord(g_phase_events[idx], s);
+}
+
+static inline void finalize_phase_call() {
+    if (!phase_profile_on()) return;
+    cudaEventSynchronize(g_phase_events[N_PHASES]);
+    for (int i = 0; i < N_PHASES; i++) {
+        float ms = 0.0f;
+        cudaEventElapsedTime(&ms, g_phase_events[i], g_phase_events[i+1]);
+        g_phase_sum_ms[i] += ms;
+    }
+    g_phase_call_count++;
 }
 
 // Custom row-wise LayerNorm wrapper. Replaces at::layer_norm in
@@ -121,11 +221,22 @@ static at::Tensor gemm_fp16(at::Tensor x, at::Tensor w,
     if (USE_DET) {
         cudaStream_t stream = at::cuda::getCurrentCUDAStream();
         const int write_fp32 = (dtype == at::kFloat) ? 1 : 0;
-        // Default v1 (16×16 WMMA). v2 (32×32) measured neutral on T4
-        // and A10G end-to-end despite 1.7-2× microbench wins because
-        // matmul isn't the layer-step bottleneck (premix/WKV/elementwise
-        // dominate). Opt into via KRUNCH_TC_V2=1; cuBLAS pinned via
-        // KRUNCH_CUBLAS_PINNED=1 (NOT bit-stable across M — bench only).
+        // Routing precedence (T3.6/T3.7 fix 2026-05-01):
+        //   1. cp.async kernel (sm_80+) — KRUNCH_HEAD_ASYNC default ON,
+        //      runs at K∈{768,3072}, N % 8 == 0, M ≥ 64. Layer matmul
+        //      shapes (N=768/3072) qualify; closes 1.7-2× of cuBLAS gap.
+        //   2. KRUNCH_TC_V2 / KRUNCH_CUBLAS_PINNED — opt-in benches.
+        //   3. Default 16×16 WMMA single-warp.
+        // PRIOR BUG: layer-matmul gemm_fp16 fell through to the default
+        // det_matmul_tc, bypassing async/MW/XL. Phase profile 2026-05-01
+        // identified this — async kernel was correct + bit-stable but
+        // never ran in production for layer matmuls.
+        static const bool USE_ASYNC_GEMM = []{
+            const char* e = std::getenv("KRUNCH_HEAD_ASYNC");
+            return e == nullptr || std::string(e) != "0";
+        }();
+        const bool gemm_async_aligned = ((K == 768 || K == 3072)
+                                          && (N % 8 == 0) && M >= 64);
         static const bool USE_CUBLAS_PIN = []{
             const char* e = std::getenv("KRUNCH_CUBLAS_PINNED");
             return e != nullptr && std::string(e) == "1";
@@ -134,7 +245,11 @@ static at::Tensor gemm_fp16(at::Tensor x, at::Tensor w,
             const char* e = std::getenv("KRUNCH_TC_V2");
             return e != nullptr && std::string(e) == "1";
         }();
-        if (USE_CUBLAS_PIN) {
+        if (USE_ASYNC_GEMM && gemm_async_aligned) {
+            launch_det_matmul_tc_async(x_c.data_ptr(), w_c.data_ptr(),
+                                        out.data_ptr(), write_fp32,
+                                        M, K, N, stream);
+        } else if (USE_CUBLAS_PIN) {
             launch_det_matmul_cublas(x_c.data_ptr(), w_c.data_ptr(),
                                       out.data_ptr(), write_fp32,
                                       M, K, N, stream);
@@ -205,11 +320,18 @@ at::Tensor rwkv4_layer_step_cpp_t1(
     auto Kw_c = Kw.contiguous();
     auto Vw_c = Vw.contiguous();
     auto Rw_c = Rw.contiguous();
+    // T=1 path: M=1 doesn't qualify for 3way_async (WMMA needs M≥16).
+    // 3way_async routing only happens in the packed rwkv4_layer_step_cpp
+    // function below.
+    static const bool DISABLE_3WAY = []{
+        const char* e = std::getenv("KRUNCH_NO_3WAY");
+        return (e == nullptr) ? false : std::string(e) == "1";
+    }();
     static const bool USE_DET_3WAY = []{
         const char* e = std::getenv("KRUNCH_DETERMINISTIC_MATMUL");
         return e != nullptr && std::string(e) == "1";
     }();
-    if (USE_DET_3WAY) {
+    if (USE_DET_3WAY && !DISABLE_3WAY) {
         // n_att == C for RWKV-4 (768 == 768), so M=N=K=768; K dim of input
         // must match. Kw is [C, n_att], Vw is [C, n_att], Rw is [C, C].
         // All have K=C=768 and N=n_att=C=768 → same shape, batchable.
@@ -238,16 +360,26 @@ at::Tensor rwkv4_layer_step_cpp_t1(
     auto td_c = time_decay.contiguous();
     auto tf_c = time_first.contiguous();
 
-    // Lookup the wkv_forward op once and call it.
-    static auto wkv_op = c10::Dispatcher::singleton()
-        .findSchemaOrThrow("rwkv::wkv_forward", "")
-        .typed<void(int64_t, int64_t, int64_t,
-                     at::Tensor&, at::Tensor&,
-                     at::Tensor&, at::Tensor&, at::Tensor&,
-                     at::Tensor&, at::Tensor&, at::Tensor&)>();
-    wkv_op.call(1, 1, C,
-                td_c, tf_c, k_flat, v_flat, y_flat,
-                aa_c, bb_c, pp_c);
+    if (use_own_wkv()) {
+        launch_krunch_wkv_forward(
+            /*B=*/1, /*T=*/1, (int)C,
+            td_c.data_ptr<float>(), tf_c.data_ptr<float>(),
+            k_flat.data_ptr<float>(), v_flat.data_ptr<float>(),
+            y_flat.data_ptr<float>(),
+            aa_c.data_ptr<float>(), bb_c.data_ptr<float>(), pp_c.data_ptr<float>(),
+            stream_t1);
+    } else {
+        // Lookup the wkv_forward op once and call it.
+        static auto wkv_op = c10::Dispatcher::singleton()
+            .findSchemaOrThrow("rwkv::wkv_forward", "")
+            .typed<void(int64_t, int64_t, int64_t,
+                         at::Tensor&, at::Tensor&,
+                         at::Tensor&, at::Tensor&, at::Tensor&,
+                         at::Tensor&, at::Tensor&, at::Tensor&)>();
+        wkv_op.call(1, 1, C,
+                    td_c, tf_c, k_flat, v_flat, y_flat,
+                    aa_c, bb_c, pp_c);
+    }
 
     // State update via copy_ — caller's tensors see the new values.
     aa.copy_(aa_c);
@@ -318,9 +450,13 @@ at::Tensor rwkv4_layer_step_cpp(
     // Premix kernel + WKV op + matmul tile schedules all generalize
     // over B; state tensors must be [B, C] / [B, n_att].
 
+    cudaStream_t prof_stream = at::cuda::getCurrentCUDAStream();
+    rec_phase(0, prof_stream);
+
     // LayerNorm 1
     auto xx = maybe_layer_norm(x, {C}, ln1_w, ln1_b);                // [1, T, C]
     auto xx_flat = xx.contiguous().view({B * T, C});
+    rec_phase(1, prof_stream);
 
     // Fused premix: kx, vx, rx = mix(xx, sx_full, tm_*).
     // sx_full[t=0] = att_xx, sx_full[t>0] = xx[t-1] — kernel handles both
@@ -336,6 +472,7 @@ at::Tensor rwkv4_layer_step_cpp(
         tm_r.contiguous().data_ptr(),
         kx_flat.data_ptr(), vx_flat.data_ptr(), rx_flat.data_ptr(),
         (int)B, (int)T, (int)C, stream0);
+    rec_phase(2, prof_stream);
 
     // K, V, R linears — fused into one TC kernel launch (3 GEMMs in 1).
     const int n_att_p = (int)Kw.size(-1);
@@ -349,7 +486,41 @@ at::Tensor rwkv4_layer_step_cpp(
         const char* e = std::getenv("KRUNCH_DETERMINISTIC_MATMUL");
         return e != nullptr && std::string(e) == "1";
     }();
-    if (USE_DET_3WAY_P) {
+    // 3-way KVR matmul routing precedence (T3.S2a, 2026-05-02):
+    //   1. 3way_async (cp.async + WMMA, sm_80+, M≥16) — fastest
+    //   2. Old 3way (single-warp WMMA) — fallback
+    //   3. KRUNCH_NO_3WAY=1 → fall through to 3 separate gemm_fp16
+    //      (each routed to async via gemm_fp16's own routing)
+    static const bool USE_3WAY_ASYNC = []{
+        const char* e = std::getenv("KRUNCH_3WAY_ASYNC");
+        return e == nullptr || std::string(e) != "0";
+    }();
+    static const bool DISABLE_3WAY_P = []{
+        const char* e = std::getenv("KRUNCH_NO_3WAY");
+        return (e == nullptr) ? false : std::string(e) == "1";
+    }();
+    // M ≥ 256 threshold: at M=128 (decompress B=128) the 64×64 tile only
+    // produces 24 blocks (2 M-tiles × 12 N-tiles) vs old 3way's 16×16
+    // tiles producing 384 blocks. A10G has 80 SMs; 24 blocks underfills
+    // (regression measured: 47 → 43.5 KB/s decompress when 3way_async
+    // was used). Compress packed M=1024 produces 192 blocks → fully
+    // saturates SMs. Tune via KRUNCH_3WAY_ASYNC_M_MIN.
+    static const int THREEWAY_ASYNC_M_MIN_P = []{
+        const char* e = std::getenv("KRUNCH_3WAY_ASYNC_M_MIN");
+        return (e != nullptr) ? atoi(e) : 256;
+    }();
+    const bool can_3way_async_p = USE_3WAY_ASYNC
+                                   && (B * T) >= THREEWAY_ASYNC_M_MIN_P
+                                   && (n_att_p == 768 || n_att_p == 3072);
+    if (USE_DET_3WAY_P && !DISABLE_3WAY_P && can_3way_async_p) {
+        TORCH_CHECK(n_att_p == (int)C, "3-way fusion needs n_att == C");
+        launch_det_matmul_tc_3way_async(
+            kx_flat.data_ptr(), vx_flat.data_ptr(), rx_flat.data_ptr(),
+            Kw_c_p.data_ptr(), Vw_c_p.data_ptr(), Rw_c_p.data_ptr(),
+            k.data_ptr(), v.data_ptr(), r_pre_flat.data_ptr(),
+            /*wf0=*/1, /*wf1=*/1, /*wf2=*/0,
+            /*M=*/(int)(B * T), /*K=*/(int)C, /*N=*/n_att_p, stream0);
+    } else if (USE_DET_3WAY_P && !DISABLE_3WAY_P) {
         TORCH_CHECK(n_att_p == (int)C, "3-way fusion needs n_att == C");
         launch_det_matmul_tc_3way(
             kx_flat.data_ptr(), vx_flat.data_ptr(), rx_flat.data_ptr(),
@@ -362,7 +533,9 @@ at::Tensor rwkv4_layer_step_cpp(
         v.copy_(gemm_fp16(vx_flat, Vw, at::kFloat));
         r_pre_flat.copy_(gemm_fp16(rx_flat, Rw));
     }
+    rec_phase(3, prof_stream);
     auto r = at::sigmoid(r_pre_flat).view({B, T, C});
+    rec_phase(4, prof_stream);
 
     // WKV: kernel expects [B*T, C] in/out.
     auto k_c = k.contiguous();
@@ -374,28 +547,41 @@ at::Tensor rwkv4_layer_step_cpp(
     auto td_c = time_decay.contiguous();
     auto tf_c = time_first.contiguous();
 
-    static auto wkv_op = c10::Dispatcher::singleton()
-        .findSchemaOrThrow("rwkv::wkv_forward", "")
-        .typed<void(int64_t, int64_t, int64_t,
-                     at::Tensor&, at::Tensor&,
-                     at::Tensor&, at::Tensor&, at::Tensor&,
-                     at::Tensor&, at::Tensor&, at::Tensor&)>();
-    wkv_op.call(B, T, C, td_c, tf_c, k_c, v_c, y_flat, aa_c, bb_c, pp_c);
+    if (use_own_wkv()) {
+        cudaStream_t stream_pk = at::cuda::getCurrentCUDAStream();
+        launch_krunch_wkv_forward(
+            (int)B, (int)T, (int)C,
+            td_c.data_ptr<float>(), tf_c.data_ptr<float>(),
+            k_c.data_ptr<float>(), v_c.data_ptr<float>(), y_flat.data_ptr<float>(),
+            aa_c.data_ptr<float>(), bb_c.data_ptr<float>(), pp_c.data_ptr<float>(),
+            stream_pk);
+    } else {
+        static auto wkv_op = c10::Dispatcher::singleton()
+            .findSchemaOrThrow("rwkv::wkv_forward", "")
+            .typed<void(int64_t, int64_t, int64_t,
+                         at::Tensor&, at::Tensor&,
+                         at::Tensor&, at::Tensor&, at::Tensor&,
+                         at::Tensor&, at::Tensor&, at::Tensor&)>();
+        wkv_op.call(B, T, C, td_c, tf_c, k_c, v_c, y_flat, aa_c, bb_c, pp_c);
+    }
 
     aa.copy_(aa_c);
     bb.copy_(bb_c);
     pp.copy_(pp_c);
     // att_xx update: last position's xx
     att_xx.copy_(xx.select(1, T - 1));
+    rec_phase(5, prof_stream);
 
     auto y = y_flat.view({B, T, C}).to(x.scalar_type());            // [1, T, C]
     auto ry_flat = (r * y).contiguous().view({B * T, C});
     auto att_out = gemm_fp16(ry_flat, Ow).view({B, T, C});
     auto x_after_att = x + att_out;                                  // [1, T, C]
+    rec_phase(6, prof_stream);
 
     // LayerNorm 2 + FFN
     auto xx2 = maybe_layer_norm(x_after_att, {C}, ln2_w, ln2_b);
     auto xx2_flat = xx2.contiguous().view({B * T, C});
+    rec_phase(7, prof_stream);
 
     // Fused FFN premix: ffn_kx, ffn_rx = mix(xx2, ffn_xx, ffn_tm_*).
     auto ffn_kx_flat = at::empty({B * T, C}, xx2_flat.options());
@@ -406,15 +592,20 @@ at::Tensor rwkv4_layer_step_cpp(
         ffn_tm_r.contiguous().data_ptr(),
         ffn_kx_flat.data_ptr(), ffn_rx_flat.data_ptr(),
         (int)B, (int)T, (int)C, stream0);
+    rec_phase(8, prof_stream);
 
     auto r_ffn = at::sigmoid(gemm_fp16(ffn_rx_flat, ffn_Rw)).view({B, T, C});
+    rec_phase(9, prof_stream);
     // FFN K + fused relu² (eliminates 2 ATen op launches: at::relu + at::pow).
     auto k_ffn = gemm_fp16(ffn_kx_flat, ffn_Kw);                    // [B*T, n_ffn]
     launch_relu_sq(k_ffn.data_ptr(), (int)k_ffn.numel(), stream0);
+    rec_phase(10, prof_stream);
     auto v_ffn = gemm_fp16(k_ffn, ffn_Vw).view({B, T, C});           // [B, T, C]
 
     auto x_final = x_after_att + r_ffn * v_ffn;
     ffn_xx.copy_(xx2.select(1, T - 1));
+    rec_phase(11, prof_stream);
+    finalize_phase_call();
 
     return x_final;
 }
@@ -519,13 +710,82 @@ static at::Tensor det_matmul_py(at::Tensor x, at::Tensor W,
     auto out = at::empty({M, N}, xc.options().dtype(dtype));
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     const int write_fp32 = (dtype == at::kFloat) ? 1 : 0;
-    // Default v1 (16×16). v2 microbench-faster but neutral end-to-end;
-    // opt-in via KRUNCH_TC_V2=1 (matches the gemm_fp16 default).
+    // Routing:
+    //   - Head matmul w/ LARGE M (K∈{768,3072}, N≥16384, M≥256): multi-warp
+    //     64×64-tile kernel (det_matmul_tc_mw). Compress packed forward
+    //     hits this (M=SEQ_BATCH=1024). 1.78× speedup on T4 microbench.
+    //     Excludes decompress stepped (M=B≤256) where 64-row tiles waste
+    //     loads (regression measured: T4 B=64 decompress 13.6→12.1 KB/s
+    //     when MW was used). M-threshold default 256 — a 64×64 kernel on
+    //     M=128 leaves half its rows padded and runs slower than 1-warp
+    //     16×16 tiles which fully use M=128. Tune via KRUNCH_HEAD_MW_M_MIN.
+    //   - KRUNCH_TC_V2=1: opt-in to 32×32-tile single-warp v2.
+    //   - Default: original 16×16-tile single-warp det_matmul_tc.
+    // KRUNCH_HEAD_MW=0 disables MW routing entirely (safety valve).
     static const bool USE_TC_V2 = []{
         const char* e = std::getenv("KRUNCH_TC_V2");
         return e != nullptr && std::string(e) == "1";
     }();
-    if (USE_TC_V2 && (K == 768 || K == 3072)) {
+    static const bool DISABLE_HEAD_MW = []{
+        const char* e = std::getenv("KRUNCH_HEAD_MW");
+        return e != nullptr && std::string(e) == "0";
+    }();
+    static const int HEAD_MW_M_MIN = []{
+        const char* e = std::getenv("KRUNCH_HEAD_MW_M_MIN");
+        return (e != nullptr) ? atoi(e) : 256;
+    }();
+    // XL kernel landed but on T4 doesn't beat MW (no cp.async on sm_75).
+    // Default OFF; flip on A10G/L40S/H100 (sm_80+) where cp.async-style
+    // optimizations actually pay off. Currently off pending sm_80+ path
+    // in det_matmul_tc_xl.cu.
+    static const bool USE_XL = []{
+        const char* e = std::getenv("KRUNCH_HEAD_XL");
+        return e != nullptr && std::string(e) == "1";
+    }();
+    // cp.async kernel (sm_80+). Default ON; set KRUNCH_HEAD_ASYNC=0 to disable.
+    // Kernel itself is empty on sm_75 — routing should detect and fall back.
+    static const bool USE_ASYNC = []{
+        const char* e = std::getenv("KRUNCH_HEAD_ASYNC");
+        return e == nullptr || std::string(e) != "0";
+    }();
+    static const int HEAD_XL_M_MIN = []{
+        const char* e = std::getenv("KRUNCH_HEAD_XL_M_MIN");
+        return (e != nullptr) ? atoi(e) : 256;
+    }();
+    const bool head_shape = (K == 768 || K == 3072) && N >= 16384
+                             && M >= HEAD_MW_M_MIN;
+    // Async kernel needs 16-byte aligned global loads. For B, row stride
+    // is N halves = 2*N bytes; aligned iff N % 8 == 0. Layer matmul shapes
+    // (N=768, N=3072) qualify; head matmul N=50277 doesn't.
+    const bool async_aligned = ((K == 768 || K == 3072) && (N % 8 == 0)
+                                 && M >= 64);
+    // Async + N-padding (T3.7 follow-up): if head_shape (large N) and N not
+    // 8-aligned (e.g., 50277), pad W internally to N_pad = (N+7)&~7, run
+    // async, slice output. Saves vs MW path; small per-call alloc overhead.
+    const bool head_shape_unaligned = (K == 768 || K == 3072)
+                                       && N >= 16384 && M >= 64
+                                       && (N % 8 != 0);
+    if (USE_ASYNC && async_aligned) {
+        launch_det_matmul_tc_async(xc.data_ptr(), Wc.data_ptr(), out.data_ptr(),
+                                     write_fp32, M, K, N, stream);
+    } else if (USE_ASYNC && head_shape_unaligned) {
+        const int N_pad = (N + 7) & ~7;
+        auto W_pad = at::zeros({K, N_pad}, Wc.options());
+        // Copy W's N cols into first N cols of W_pad (rest stays zero).
+        W_pad.narrow(1, 0, N).copy_(Wc);
+        auto out_pad = at::empty({M, N_pad}, out.options());
+        launch_det_matmul_tc_async(xc.data_ptr(), W_pad.data_ptr(),
+                                     out_pad.data_ptr(),
+                                     write_fp32, M, K, N_pad, stream);
+        out.copy_(out_pad.narrow(1, 0, N));
+    } else if (head_shape && USE_XL && M >= HEAD_XL_M_MIN) {
+        // 128×128 tile / 8-warp kernel — better M=1024 perf than MW.
+        launch_det_matmul_tc_xl(xc.data_ptr(), Wc.data_ptr(), out.data_ptr(),
+                                 write_fp32, M, K, N, stream);
+    } else if (head_shape && !DISABLE_HEAD_MW) {
+        launch_det_matmul_tc_mw(xc.data_ptr(), Wc.data_ptr(), out.data_ptr(),
+                                 write_fp32, M, K, N, stream);
+    } else if (USE_TC_V2 && (K == 768 || K == 3072)) {
         launch_det_matmul_tc_v2(xc.data_ptr(), Wc.data_ptr(), out.data_ptr(),
                                  write_fp32, M, K, N, stream);
     } else {
@@ -536,6 +796,19 @@ static at::Tensor det_matmul_py(at::Tensor x, at::Tensor W,
 }
 
 void register_layer_cpp(pybind11::module& m) {
+    m.def("read_phase_times", []() {
+        pybind11::dict d;
+        for (int i = 0; i < N_PHASES; i++) {
+            d[PHASE_NAMES[i]] = g_phase_sum_ms[i];
+        }
+        d["call_count"] = g_phase_call_count;
+        return d;
+    }, "Read accumulated phase timings (ms). Set KRUNCH_PHASE_PROFILE=1 to enable.");
+    m.def("reset_phase_times", []() {
+        for (int i = 0; i < N_PHASES; i++) g_phase_sum_ms[i] = 0;
+        g_phase_call_count = 0;
+    }, "Reset phase-time accumulators to zero.");
+
     m.def("rwkv4_layer_step_cpp_t1", &rwkv4_layer_step_cpp_t1,
           "C++ orchestration of one RWKV-4 layer at B=1, T=1.");
     m.def("rwkv4_layer_step_cpp", &rwkv4_layer_step_cpp,
@@ -548,6 +821,52 @@ void register_layer_cpp(pybind11::module& m) {
           "Deterministic shape-invariant matmul: y = x @ W.",
           pybind11::arg("x"), pybind11::arg("W"),
           pybind11::arg("out_dtype") = c10::nullopt);
+    m.def("det_matmul_bf16", [](at::Tensor x, at::Tensor W,
+                                 c10::optional<at::ScalarType> out_dtype) {
+        // bf16 cp.async + WMMA matmul (sm_80+). Used by the bf16 microbench
+        // to compare against det_matmul (fp16) for speed + numerical drift.
+        auto xc = x.contiguous();
+        auto Wc = W.contiguous();
+        const int M = (int)xc.size(0);
+        const int K = (int)xc.size(1);
+        const int N = (int)Wc.size(-1);
+        const auto dtype = out_dtype.has_value() ? out_dtype.value() : xc.scalar_type();
+        auto out = at::empty({M, N}, xc.options().dtype(dtype));
+        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+        const int write_fp32 = (dtype == at::kFloat) ? 1 : 0;
+        launch_det_matmul_tc_async_bf16(
+            xc.data_ptr(), Wc.data_ptr(), out.data_ptr(),
+            write_fp32, M, K, N, stream);
+        return out;
+    }, "bf16 deterministic matmul (sm_80+ only). y = x @ W with both "
+       "inputs bf16 and fp32 accumulator.",
+       pybind11::arg("x"), pybind11::arg("W"),
+       pybind11::arg("out_dtype") = c10::nullopt);
+    m.def("det_matmul_uint8", [](at::Tensor x, at::Tensor W_u8,
+                                   at::Tensor scale, at::Tensor offset,
+                                   c10::optional<at::ScalarType> out_dtype) {
+        // uint8 weights + inline dequant + fp16 WMMA. Used by uint8 microbench.
+        // x: [M, K] fp16, W_u8: [K, N] uint8, scale/offset: [K] fp16.
+        auto xc = x.contiguous();
+        auto Wc = W_u8.contiguous();
+        auto sc = scale.contiguous();
+        auto oc = offset.contiguous();
+        const int M = (int)xc.size(0);
+        const int K = (int)xc.size(1);
+        const int N = (int)Wc.size(-1);
+        const auto dtype = out_dtype.has_value() ? out_dtype.value() : xc.scalar_type();
+        auto out = at::empty({M, N}, xc.options().dtype(dtype));
+        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+        const int write_fp32 = (dtype == at::kFloat) ? 1 : 0;
+        launch_det_matmul_tc_uint8(
+            xc.data_ptr(), Wc.data_ptr(), sc.data_ptr(), oc.data_ptr(),
+            out.data_ptr(), write_fp32, M, K, N, stream);
+        return out;
+    }, "uint8 weight matmul with per-input-channel scale + offset. "
+       "x fp16, W_u8 uint8, scale + offset fp16.",
+       pybind11::arg("x"), pybind11::arg("W_u8"),
+       pybind11::arg("scale"), pybind11::arg("offset"),
+       pybind11::arg("out_dtype") = c10::nullopt);
     m.def("det_matmul_cublas_pinned", [](at::Tensor x, at::Tensor W,
                                           c10::optional<at::ScalarType> out_dtype) {
         // Test-only binding: forces the cuBLAS pinned-algo path so we
@@ -578,6 +897,100 @@ void register_layer_cpp(pybind11::module& m) {
     }, "Override the cuBLAS algo enum used by det_matmul_cublas_pinned + "
        "the in-engine cuBLAS path. Useful for sweeping algos.",
        pybind11::arg("algo_id"));
+    m.def("det_matmul_tc_3way_async", [](
+            at::Tensor A0, at::Tensor A1, at::Tensor A2,
+            at::Tensor B0, at::Tensor B1, at::Tensor B2,
+            c10::optional<at::ScalarType> out_dtype) {
+        // 3-way fused cp.async + WMMA matmul for testing.
+        // All inputs share [M, K], all weights share [K, N].
+        auto a0 = A0.contiguous();
+        auto a1 = A1.contiguous();
+        auto a2 = A2.contiguous();
+        auto b0 = B0.contiguous();
+        auto b1 = B1.contiguous();
+        auto b2 = B2.contiguous();
+        const int M = (int)a0.size(0);
+        const int K = (int)a0.size(1);
+        const int N = (int)b0.size(-1);
+        TORCH_CHECK(K == 768 || K == 3072, "3way_async needs K∈{768,3072}");
+        TORCH_CHECK(a1.size(0) == M && a2.size(0) == M, "M must match");
+        TORCH_CHECK(b1.size(-1) == N && b2.size(-1) == N, "N must match");
+        const auto dtype = out_dtype.has_value() ? out_dtype.value() : a0.scalar_type();
+        auto y0 = at::empty({M, N}, a0.options().dtype(dtype));
+        auto y1 = at::empty({M, N}, a0.options().dtype(dtype));
+        auto y2 = at::empty({M, N}, a0.options().dtype(dtype));
+        const int wf = (dtype == at::kFloat) ? 1 : 0;
+        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+        launch_det_matmul_tc_3way_async(
+            a0.data_ptr(), a1.data_ptr(), a2.data_ptr(),
+            b0.data_ptr(), b1.data_ptr(), b2.data_ptr(),
+            y0.data_ptr(), y1.data_ptr(), y2.data_ptr(),
+            wf, wf, wf, M, K, N, stream);
+        return std::make_tuple(y0, y1, y2);
+    }, "3-way fused cp.async + WMMA matmul (sm_80+).",
+       pybind11::arg("A0"), pybind11::arg("A1"), pybind11::arg("A2"),
+       pybind11::arg("B0"), pybind11::arg("B1"), pybind11::arg("B2"),
+       pybind11::arg("out_dtype") = c10::nullopt);
+
+    m.def("det_matmul_tc_async", [](at::Tensor x, at::Tensor W,
+                                     c10::optional<at::ScalarType> out_dtype) {
+        // Direct binding for cp.async double-buffered kernel (sm_80+).
+        auto xc = x.contiguous();
+        auto Wc = W.contiguous();
+        const int M = (int)xc.size(0);
+        const int K = (int)xc.size(1);
+        const int N = (int)Wc.size(-1);
+        TORCH_CHECK(K == 768 || K == 3072, "det_matmul_tc_async needs K∈{768,3072}");
+        const auto dtype = out_dtype.has_value() ? out_dtype.value() : xc.scalar_type();
+        auto out = at::empty({M, N}, xc.options().dtype(dtype));
+        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+        const int write_fp32 = (dtype == at::kFloat) ? 1 : 0;
+        launch_det_matmul_tc_async(xc.data_ptr(), Wc.data_ptr(), out.data_ptr(),
+                                    write_fp32, M, K, N, stream);
+        return out;
+    }, "cp.async double-buffered WMMA matmul (sm_80+).",
+       pybind11::arg("x"), pybind11::arg("W"),
+       pybind11::arg("out_dtype") = c10::nullopt);
+    m.def("det_matmul_tc_xl", [](at::Tensor x, at::Tensor W,
+                                  c10::optional<at::ScalarType> out_dtype) {
+        // Direct binding for testing det_matmul_tc_xl (8-warp, 128×128 tile).
+        auto xc = x.contiguous();
+        auto Wc = W.contiguous();
+        const int M = (int)xc.size(0);
+        const int K = (int)xc.size(1);
+        const int N = (int)Wc.size(-1);
+        TORCH_CHECK(K == 768 || K == 3072, "det_matmul_tc_xl needs K∈{768,3072}");
+        const auto dtype = out_dtype.has_value() ? out_dtype.value() : xc.scalar_type();
+        auto out = at::empty({M, N}, xc.options().dtype(dtype));
+        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+        const int write_fp32 = (dtype == at::kFloat) ? 1 : 0;
+        launch_det_matmul_tc_xl(xc.data_ptr(), Wc.data_ptr(), out.data_ptr(),
+                                 write_fp32, M, K, N, stream);
+        return out;
+    }, "8-warp 128x128-tile WMMA matmul. Bit-stable across M.",
+       pybind11::arg("x"), pybind11::arg("W"),
+       pybind11::arg("out_dtype") = c10::nullopt);
+    m.def("det_matmul_tc_mw", [](at::Tensor x, at::Tensor W,
+                                  c10::optional<at::ScalarType> out_dtype) {
+        // Direct binding for testing det_matmul_tc_mw (4-warps-per-block,
+        // 64×64 tile). Requires K=768 or K=3072. Verifies bit-stability across
+        // M without going through head_shape auto-routing.
+        auto xc = x.contiguous();
+        auto Wc = W.contiguous();
+        const int M = (int)xc.size(0);
+        const int K = (int)xc.size(1);
+        const int N = (int)Wc.size(-1);
+        TORCH_CHECK(K == 768 || K == 3072, "det_matmul_tc_mw only supports K∈{768,3072}");
+        const auto dtype = out_dtype.has_value() ? out_dtype.value() : xc.scalar_type();
+        auto out = at::empty({M, N}, xc.options().dtype(dtype));
+        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+        const int write_fp32 = (dtype == at::kFloat) ? 1 : 0;
+        launch_det_matmul_tc_mw(xc.data_ptr(), Wc.data_ptr(), out.data_ptr(),
+                                 write_fp32, M, K, N, stream);
+        return out;
+    }, "Multi-warp 64x64-tile WMMA matmul (4 warps/block). Bit-stable across M.",
+       pybind11::arg("x"), pybind11::arg("W"),
+       pybind11::arg("out_dtype") = c10::nullopt);
     m.def("det_matmul_tc_v2", [](at::Tensor x, at::Tensor W,
                                   c10::optional<at::ScalarType> out_dtype) {
         // 32×32-tile WMMA. Bit-stable across M; produces DIFFERENT bits

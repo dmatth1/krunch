@@ -91,7 +91,14 @@ def _run_compress_worker():
     logger.info("read %d bytes", len(raw))
 
     engine.load()
-    chunk_entries, n_chunks = compress_all(raw, engine.compress_chunk)
+    # Pass total_size so all workers pick the SAME chunk_size as
+    # _byte_range did (deterministic from KRUNCH_INPUT_LEN). Without this,
+    # a worker on a small slice would derive a smaller chunk_size from
+    # its own len(raw) and emit chunks that don't line up with the
+    # byte-range alignment chosen above.
+    chunk_entries, n_chunks = compress_all(
+        raw, engine.compress_chunk, total_size=total_size,
+    )
     entries_bytes = b"".join(chunk_entries)
     crc = zlib.crc32(raw) & 0xFFFFFFFF
     blob = encode_header(len(raw), n_chunks, crc) + entries_bytes
@@ -235,10 +242,14 @@ def _parts_prefix(output_url: str) -> str:
 
 def _byte_range(part_index: int, part_count: int,
                 total_size: int) -> tuple[int, int]:
-    """Compute [start, end) for this part, aligned to chunking.CHUNK_SIZE."""
-    from .chunking import CHUNK_SIZE
-    per_part = (total_size // part_count // CHUNK_SIZE) * CHUNK_SIZE
-    per_part = max(per_part, CHUNK_SIZE)
+    """Compute [start, end) for this part, aligned to the dynamic chunk
+    size derived from total_size. All N workers see the same total_size
+    (KRUNCH_INPUT_LEN) and so pick the same chunk_size — byte ranges
+    align across workers without coordination."""
+    from .chunking import compute_chunk_size
+    chunk_size = compute_chunk_size(total_size)
+    per_part = (total_size // part_count // chunk_size) * chunk_size
+    per_part = max(per_part, chunk_size)
     start = part_index * per_part
     end = start + per_part if part_index < part_count - 1 else total_size
     return start, min(end, total_size)

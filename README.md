@@ -1,8 +1,12 @@
 # Krunch
 
-> **Krunch is a distributed neural compression framework.**
+> **Krunch is a neural codec for text.**
 > It works on any NVIDIA GPU and beats traditional compression algorithms (like zstd-22) by 20-40% on
 > text-heavy data (logs, chat, support tickets, code).
+>
+> Ships as a Python library, a Docker image, and a documented blob
+> format. Run it on one machine, parallelize it across a cluster with
+> any batch system you already use — your call.
 
 > Status: pre-launch.
 
@@ -28,28 +32,37 @@ that shells out to
 `docker run --gpus all -i ghcr.io/dmatth1/krunch:latest …`. After install
 every call starts in ~30 seconds (model load + WKV kernel cache).
 
-## Distributed batch jobs
+## Distributed across machines
 
-For large files / archival workloads, run the same image as an array job
-under any batch scheduler (AWS Batch, k8s Jobs, Spark, Dask, Ray) —
-workers read byte ranges directly from object storage and process them
-in parallel.
+For large files / archival workloads, run krunch as parallel tasks on
+whatever batch system you already use. `krunch plan` emits a
+ready-to-run artifact for the target you pick — we don't run anything
+for you, we just generate the config:
 
 ```bash
-# One-time AWS setup: deploy the Batch infra
-cd deploy/aws-cdk && npm install && npx cdk deploy
-
-# Submit a distributed job
-krunch submit \
-  --source s3://my-bucket/logs/data.jsonl \
-  --dest   s3://my-bucket/logs/data.krunch \
-  --workers 8
+krunch plan --target aws-batch --source s3://… --dest s3://… --workers 16 > job.json
+krunch plan --target k8s       --source s3://… --dest s3://… --workers 16 > job.yaml
+krunch plan --target modal     --source s3://… --dest s3://… --workers 16 > run.py
+krunch plan --target ray       --source s3://… --dest s3://… --workers 16 > run.py
+krunch plan --target slurm     --source s3://… --dest s3://… --workers 16 > run.sbatch
 ```
 
-See `deploy/aws-cdk/README.md` for the AWS-specific setup. The job
-contract (read byte range from URL, compress, write partial blob) is
-generic — the same Docker image runs under any scheduler that can pass
-env vars and grant S3 access.
+Then run it with your own tooling and credentials:
+`aws batch submit-job --cli-input-json file://job.json`,
+`kubectl apply -f job.yaml`, `modal run run.py`, etc.
+
+The artifact contains both the worker tasks (each computes its byte
+range from a framework-injected index) and a finalize task that
+stitches partial blobs into the final `.krunch`. The container
+contract (`KRUNCH_INPUT_URL`, `KRUNCH_PART_INDEX`, `KRUNCH_PART_COUNT`,
+…) is documented and stable — you can wire krunch into a batch system
+we don't have a template for in ~30 lines.
+
+See `examples/` for full reference deployments (including an AWS
+Batch CDK stack you can deploy as-is).
+
+> `krunch submit` is deprecated and will be removed in a future
+> release; use `krunch plan --target aws-batch` instead.
 
 ## What's inside the Docker image
 
@@ -128,17 +141,17 @@ predict it, krunch can produce *larger* output than the input. For
 arbitrary binary data, mixed media, or already-compressed payloads, use 
 a different compressor.
 
-## Why "distributed"
+## Why parallelize
 
 Compression chunks are independent — N workers means ~N× throughput.
 Decompression is the same: token-step is sequential within a chunk
 (RNN), but chunks decode in parallel. A 10 TB backfill on 10 workers
-finishes in 1/10th the time, with no orchestration code on the
-customer's side.
+finishes in 1/10th the time.
 
-The compression task is map-only and parallel, so it
-ships as a generic "run this container with these env vars" contract
-that fits any batch framework.
+Krunch doesn't ship a batch system — Modal, Ray, AWS Batch, k8s, and
+Slurm already do that part well. Instead we ship a stable container
+contract (one set of env vars, same behavior everywhere) and `krunch
+plan` to emit configs for the popular targets.
 
 ## Repo layout
 
@@ -146,21 +159,25 @@ that fits any batch framework.
 krunch/
 ├── Dockerfile              # CUDA + PyTorch + RWKV + WKV kernel + model weights
 ├── install.sh              # one-line installer (used by the curl install)
-├── krunch/                 # the Python package — core compression code
-│   ├── cli.py              # single-shot CLI entrypoint
+├── krunch/                 # the Python package — codec library + CLI
+│   ├── cli.py              # CLI: compress | decompress | plan | bench
 │   ├── inference.py        # RWKV-4-Pile-169M wrapper + AC coder + blob format
-│   ├── chunking.py         # 1 MB chunk splitter (neural-only, no fallback)
-│   ├── job.py              # Batch job runner: compress (array) + assemble
+│   ├── chunking.py         # chunk splitter (neural-only, no fallback)
+│   ├── worker_pool.py      # multi-process pool for --workers N
+│   ├── plan/               # krunch plan templates (aws-batch, k8s, modal, ray, slurm, …)
+│   ├── job.py              # in-container per-worker entry: range → partial blob
 │   └── url_io.py           # generic URL read/write (s3://, http://, file://)
+├── docs/
+│   └── format.md           # blob format spec (RFC-style, implementable)
 ├── scripts/
 │   ├── krunch              # the user-facing CLI wrapper (Python)
-│   └── entrypoint.sh       # container entrypoint (compress | decompress | job)
+│   └── entrypoint.sh       # container entrypoint (worker | finalize | compress | decompress)
 ├── tests/                  # see tests/README.md
 │   ├── test_blob.py        # unit tests (blob format, AC codec, chunking, CRC)
 │   ├── quick.sh            # CI-equivalent local checks (free, seconds)
 │   ├── integration.sh      # CPU end-to-end with the real model (free, ~30s)
 │   └── gpu.sh              # GPU smoke on a g5.xlarge spot (~$0.15)
-├── deploy/aws-cdk/         # AWS Batch deployer (compute envs, job queue, S3)
+├── examples/               # batch-framework integrations (AWS Batch CDK, Modal, Ray, k8s, …)
 └── LICENSE                 # Apache-2.0
 ```
 

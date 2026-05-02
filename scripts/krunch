@@ -94,8 +94,15 @@ def _run_local(action: str, args) -> int:
     cmd = [
         "docker", "run", "--rm", "--gpus", "all", "-i",
         "-v", "krunch-cache:/root/.cache",
-        DEFAULT_IMAGE, action,
     ]
+    # Pass through any KRUNCH_* env var to the container so flags like
+    # KRUNCH_CPP_GRAPH, KRUNCH_OWN_WKV, KRUNCH_DECOMPRESS_BATCH, etc.
+    # can be toggled from the host without rebuilding the image.
+    # Skip KRUNCH_IMAGE (host-only — the wrapper itself reads it).
+    for k, v in os.environ.items():
+        if k.startswith("KRUNCH_") and k != "KRUNCH_IMAGE":
+            cmd += ["-e", f"{k}={v}"]
+    cmd += [DEFAULT_IMAGE, action]
 
     # Pass file handles to subprocess only when explicit file args are
     # provided. Otherwise let subprocess inherit the parent's stdin/stdout

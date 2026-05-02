@@ -23,7 +23,12 @@ setup(
                      "det_softmax_cdf.cu", "det_matmul_tc.cu",
                      "det_matmul_tc_3way.cu", "det_matmul_cublas.cu",
                      "det_matmul_tc_v2.cu", "layer_norm.cu",
-                     "fused_pre_attn.cu"],
+                     "fused_pre_attn.cu", "wkv_kernel.cu",
+                     "det_matmul_tc_mw.cu", "rwkv_step_v2.cu",
+                     "det_matmul_tc_xl.cu", "det_matmul_tc_async.cu",
+                     "det_matmul_tc_3way_async.cu", "rwkv_step_v3.cu",
+                     "det_matmul_tc_bf16.cu",
+                     "det_matmul_tc_uint8.cu"],
             extra_compile_args={
                 "cxx": ["-O3", "-std=c++17"],
                 "nvcc": ["-O3", "--use_fast_math", "-std=c++17"],

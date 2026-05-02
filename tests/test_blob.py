@@ -171,6 +171,86 @@ def test_tokenizer():
 
 # ---------------------------------------------------------------------------
 
+def test_compute_chunk_size():
+    """Dynamic chunk sizing: 64 KB floor for small files, ~total/(4·B)
+    for large ones; deterministic across workers seeing same total."""
+    import os
+    from krunch.chunking import compute_chunk_size, _CHUNK_SIZE_FLOOR
+
+    # Snapshot env so the explicit-pin test doesn't leak.
+    saved_chunk = os.environ.pop("KRUNCH_CHUNK_SIZE", None)
+    saved_target = os.environ.pop("KRUNCH_TARGET_B", None)
+    try:
+        # Default target_B=128 → target_chunks=512.
+
+        # Tiny file: floors at 64 KB.
+        assert compute_chunk_size(10_000) == _CHUNK_SIZE_FLOOR
+        assert compute_chunk_size(0) == _CHUNK_SIZE_FLOOR
+
+        # 10 MB: 10MB/512 = ~20 KB → floor wins → 64 KB.
+        assert compute_chunk_size(10 * 1024 * 1024) == _CHUNK_SIZE_FLOOR
+
+        # 100 MB: 100MB/512 = 200 KB → above floor.
+        assert compute_chunk_size(100 * 1024 * 1024) == 200 * 1024
+
+        # 1 GB: 1GB/512 = 2 MB → 512 chunks of 2 MB.
+        assert compute_chunk_size(1024 * 1024 * 1024) == 2 * 1024 * 1024
+
+        # Determinism across two calls with same total.
+        assert compute_chunk_size(50_000_000) == compute_chunk_size(50_000_000)
+
+        # KRUNCH_TARGET_B override changes the math.
+        os.environ["KRUNCH_TARGET_B"] = "512"  # H100 class, 4×=2048 chunks
+        assert compute_chunk_size(1024 * 1024 * 1024) == 512 * 1024
+        del os.environ["KRUNCH_TARGET_B"]
+
+        # Explicit KRUNCH_CHUNK_SIZE pin overrides everything.
+        os.environ["KRUNCH_CHUNK_SIZE"] = "131072"
+        assert compute_chunk_size(1024 * 1024 * 1024) == 131072
+        assert compute_chunk_size(1000) == 131072
+    finally:
+        os.environ.pop("KRUNCH_CHUNK_SIZE", None)
+        os.environ.pop("KRUNCH_TARGET_B", None)
+        if saved_chunk is not None:
+            os.environ["KRUNCH_CHUNK_SIZE"] = saved_chunk
+        if saved_target is not None:
+            os.environ["KRUNCH_TARGET_B"] = saved_target
+
+    print(f"  PASS compute_chunk_size (floor / scale / pin / override)")
+
+
+def test_dynamic_chunking_roundtrip():
+    """compress_all without explicit chunk_size auto-derives from len(raw),
+    and decompress_all roundtrips byte-exactly. Same data, different total
+    sizes pick different chunk counts."""
+    from krunch.chunking import compress_all, decompress_all
+
+    def passthrough(b: bytes) -> bytes:
+        return b
+
+    # Small input: should fit in one chunk (64 KB floor).
+    raw_small = b"abc" * 10_000  # 30 KB
+    entries, n = compress_all(raw_small, passthrough)
+    assert n == 1, f"30 KB should be 1 chunk, got {n}"
+    assert decompress_all(b"".join(entries), n, passthrough) == raw_small
+
+    # Big input: splits into multiple chunks; same chunk_size on both sides.
+    raw_big = b"abc" * 200_000  # 600 KB → ceil(600K/64K) = 10 chunks
+    entries, n = compress_all(raw_big, passthrough)
+    assert n >= 9, f"600 KB should give ~10 chunks at 64K, got {n}"
+    assert decompress_all(b"".join(entries), n, passthrough) == raw_big
+
+    # Distributed semantics: passing total_size > len(raw) gives the
+    # global chunk_size that the byte-range alignment used.
+    entries_d, n_d = compress_all(raw_big, passthrough,
+                                   total_size=10 * 1024 * 1024)
+    # 10 MB total → 64 KB chunks; same as auto-derive for raw_big.
+    assert n_d == n
+    assert decompress_all(b"".join(entries_d), n_d, passthrough) == raw_big
+
+    print("  PASS dynamic chunking roundtrip (auto-derive + total_size override)")
+
+
 def main():
     print("Krunch local smoke test")
     print("=" * 40)
@@ -178,6 +258,8 @@ def main():
         test_blob_header,
         test_ac_roundtrip,
         test_chunking_roundtrip,
+        test_compute_chunk_size,
+        test_dynamic_chunking_roundtrip,
         test_threaded_decompress_byte_identical,
         test_crc,
         test_tokenizer,

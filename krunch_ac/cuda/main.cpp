@@ -62,6 +62,37 @@ void launch_mb_gemv_3072x768(const void*, const void*, void*, cudaStream_t);
 // layer_cpp.cpp — C++ orchestration of one RWKV-4 layer at B=1, T=1.
 void register_layer_cpp(pybind11::module& m);
 
+// rwkv_step_v3.cu — B-batched persistent fused layer kernel (in progress).
+extern "C" int v3_scratch_bytes(int B);
+extern "C" int launch_rwkv4_layer_step_v3(
+    int B,
+    const void* x_in, void* x_out,
+    void* att_xx, float* aa, float* bb, float* pp, void* ffn_xx,
+    const void* ln1_w, const void* ln1_b,
+    const void* tm_k, const void* tm_v, const void* tm_r,
+    const float* time_decay, const float* time_first,
+    const void* Kw, const void* Vw, const void* Rw, const void* Ow,
+    const void* ln2_w, const void* ln2_b,
+    const void* ffn_tm_k, const void* ffn_tm_r,
+    const void* ffn_Kw, const void* ffn_Vw, const void* ffn_Rw,
+    void* scratch_v3,
+    cudaStream_t stream);
+
+// rwkv_step_v2.cu — multi-block fused RWKV-4 layer (cooperative launch).
+extern "C" int v2_scratch_bytes();
+extern "C" int launch_rwkv4_layer_step_v2(
+    const void* x_in, void* x_out,
+    void* att_xx, float* aa, float* bb, float* pp, void* ffn_xx,
+    const void* ln1_w, const void* ln1_b,
+    const void* tm_k, const void* tm_v, const void* tm_r,
+    const float* time_decay, const float* time_first,
+    const void* Kw, const void* Vw, const void* Rw, const void* Ow,
+    const void* ln2_w, const void* ln2_b,
+    const void* ffn_tm_k, const void* ffn_tm_r,
+    const void* ffn_Kw, const void* ffn_Vw, const void* ffn_Rw,
+    void* scratch_v2,
+    cudaStream_t stream);
+
 // rwkv_step.cu — fused single-step RWKV-4 layer kernel.
 // Uses void* for __half to avoid pulling cuda_fp16.h into main.cpp; the
 // .cu side reinterpret_casts to __half*.
@@ -339,6 +370,85 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Final-flush B encoder states; one launch.");
     m.def("rwkv4_layer_step", &rwkv4_layer_step,
           "Fused RWKV-4 single-layer forward (B=1, T=1).");
+
+    // v2: multi-block cooperative kernel. Pybind takes torch tensors +
+    // a scratch tensor (uint8 of size v2_scratch_bytes()). Same arg
+    // contract as rwkv4_layer_step but uses 24×32 grid → ~24× SM utilization.
+    m.def("v2_scratch_bytes", []() { return v2_scratch_bytes(); },
+          "Bytes required for the v2 per-call scratch buffer.");
+    // v3: B-batched persistent fused layer kernel (in progress, M2 only).
+    m.def("v3_scratch_bytes", [](int B) { return v3_scratch_bytes(B); },
+          "Bytes required for v3 per-call scratch buffer at given B.");
+    m.def("rwkv4_layer_step_v3", [](
+          int B,
+          at::Tensor x_in, at::Tensor x_out,
+          at::Tensor att_xx, at::Tensor aa, at::Tensor bb, at::Tensor pp,
+          at::Tensor ffn_xx,
+          at::Tensor ln1_w, at::Tensor ln1_b,
+          at::Tensor tm_k, at::Tensor tm_v, at::Tensor tm_r,
+          at::Tensor time_decay, at::Tensor time_first,
+          at::Tensor Kw, at::Tensor Vw, at::Tensor Rw, at::Tensor Ow,
+          at::Tensor ln2_w, at::Tensor ln2_b,
+          at::Tensor ffn_tm_k, at::Tensor ffn_tm_r,
+          at::Tensor ffn_Kw, at::Tensor ffn_Vw, at::Tensor ffn_Rw,
+          at::Tensor scratch) {
+        TORCH_CHECK(scratch.is_cuda() && scratch.is_contiguous(),
+                    "scratch must be CUDA contiguous");
+        TORCH_CHECK((int)scratch.numel() >= v3_scratch_bytes(B),
+                    "scratch too small; need ", v3_scratch_bytes(B), " bytes");
+        cudaStream_t s = at::cuda::getCurrentCUDAStream();
+        int rc = launch_rwkv4_layer_step_v3(
+            B,
+            x_in.data_ptr(), x_out.data_ptr(),
+            att_xx.data_ptr(),
+            aa.data_ptr<float>(), bb.data_ptr<float>(), pp.data_ptr<float>(),
+            ffn_xx.data_ptr(),
+            ln1_w.data_ptr(), ln1_b.data_ptr(),
+            tm_k.data_ptr(), tm_v.data_ptr(), tm_r.data_ptr(),
+            time_decay.data_ptr<float>(), time_first.data_ptr<float>(),
+            Kw.data_ptr(), Vw.data_ptr(), Rw.data_ptr(), Ow.data_ptr(),
+            ln2_w.data_ptr(), ln2_b.data_ptr(),
+            ffn_tm_k.data_ptr(), ffn_tm_r.data_ptr(),
+            ffn_Kw.data_ptr(), ffn_Vw.data_ptr(), ffn_Rw.data_ptr(),
+            scratch.data_ptr(), s);
+        TORCH_CHECK(rc == 0, "v3 cudaLaunchCooperativeKernel rc=", rc);
+    }, "B-batched persistent fused RWKV-4 layer step (v3, in progress).");
+
+    m.def("rwkv4_layer_step_v2", [](
+          at::Tensor x_in, at::Tensor x_out,
+          at::Tensor att_xx, at::Tensor aa, at::Tensor bb, at::Tensor pp,
+          at::Tensor ffn_xx,
+          at::Tensor ln1_w, at::Tensor ln1_b,
+          at::Tensor tm_k, at::Tensor tm_v, at::Tensor tm_r,
+          at::Tensor time_decay, at::Tensor time_first,
+          at::Tensor Kw, at::Tensor Vw, at::Tensor Rw, at::Tensor Ow,
+          at::Tensor ln2_w, at::Tensor ln2_b,
+          at::Tensor ffn_tm_k, at::Tensor ffn_tm_r,
+          at::Tensor ffn_Kw, at::Tensor ffn_Vw, at::Tensor ffn_Rw,
+          at::Tensor scratch) {
+        TORCH_CHECK(scratch.is_cuda() && scratch.is_contiguous(),
+                    "scratch must be CUDA contiguous");
+        TORCH_CHECK((int)scratch.numel() >= v2_scratch_bytes(),
+                    "scratch too small; need ", v2_scratch_bytes(), " bytes");
+        cudaStream_t s = at::cuda::getCurrentCUDAStream();
+        int rc = launch_rwkv4_layer_step_v2(
+            x_in.data_ptr(), x_out.data_ptr(),
+            att_xx.data_ptr(),
+            aa.data_ptr<float>(), bb.data_ptr<float>(), pp.data_ptr<float>(),
+            ffn_xx.data_ptr(),
+            ln1_w.data_ptr(), ln1_b.data_ptr(),
+            tm_k.data_ptr(), tm_v.data_ptr(), tm_r.data_ptr(),
+            time_decay.data_ptr<float>(), time_first.data_ptr<float>(),
+            Kw.data_ptr(), Vw.data_ptr(), Rw.data_ptr(), Ow.data_ptr(),
+            ln2_w.data_ptr(), ln2_b.data_ptr(),
+            ffn_tm_k.data_ptr(), ffn_tm_r.data_ptr(),
+            ffn_Kw.data_ptr(), ffn_Vw.data_ptr(), ffn_Rw.data_ptr(),
+            scratch.data_ptr(), s);
+        TORCH_CHECK(rc == 0, "cudaLaunchCooperativeKernel rc=", rc);
+    }, "Multi-block fused RWKV-4 layer (cooperative <<<24,32>>>). State + "
+       "x_out mutated in place. caller-allocated `scratch` (uint8 buffer of "
+       "v2_scratch_bytes() bytes) is reused per call.");
+
     m.def("mb_gemv_768x768", [](at::Tensor x, at::Tensor W, at::Tensor y) {
         cudaStream_t s = at::cuda::getCurrentCUDAStream();
         launch_mb_gemv_768x768(x.data_ptr(), W.data_ptr(), y.data_ptr(), s);

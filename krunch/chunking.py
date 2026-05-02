@@ -22,18 +22,48 @@ from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
 
-# Default 1 MB. Chunk size is no longer memory-bound (compress streams range-
-# encoded bytes batch by batch, so peak memory is O(SEQ_BATCH × vocab) ≈
-# 200 MB regardless of chunk size). Bigger chunks → better ratio (more model
-# context, smaller cold-start fraction); smaller chunks → more cross-chunk
-# parallelism for cross-chunk batched decode (each chunk is one batch
-# slot in the stepped forward; B=128 on A10G, so we want ≥128 chunks
-# per file to keep the GPU saturated).
-#
-# 64 KB measured cost vs 1 MB on a 3 MB WildChat sample: +0.08% ratio
-# (essentially noise). Default flipped 2026-04-30 to fill the GPU on
-# small-to-mid files. Override via KRUNCH_CHUNK_SIZE.
-CHUNK_SIZE = int(os.environ.get("KRUNCH_CHUNK_SIZE", 65536))  # 64 KB
+# Floor for compress chunk size. Smaller chunks get less model context →
+# worse ratio. 64 KB measured cost vs 1 MB on a 3 MB WildChat sample:
+# +0.08% ratio (essentially noise). Set 2026-04-30. Bigger chunks → better
+# ratio (more model context, smaller cold-start fraction); smaller chunks
+# → more cross-chunk parallelism for cross-chunk batched decode (each
+# chunk is one batch slot in the stepped forward).
+_CHUNK_SIZE_FLOOR = 64 * 1024
+
+# Cross-chunk batch size hint used to size chunks. Workers auto-tune their
+# actual decompress B at runtime (T4=64, A10G=128, A100/L40S=256, H100=512);
+# 128 here is the planning hint for the dominant production GPU class. We
+# aim for 4× target_B chunks per file so the decompress GPU stays saturated.
+_DEFAULT_TARGET_B = 128
+
+
+def compute_chunk_size(total_size: int) -> int:
+    """Pick a chunk size that gives ~4× target_B chunks (or ≥16 chunks),
+    floored at 64 KB to preserve compress ratio.
+
+    Single-machine and distributed workers converge on the same answer
+    because the only input is total_size: distributed workers all see the
+    same KRUNCH_INPUT_LEN, so byte ranges align without coordination.
+
+    Override via KRUNCH_CHUNK_SIZE (pins to a static size, ignores total).
+    Override target via KRUNCH_TARGET_B.
+    """
+    explicit = os.environ.get("KRUNCH_CHUNK_SIZE")
+    if explicit is not None:
+        return int(explicit)
+    if total_size <= 0:
+        return _CHUNK_SIZE_FLOOR
+    target_B = int(os.environ.get("KRUNCH_TARGET_B", _DEFAULT_TARGET_B))
+    target_chunks = max(target_B * 4, 16)
+    # ceil(total_size / target_chunks)
+    natural = (total_size + target_chunks - 1) // target_chunks
+    return max(_CHUNK_SIZE_FLOOR, natural)
+
+
+# Legacy module-level constant. Used as a fallback by callers that don't
+# (yet) pass total_size, and by tests. Reflects KRUNCH_CHUNK_SIZE pin if set,
+# otherwise the floor — for the new sizing call compute_chunk_size(total).
+CHUNK_SIZE = int(os.environ.get("KRUNCH_CHUNK_SIZE", _CHUNK_SIZE_FLOOR))
 
 # Number of chunks decompressed concurrently on a single worker. Each
 # concurrent stream maintains its own RNN state and AC decoder; threads
@@ -53,13 +83,22 @@ DECOMPRESS_BATCH = int(os.environ.get("KRUNCH_DECOMPRESS_BATCH", 1))
 
 def compress_all(raw: bytes,
                  neural_fn: Callable[[bytes], bytes],
-                 neural_batch_fn: Optional[Callable[[list], list]] = None
+                 neural_batch_fn: Optional[Callable[[list], list]] = None,
+                 chunk_size: Optional[int] = None,
+                 total_size: Optional[int] = None,
                  ) -> tuple[list[bytes], int]:
     """Compress raw bytes chunk by chunk via the neural codec.
     If `neural_batch_fn` is supplied (the chunks-batched encode path),
     invoke it once with all chunks; otherwise per-chunk via `neural_fn`.
+
+    `chunk_size` overrides the dynamic sizing. Distributed workers should
+    pass the same `total_size` (= KRUNCH_INPUT_LEN) so all workers
+    converge on the same chunk size; single-machine callers can omit
+    it and get sizing from `len(raw)`.
     """
-    chunks = _split_utf8_safe(raw, CHUNK_SIZE)
+    if chunk_size is None:
+        chunk_size = compute_chunk_size(total_size if total_size is not None else len(raw))
+    chunks = _split_utf8_safe(raw, chunk_size)
     if neural_batch_fn is not None and len(chunks) > 1:
         compressed = neural_batch_fn(chunks)
         entries = [

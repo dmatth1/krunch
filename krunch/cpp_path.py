@@ -170,6 +170,98 @@ def _get_stepped_bufs(weights: dict):
 
 
 _GRAPH_CACHE: dict[int, list] = {}
+_STEPPED_BATCHED_BUFS_CACHE: dict[tuple, list] = {}
+_GRAPH_BATCHED_CACHE: dict[tuple, list] = {}
+
+
+def _get_stepped_batched_bufs(weights: dict, B: int):
+    """Static [B,1,n_embd] tensors for graph-captured batched stepped forward."""
+    import torch
+    key = (id(weights), B)
+    if key in _STEPPED_BATCHED_BUFS_CACHE:
+        return _STEPPED_BATCHED_BUFS_CACHE[key]
+    device = weights["device"]
+    n_embd = weights["n_embd"]
+    bufs = [torch.empty(B, 1, n_embd, dtype=torch.float16, device=device)
+            for _ in range(N_LAYER + 1)]
+    _STEPPED_BATCHED_BUFS_CACHE[key] = bufs
+    return bufs
+
+
+def _capture_one_layer_graph_batched(weights, state, layer_idx, bufs):
+    """Same as _capture_one_layer_graph but at B>1. State tensors are
+    already [B, ...] shape — kernel dispatches batched path internally."""
+    import torch
+    import krunch_ac_cuda
+    layer = weights["layers"][layer_idx]
+    s0, s1, s2, s3, s4 = (state[k][layer_idx] for k in range(5))
+
+    for _ in range(2):
+        out = krunch_ac_cuda.rwkv4_layer_step_cpp(
+            bufs[layer_idx], s0, s1, s2, s3, s4, *layer)
+        bufs[layer_idx + 1].copy_(out)
+    torch.cuda.synchronize()
+
+    g = torch.cuda.CUDAGraph()
+    cap_stream = torch.cuda.Stream()
+    cap_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(cap_stream):
+        with torch.cuda.graph(g):
+            out = krunch_ac_cuda.rwkv4_layer_step_cpp(
+                bufs[layer_idx], s0, s1, s2, s3, s4, *layer)
+            bufs[layer_idx + 1].copy_(out)
+    torch.cuda.current_stream().wait_stream(cap_stream)
+    return g
+
+
+def forward_stepped_batched_graphed_v2(weights: dict, last_tokens, state):
+    """Graph-captured B-batched stepped forward.
+
+    REQUIRES: KRUNCH_DETERMINISTIC_MATMUL=1 + KRUNCH_OWN_WKV=1. With third-
+    party rwkv ops, graph replay is non-deterministic (verified by
+    test_graph_determinism.py). With our own kernels, replay is bit-exact
+    (0.0 abs diff across 5 steps).
+
+    Decompress 47/200 KB/s gate is bound by per-step ATen launch overhead
+    on the stepped path (12 layers × ~10-20 ATen ops × Python dispatch).
+    Graphs collapse that to one launch per layer per replay.
+    """
+    import torch
+    import krunch_ac_cuda
+    import torch.nn.functional as F
+    n_embd = weights["n_embd"]
+    emb_w = weights["emb_w"]
+    ln_out_w = weights["ln_out_w"]
+    ln_out_b = weights["ln_out_b"]
+    head_w = weights["head_w"]
+
+    if not isinstance(last_tokens, torch.Tensor):
+        last_tokens = torch.as_tensor(last_tokens, dtype=torch.long,
+                                       device=weights["device"])
+    B = int(last_tokens.shape[0])
+    bufs = _get_stepped_batched_bufs(weights, B)
+
+    cache_key = (id(weights), B)
+    if cache_key not in _GRAPH_BATCHED_CACHE:
+        # Capture one graph per layer. Snapshot+restore state so the
+        # warmup (3 mutations per layer) doesn't desync with the caller.
+        bufs[0].copy_(emb_w[last_tokens].view(B, 1, n_embd))
+        snap = _snapshot_state(state)
+        graphs = []
+        for i in range(N_LAYER):
+            _restore_state(state, snap)
+            graphs.append(_capture_one_layer_graph_batched(weights, state, i, bufs))
+        _restore_state(state, snap)
+        _GRAPH_BATCHED_CACHE[cache_key] = graphs
+
+    graphs = _GRAPH_BATCHED_CACHE[cache_key]
+    bufs[0].copy_(emb_w[last_tokens].view(B, 1, n_embd))
+    for i in range(N_LAYER):
+        graphs[i].replay()
+    xn = F.layer_norm(bufs[N_LAYER].view(B, n_embd), (n_embd,),
+                      weight=ln_out_w, bias=ln_out_b)
+    logits = krunch_ac_cuda.det_matmul(xn.contiguous(), head_w.contiguous())
+    return logits  # [B, V]
 
 
 def _snapshot_state(state):
