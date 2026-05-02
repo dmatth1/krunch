@@ -153,6 +153,11 @@ export KRUNCH_IMAGE="${KRUNCH_IMAGE_TAG}"
 INPUT_BYTES=$(wc -c < /tmp/sample.bin)
 echo "Input: ${INPUT_BYTES} bytes"
 
+# Forward KRUNCH_* flags from the caller's shell (so the operator can
+# toggle e.g. KRUNCH_BF16=1 without modifying this script). Listed
+# explicitly to keep the userdata diff readable; add new flags here.
+__FORWARD_ENV__
+
 echo "COMPRESS_START $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 T0=$(date +%s.%N)
 krunch compress < /tmp/sample.bin > /tmp/sample.krunch
@@ -220,6 +225,16 @@ echo "TIER3_DONE $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 aws ec2 terminate-instances --instance-ids "${INSTANCE_ID}" --region "${REGION}"
 USERDATA_EOF
 
+# Build forward-env block in a tempfile so multiline newlines don't fight sed.
+# Empty file = no env forwarded (default).
+FORWARD_FILE=$(mktemp)
+: > "$FORWARD_FILE"
+for v in KRUNCH_BF16 KRUNCH_OWN_WKV KRUNCH_DETERMINISTIC_MATMUL KRUNCH_DECOMPRESS_BATCH KRUNCH_CHUNK_SIZE KRUNCH_TARGET_B KRUNCH_CPP_GRAPH; do
+  if [[ -n "${!v:-}" ]]; then
+    echo "export ${v}='${!v}'" >> "$FORWARD_FILE"
+    echo "  forward env: ${v}=${!v}"
+  fi
+done
 sed -i.bak \
   -e "s|__S3_BASE__|${S3_BASE}|g" \
   -e "s|__S3_BUCKET__|${S3_BUCKET}|g" \
@@ -228,7 +243,13 @@ sed -i.bak \
   -e "s|__LOCAL_BUILD__|${LOCAL_BUILD}|g" \
   -e "s|__KRUNCH_IMAGE_TAG__|${KRUNCH_IMAGE_TAG}|g" \
   "$USER_DATA"
-rm -f "${USER_DATA}.bak"
+# Splice in the forward-env block (multiline) at the __FORWARD_ENV__ marker.
+python3 -c "
+ud=open('${USER_DATA}').read()
+fwd=open('${FORWARD_FILE}').read()
+open('${USER_DATA}', 'w').write(ud.replace('__FORWARD_ENV__', fwd))
+"
+rm -f "${USER_DATA}.bak" "$FORWARD_FILE"
 
 # ---------------------------------------------------------------------------
 # 3. Launch instance — spot by default, on-demand if KRUNCH_ON_DEMAND=1
