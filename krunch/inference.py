@@ -575,15 +575,16 @@ class InferenceEngine:
 
     def compress_chunks_batched(self, chunks: list[bytes]) -> list[bytes]:
         """Compress N chunks in lockstep, B=N forward + B=N AC encode per
-        timestep. Symmetric to `decompress_chunks_batched`: identical
-        forward shape (`forward_batched`, B=N, T=1) on both sides
-        guarantees bit-equivalent logits → AC roundtrip.
+        timestep. Symmetric to `decompress_chunks_batched`: both sides
+        call cpp_path.forward_stepped_batched (B=N, T=1) so logits are
+        bit-identical → AC roundtrip holds, including under bf16 / int8
+        codecs that swap kernels in cpp_path.
         Returns list of N compressed-chunk byte strings (mini-header + AC).
         """
         import torch
         import krunch_ac_cuda
         from krunch_ac.gpu_encode import probs_to_cdf_gpu
-        from krunch.batched_rwkv4 import init_state_batched, forward_batched
+        from krunch import cpp_path
 
         B = len(chunks)
         if B == 0:
@@ -632,12 +633,17 @@ class InferenceEngine:
         ac_states = torch.zeros(B * 4, dtype=torch.uint32, device=device)
         ac_states.view(B, 4)[:, 1] = 0xFFFFFFFF
 
-        rwkv_state = init_state_batched(self._model, B, device=device)
+        # Use cpp_path's stepped-batched forward — same code path as the
+        # decompress side. Symmetric forward = identical logits = roundtrip
+        # holds. (The previous `batched_rwkv4.forward_batched` path was a
+        # parallel implementation that bypassed cpp_path's gemm_fp16 routing,
+        # making bf16 / int8 paths asymmetric and breaking roundtrip.)
+        weights = cpp_path.init_weights(self._model, device)
+        rwkv_state = cpp_path.fresh_state_batched(weights, B)
 
         for t in range(T_max):
-            cur_in = inputs_padded[:, t]
-            logits, rwkv_state = forward_batched(
-                self._model, cur_in.unsqueeze(1), rwkv_state, full_output=False)
+            cur_in = inputs_padded[:, t].contiguous()
+            logits = cpp_path.forward_stepped_batched(weights, cur_in, rwkv_state)
             with torch.no_grad():
                 probs = torch.softmax(logits.float(), dim=-1)
                 cdfs = probs_to_cdf_gpu(probs).contiguous()  # [B, V+1]
