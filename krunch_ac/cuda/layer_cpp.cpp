@@ -42,17 +42,9 @@ void launch_det_matmul_cublas(const void* x, const void* W, void* y,
                                int write_fp32, int M, int K, int N,
                                cudaStream_t stream);
 void set_det_matmul_cublas_algo(int algo_id);
-// 32×32-tile WMMA matmul — see det_matmul_tc_v2.cu.
-void launch_det_matmul_tc_v2(const void* A, const void* B, void* C,
-                              int write_fp32, int M, int K, int N,
-                              cudaStream_t stream);
 // Multi-warp 64x64-tile WMMA matmul — see det_matmul_tc_mw.cu.
 // Only K=768 and K=3072 are supported; intended for the head matmul shape.
 void launch_det_matmul_tc_mw(const void* A, const void* B, void* C,
-                              int write_fp32, int M, int K, int N,
-                              cudaStream_t stream);
-// 128x128-tile / 8-warp WMMA matmul — see det_matmul_tc_xl.cu.
-void launch_det_matmul_tc_xl(const void* A, const void* B, void* C,
                               int write_fp32, int M, int K, int N,
                               cudaStream_t stream);
 // cp.async double-buffered K-loop (sm_80+ only) — see det_matmul_tc_async.cu.
@@ -62,13 +54,13 @@ void launch_det_matmul_tc_async(const void* A, const void* B, void* C,
                                  int write_fp32, int M, int K, int N,
                                  cudaStream_t stream);
 // bf16 variant of det_matmul_tc_async — see det_matmul_tc_bf16.cu.
+// Used by gemm_fp16 when KRUNCH_BF16=1 (v2 codec; encoder + decoder must
+// agree). KNOWN ISSUE: roundtrip currently fails — encoder packed last
+// partial batch falls through to fp16 path with a bf16 weight tensor when
+// M < 64. Fix is to either lift the M >= 64 guard or pad M up. Parked.
 void launch_det_matmul_tc_async_bf16(
     const void* A, const void* B, void* C,
     int write_fp32, int M, int K, int N, cudaStream_t stream);
-// uint8 weights + inline dequant + fp16 WMMA — see det_matmul_tc_uint8.cu.
-void launch_det_matmul_tc_uint8(
-    const void* A, const void* W_u8, const void* scale, const void* offset,
-    void* C, int write_fp32, int M, int K, int N, cudaStream_t stream);
 // 3-way fused cp.async + WMMA matmul — see det_matmul_tc_3way_async.cu.
 // Computes (Y0=A0@B0, Y1=A1@B1, Y2=A2@B2) in one kernel launch.
 // All inputs/outputs share shape; saves 2 launches + amortizes K-axis
@@ -240,16 +232,13 @@ static at::Tensor gemm_fp16(at::Tensor x, at::Tensor w,
                 ? out_bf
                 : out_bf.to(dtype).contiguous();
         }
-        // Routing precedence (T3.6/T3.7 fix 2026-05-01):
+        // Routing precedence:
         //   1. cp.async kernel (sm_80+) — KRUNCH_HEAD_ASYNC default ON,
         //      runs at K∈{768,3072}, N % 8 == 0, M ≥ 64. Layer matmul
-        //      shapes (N=768/3072) qualify; closes 1.7-2× of cuBLAS gap.
-        //   2. KRUNCH_TC_V2 / KRUNCH_CUBLAS_PINNED — opt-in benches.
-        //   3. Default 16×16 WMMA single-warp.
-        // PRIOR BUG: layer-matmul gemm_fp16 fell through to the default
-        // det_matmul_tc, bypassing async/MW/XL. Phase profile 2026-05-01
-        // identified this — async kernel was correct + bit-stable but
-        // never ran in production for layer matmuls.
+        //      shapes (N=768/3072) qualify.
+        //   2. KRUNCH_CUBLAS_PINNED — opt-in cuBLAS path for shape stability
+        //      checks.
+        //   3. Default 16×16 WMMA single-warp (det_matmul_tc).
         static const bool USE_ASYNC_GEMM = []{
             const char* e = std::getenv("KRUNCH_HEAD_ASYNC");
             return e == nullptr || std::string(e) != "0";
@@ -260,10 +249,6 @@ static at::Tensor gemm_fp16(at::Tensor x, at::Tensor w,
             const char* e = std::getenv("KRUNCH_CUBLAS_PINNED");
             return e != nullptr && std::string(e) == "1";
         }();
-        static const bool USE_TC_V2 = []{
-            const char* e = std::getenv("KRUNCH_TC_V2");
-            return e != nullptr && std::string(e) == "1";
-        }();
         if (USE_ASYNC_GEMM && gemm_async_aligned) {
             launch_det_matmul_tc_async(x_c.data_ptr(), w_c.data_ptr(),
                                         out.data_ptr(), write_fp32,
@@ -272,10 +257,6 @@ static at::Tensor gemm_fp16(at::Tensor x, at::Tensor w,
             launch_det_matmul_cublas(x_c.data_ptr(), w_c.data_ptr(),
                                       out.data_ptr(), write_fp32,
                                       M, K, N, stream);
-        } else if (USE_TC_V2 && (K == 768 || K == 3072)) {
-            launch_det_matmul_tc_v2(x_c.data_ptr(), w_c.data_ptr(),
-                                     out.data_ptr(), write_fp32,
-                                     M, K, N, stream);
         } else {
             launch_det_matmul_tc(x_c.data_ptr(), w_c.data_ptr(),
                                   out.data_ptr(), write_fp32, M, K, N, stream);
@@ -736,21 +717,18 @@ static at::Tensor det_matmul_py(at::Tensor x, at::Tensor W,
     auto out = at::empty({M, N}, xc.options().dtype(dtype));
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     const int write_fp32 = (dtype == at::kFloat) ? 1 : 0;
-    // Routing:
-    //   - Head matmul w/ LARGE M (K∈{768,3072}, N≥16384, M≥256): multi-warp
-    //     64×64-tile kernel (det_matmul_tc_mw). Compress packed forward
-    //     hits this (M=SEQ_BATCH=1024). 1.78× speedup on T4 microbench.
-    //     Excludes decompress stepped (M=B≤256) where 64-row tiles waste
-    //     loads (regression measured: T4 B=64 decompress 13.6→12.1 KB/s
-    //     when MW was used). M-threshold default 256 — a 64×64 kernel on
-    //     M=128 leaves half its rows padded and runs slower than 1-warp
-    //     16×16 tiles which fully use M=128. Tune via KRUNCH_HEAD_MW_M_MIN.
-    //   - KRUNCH_TC_V2=1: opt-in to 32×32-tile single-warp v2.
-    //   - Default: original 16×16-tile single-warp det_matmul_tc.
-    // KRUNCH_HEAD_MW=0 disables MW routing entirely (safety valve).
-    static const bool USE_TC_V2 = []{
-        const char* e = std::getenv("KRUNCH_TC_V2");
-        return e != nullptr && std::string(e) == "1";
+    // Routing precedence:
+    //   1. cp.async kernel (sm_80+, KRUNCH_HEAD_ASYNC default ON):
+    //      K∈{768,3072}, N % 8 == 0, M ≥ 64. Layer matmul shapes qualify.
+    //   2. Async + N-padding for head matmul (large N, e.g. 50277) where
+    //      N isn't 8-aligned: pad W internally, run async, slice output.
+    //   3. Multi-warp 64×64 (det_matmul_tc_mw) for head matmul w/ M ≥ 256
+    //      where N alignment failed and async-pad isn't preferred. Fallback
+    //      for sm_75 (no cp.async). KRUNCH_HEAD_MW=0 disables.
+    //   4. Default 16×16 single-warp (det_matmul_tc) — small-M fallback.
+    static const bool USE_ASYNC = []{
+        const char* e = std::getenv("KRUNCH_HEAD_ASYNC");
+        return e == nullptr || std::string(e) != "0";
     }();
     static const bool DISABLE_HEAD_MW = []{
         const char* e = std::getenv("KRUNCH_HEAD_MW");
@@ -760,34 +738,12 @@ static at::Tensor det_matmul_py(at::Tensor x, at::Tensor W,
         const char* e = std::getenv("KRUNCH_HEAD_MW_M_MIN");
         return (e != nullptr) ? atoi(e) : 256;
     }();
-    // XL kernel landed but on T4 doesn't beat MW (no cp.async on sm_75).
-    // Default OFF; flip on A10G/L40S/H100 (sm_80+) where cp.async-style
-    // optimizations actually pay off. Currently off pending sm_80+ path
-    // in det_matmul_tc_xl.cu.
-    static const bool USE_XL = []{
-        const char* e = std::getenv("KRUNCH_HEAD_XL");
-        return e != nullptr && std::string(e) == "1";
-    }();
-    // cp.async kernel (sm_80+). Default ON; set KRUNCH_HEAD_ASYNC=0 to disable.
-    // Kernel itself is empty on sm_75 — routing should detect and fall back.
-    static const bool USE_ASYNC = []{
-        const char* e = std::getenv("KRUNCH_HEAD_ASYNC");
-        return e == nullptr || std::string(e) != "0";
-    }();
-    static const int HEAD_XL_M_MIN = []{
-        const char* e = std::getenv("KRUNCH_HEAD_XL_M_MIN");
-        return (e != nullptr) ? atoi(e) : 256;
-    }();
     const bool head_shape = (K == 768 || K == 3072) && N >= 16384
                              && M >= HEAD_MW_M_MIN;
-    // Async kernel needs 16-byte aligned global loads. For B, row stride
-    // is N halves = 2*N bytes; aligned iff N % 8 == 0. Layer matmul shapes
-    // (N=768, N=3072) qualify; head matmul N=50277 doesn't.
+    // Async kernel needs 16-byte aligned global loads. Layer matmul shapes
+    // (N=768, N=3072) qualify; head matmul N=50277 doesn't (handled below).
     const bool async_aligned = ((K == 768 || K == 3072) && (N % 8 == 0)
                                  && M >= 64);
-    // Async + N-padding (T3.7 follow-up): if head_shape (large N) and N not
-    // 8-aligned (e.g., 50277), pad W internally to N_pad = (N+7)&~7, run
-    // async, slice output. Saves vs MW path; small per-call alloc overhead.
     const bool head_shape_unaligned = (K == 768 || K == 3072)
                                        && N >= 16384 && M >= 64
                                        && (N % 8 != 0);
@@ -797,22 +753,14 @@ static at::Tensor det_matmul_py(at::Tensor x, at::Tensor W,
     } else if (USE_ASYNC && head_shape_unaligned) {
         const int N_pad = (N + 7) & ~7;
         auto W_pad = at::zeros({K, N_pad}, Wc.options());
-        // Copy W's N cols into first N cols of W_pad (rest stays zero).
         W_pad.narrow(1, 0, N).copy_(Wc);
         auto out_pad = at::empty({M, N_pad}, out.options());
         launch_det_matmul_tc_async(xc.data_ptr(), W_pad.data_ptr(),
                                      out_pad.data_ptr(),
                                      write_fp32, M, K, N_pad, stream);
         out.copy_(out_pad.narrow(1, 0, N));
-    } else if (head_shape && USE_XL && M >= HEAD_XL_M_MIN) {
-        // 128×128 tile / 8-warp kernel — better M=1024 perf than MW.
-        launch_det_matmul_tc_xl(xc.data_ptr(), Wc.data_ptr(), out.data_ptr(),
-                                 write_fp32, M, K, N, stream);
     } else if (head_shape && !DISABLE_HEAD_MW) {
         launch_det_matmul_tc_mw(xc.data_ptr(), Wc.data_ptr(), out.data_ptr(),
-                                 write_fp32, M, K, N, stream);
-    } else if (USE_TC_V2 && (K == 768 || K == 3072)) {
-        launch_det_matmul_tc_v2(xc.data_ptr(), Wc.data_ptr(), out.data_ptr(),
                                  write_fp32, M, K, N, stream);
     } else {
         launch_det_matmul_tc(xc.data_ptr(), Wc.data_ptr(), out.data_ptr(),
@@ -867,31 +815,6 @@ void register_layer_cpp(pybind11::module& m) {
     }, "bf16 deterministic matmul (sm_80+ only). y = x @ W with both "
        "inputs bf16 and fp32 accumulator.",
        pybind11::arg("x"), pybind11::arg("W"),
-       pybind11::arg("out_dtype") = c10::nullopt);
-    m.def("det_matmul_uint8", [](at::Tensor x, at::Tensor W_u8,
-                                   at::Tensor scale, at::Tensor offset,
-                                   c10::optional<at::ScalarType> out_dtype) {
-        // uint8 weights + inline dequant + fp16 WMMA. Used by uint8 microbench.
-        // x: [M, K] fp16, W_u8: [K, N] uint8, scale/offset: [K] fp16.
-        auto xc = x.contiguous();
-        auto Wc = W_u8.contiguous();
-        auto sc = scale.contiguous();
-        auto oc = offset.contiguous();
-        const int M = (int)xc.size(0);
-        const int K = (int)xc.size(1);
-        const int N = (int)Wc.size(-1);
-        const auto dtype = out_dtype.has_value() ? out_dtype.value() : xc.scalar_type();
-        auto out = at::empty({M, N}, xc.options().dtype(dtype));
-        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-        const int write_fp32 = (dtype == at::kFloat) ? 1 : 0;
-        launch_det_matmul_tc_uint8(
-            xc.data_ptr(), Wc.data_ptr(), sc.data_ptr(), oc.data_ptr(),
-            out.data_ptr(), write_fp32, M, K, N, stream);
-        return out;
-    }, "uint8 weight matmul with per-input-channel scale + offset. "
-       "x fp16, W_u8 uint8, scale + offset fp16.",
-       pybind11::arg("x"), pybind11::arg("W_u8"),
-       pybind11::arg("scale"), pybind11::arg("offset"),
        pybind11::arg("out_dtype") = c10::nullopt);
     m.def("det_matmul_cublas_pinned", [](at::Tensor x, at::Tensor W,
                                           c10::optional<at::ScalarType> out_dtype) {
@@ -977,25 +900,6 @@ void register_layer_cpp(pybind11::module& m) {
     }, "cp.async double-buffered WMMA matmul (sm_80+).",
        pybind11::arg("x"), pybind11::arg("W"),
        pybind11::arg("out_dtype") = c10::nullopt);
-    m.def("det_matmul_tc_xl", [](at::Tensor x, at::Tensor W,
-                                  c10::optional<at::ScalarType> out_dtype) {
-        // Direct binding for testing det_matmul_tc_xl (8-warp, 128×128 tile).
-        auto xc = x.contiguous();
-        auto Wc = W.contiguous();
-        const int M = (int)xc.size(0);
-        const int K = (int)xc.size(1);
-        const int N = (int)Wc.size(-1);
-        TORCH_CHECK(K == 768 || K == 3072, "det_matmul_tc_xl needs K∈{768,3072}");
-        const auto dtype = out_dtype.has_value() ? out_dtype.value() : xc.scalar_type();
-        auto out = at::empty({M, N}, xc.options().dtype(dtype));
-        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-        const int write_fp32 = (dtype == at::kFloat) ? 1 : 0;
-        launch_det_matmul_tc_xl(xc.data_ptr(), Wc.data_ptr(), out.data_ptr(),
-                                 write_fp32, M, K, N, stream);
-        return out;
-    }, "8-warp 128x128-tile WMMA matmul. Bit-stable across M.",
-       pybind11::arg("x"), pybind11::arg("W"),
-       pybind11::arg("out_dtype") = c10::nullopt);
     m.def("det_matmul_tc_mw", [](at::Tensor x, at::Tensor W,
                                   c10::optional<at::ScalarType> out_dtype) {
         // Direct binding for testing det_matmul_tc_mw (4-warps-per-block,
@@ -1015,27 +919,6 @@ void register_layer_cpp(pybind11::module& m) {
                                  write_fp32, M, K, N, stream);
         return out;
     }, "Multi-warp 64x64-tile WMMA matmul (4 warps/block). Bit-stable across M.",
-       pybind11::arg("x"), pybind11::arg("W"),
-       pybind11::arg("out_dtype") = c10::nullopt);
-    m.def("det_matmul_tc_v2", [](at::Tensor x, at::Tensor W,
-                                  c10::optional<at::ScalarType> out_dtype) {
-        // 32×32-tile WMMA. Bit-stable across M; produces DIFFERENT bits
-        // than det_matmul (16×16 tile). Used for testing the v2 kernel
-        // shape-stability + speed.
-        auto xc = x.contiguous();
-        auto Wc = W.contiguous();
-        const int M = (int)xc.size(0);
-        const int K = (int)xc.size(1);
-        const int N = (int)Wc.size(-1);
-        const auto dtype = out_dtype.has_value() ? out_dtype.value() : xc.scalar_type();
-        auto out = at::empty({M, N}, xc.options().dtype(dtype));
-        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-        const int write_fp32 = (dtype == at::kFloat) ? 1 : 0;
-        launch_det_matmul_tc_v2(xc.data_ptr(), Wc.data_ptr(),
-                                 out.data_ptr(), write_fp32,
-                                 M, K, N, stream);
-        return out;
-    }, "32x32-tile WMMA matmul, bit-stable across M.",
        pybind11::arg("x"), pybind11::arg("W"),
        pybind11::arg("out_dtype") = c10::nullopt);
     m.def("det_softmax_cdf", [](at::Tensor logits_TxV, int cdf_T_value) {
