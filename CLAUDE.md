@@ -115,4 +115,43 @@ krunch/
   pre-session baseline only. Drift accumulates one "small" regression at
   a time.
 
+## Benchmarking 1 MB WildChat
+
+Standard bench: `scripts/bench_1mb_roundtrip.py`. Always uses the
+**production path** (matches `cli.py`):
+- `chunking.compute_chunk_size(total)` → dynamic chunk size (64 KB floor;
+  16 chunks for 1 MB)
+- per-chunk `engine.compress_chunk` (packed T=1024 forward; chunks-batched
+  compress is 5× slower)
+- `engine.decompress_chunks_batched` (B auto-picked from SM count via
+  `cpp_path.compute_decompress_batch`; clamps to `n_chunks`)
+
+Sample lives at `s3://dmatth1-bnn-checkpoints/krunch-tier3/20260502-163212/sample.bin`.
+
+```bash
+# 1. Launch instance (g4dn.xlarge for T4 sm_75; g5.xlarge for A10G sm_86)
+# 2. Pull docker image: ghcr.io/dmatth1/krunch:latest
+# 3. Stage sample to /tmp/sample.bin (10 MB; bench reads first 1 MB)
+aws s3 cp s3://dmatth1-bnn-checkpoints/krunch-tier3/20260502-163212/sample.bin /tmp/sample.bin
+# 4. SCP scripts/bench_1mb_roundtrip.py to /tmp on the instance
+# 5. Run via Docker (mount /tmp, override entrypoint to python):
+docker run --rm --gpus all \
+  -e KRUNCH_CPP_PATH=1 -e KRUNCH_DETERMINISTIC_MATMUL=1 -e KRUNCH_OWN_WKV=1 \
+  -v /tmp:/tmp --entrypoint /opt/conda/bin/python \
+  ghcr.io/dmatth1/krunch:latest \
+  /tmp/bench_1mb_roundtrip.py --sample /tmp/sample.bin
+```
+
+Historical baselines (V1_PLAN.md, 1 MB WildChat):
+- **T4 (sm_75, g4dn.xlarge):** ratio 0.115, compress ~41 KB/s, decompress ~13.5 KB/s
+- **A10G (sm_86, g5.xlarge):** ratio 0.116, compress ~152 KB/s, decompress ~47 KB/s
+- Tier-3 gates (≥200 KB/s both, ratio ≤0.11) were set for A10G; T4 will not pass.
+
+T4 sm_75 caveat: cp.async kernels (`det_matmul_tc_async`,
+`det_matmul_tc_3way_async`) have `#if __CUDA_ARCH__ >= 800` guards and are
+empty no-ops on T4. `cpp_path.py` auto-detects sm_major at import and sets
+`KRUNCH_HEAD_ASYNC=0 KRUNCH_3WAY_ASYNC=0` on sm<8; `layer_cpp.cpp` also
+gates the routing via `USE_SM80_PLUS`. Don't manually flip those env vars
+on A10G+ or you'll lose the fast path.
+
 Keep this file under 200 lines.
