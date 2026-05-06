@@ -18,6 +18,22 @@ import os
 # afterward has no effect.
 os.environ.setdefault("KRUNCH_DETERMINISTIC_MATMUL", "1")
 
+# Auto-disable sm_80+ kernels (cp.async WMMA) on sm_75 and older (e.g. T4).
+# Both det_matmul_tc_async and det_matmul_tc_3way_async have empty kernel
+# bodies under #if __CUDA_ARCH__ >= 800 — invoking them on sm_75 leaves
+# outputs uninitialized (garbage from at::empty), breaking the roundtrip.
+# Must run before krunch_ac_cuda import so the C++ statics read correctly.
+try:
+    import torch as _torch
+    if _torch.cuda.is_available():
+        _sm = _torch.cuda.get_device_properties(0).major
+        if _sm < 8:
+            os.environ.setdefault("KRUNCH_HEAD_ASYNC", "0")
+            os.environ.setdefault("KRUNCH_3WAY_ASYNC", "0")
+    del _torch, _sm
+except Exception:
+    pass
+
 N_LAYER = 12
 
 _WEIGHTS_CACHE: dict[int, dict] = {}

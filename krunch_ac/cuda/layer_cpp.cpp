@@ -89,6 +89,16 @@ void launch_krunch_wkv_forward(
     cudaStream_t stream);
 }
 
+// Detect sm_major once at process start. cp.async kernels (det_matmul_tc_async,
+// det_matmul_tc_3way_async) have #if __CUDA_ARCH__ >= 800 guards and are empty
+// no-ops on sm_75 (T4). USE_SM80_PLUS gates all async-kernel routing so those
+// paths are never taken on older hardware.
+static const bool USE_SM80_PLUS = []{
+    int dev; cudaGetDevice(&dev);
+    cudaDeviceProp p; cudaGetDeviceProperties(&p, dev);
+    return p.major >= 8;
+}();
+
 // Toggle our own graph-safe WKV via KRUNCH_OWN_WKV=1. Default OFF — only
 // flip when we need CUDA-graph capture of the layer step (KRUNCH_CPP_GRAPH=1).
 // MUST match across encoder + decoder or AC roundtrip breaks.
@@ -239,7 +249,8 @@ static at::Tensor gemm_fp16(at::Tensor x, at::Tensor w,
         //   2. KRUNCH_CUBLAS_PINNED — opt-in cuBLAS path for shape stability
         //      checks.
         //   3. Default 16×16 WMMA single-warp (det_matmul_tc).
-        static const bool USE_ASYNC_GEMM = []{
+        // cp.async requires sm_80+ (T4 is sm_75). USE_SM80_PLUS guards this path.
+        static const bool USE_ASYNC_GEMM = USE_SM80_PLUS && []{
             const char* e = std::getenv("KRUNCH_HEAD_ASYNC");
             return e == nullptr || std::string(e) != "0";
         }();
@@ -495,7 +506,8 @@ at::Tensor rwkv4_layer_step_cpp(
     //   2. Old 3way (single-warp WMMA) — fallback
     //   3. KRUNCH_NO_3WAY=1 → fall through to 3 separate gemm_fp16
     //      (each routed to async via gemm_fp16's own routing)
-    static const bool USE_3WAY_ASYNC = []{
+    // det_matmul_tc_3way_async is empty on sm_75; USE_SM80_PLUS gates it.
+    static const bool USE_3WAY_ASYNC = USE_SM80_PLUS && []{
         const char* e = std::getenv("KRUNCH_3WAY_ASYNC");
         return e == nullptr || std::string(e) != "0";
     }();
@@ -726,7 +738,7 @@ static at::Tensor det_matmul_py(at::Tensor x, at::Tensor W,
     //      where N alignment failed and async-pad isn't preferred. Fallback
     //      for sm_75 (no cp.async). KRUNCH_HEAD_MW=0 disables.
     //   4. Default 16×16 single-warp (det_matmul_tc) — small-M fallback.
-    static const bool USE_ASYNC = []{
+    static const bool USE_ASYNC = USE_SM80_PLUS && []{
         const char* e = std::getenv("KRUNCH_HEAD_ASYNC");
         return e == nullptr || std::string(e) != "0";
     }();
