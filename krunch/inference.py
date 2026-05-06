@@ -419,33 +419,61 @@ class InferenceEngine:
         krunch_ac_cuda.decode_init_batched(input_buf, base_byte_offsets, ac_states)
 
         weights = cpp_path.init_weights(self._model, self._device)
-        # CUDA-graph-captured per-layer stepped forward — collapses 12 × ~13
-        # ATen launches per step into 12 graph replays. Default ON when
-        # KRUNCH_OWN_WKV=1 (graph-safety prerequisite); disable explicitly via
-        # KRUNCH_DECOMPRESS_GRAPH=0 for debugging or non-own-WKV runs.
+        # CUDA-graph dispatch: three modes via KRUNCH_DECOMPRESS_GRAPH.
+        #   "full"      (default if KRUNCH_OWN_WKV=1): emb → 12 layers →
+        #               ln_out → head → softmax+CDF → AC decode all in one
+        #               captured graph. 1 g.replay() per step.
+        #               (Week 1 lever, KTransformers SOSP'25 pattern.)
+        #   "per_layer" (legacy): 12 graphs, one per layer; softmax+CDF
+        #               + decode outside graph. Effectively neutral on
+        #               T4 / A10G B=16 measurements (1.03×).
+        #   "eager"     (KRUNCH_OWN_WKV=0 or "0"): no graph; for debugging.
         own_wkv = os.environ.get("KRUNCH_OWN_WKV") == "1"
-        graph_default = "1" if own_wkv else "0"
-        use_graph = os.environ.get("KRUNCH_DECOMPRESS_GRAPH", graph_default) == "1"
+        graph_mode = os.environ.get(
+            "KRUNCH_DECOMPRESS_GRAPH", "full" if own_wkv else "eager")
+        # Back-compat: prior env was "0"/"1" → map "1" to legacy per_layer.
+        if graph_mode == "1":
+            graph_mode = "per_layer"
+        elif graph_mode == "0":
+            graph_mode = "eager"
+        use_graph = graph_mode in ("full", "per_layer")
         # Graphs are pointer-bound; reuse same state tensors across calls
         # (in-place reset). Eager path uses fresh allocations as before.
         if use_graph:
             state = cpp_path.fresh_state_batched_cached(weights, B)
         else:
             state = cpp_path.fresh_state_batched(weights, B)
-        last_input = torch.full((B,), BOS_TOKEN, dtype=torch.long, device=device)
-        out_syms = torch.empty(B, dtype=torch.int32, device=device)
         decoded_tokens = torch.zeros((B, max_T), dtype=torch.int32, device=device)
-        fwd = (cpp_path.forward_stepped_batched_graphed_v2 if use_graph
-               else cpp_path.forward_stepped_batched)
 
         with torch.no_grad():
-            for t in range(max_T):
-                logits = fwd(weights, last_input, state)
-                cdfs = cpp_path.softmax_cdfs_per_row(logits)
-                krunch_ac_cuda.decode_step_batched(
-                    cdfs, input_buf, base_byte_offsets, ac_states, out_syms)
-                decoded_tokens[:, t] = out_syms
-                last_input = out_syms.long()
+            if graph_mode == "full":
+                # Whole-step graph: emb → ... → AC decode in one g.replay().
+                bufs = cpp_path._get_full_step_bufs(weights, B)
+                bufs["last_input"].fill_(BOS_TOKEN)
+                for t in range(max_T):
+                    out_syms_buf = cpp_path.forward_step_full_graphed_v3(
+                        weights, ac_states, input_buf,
+                        base_byte_offsets, state, B)
+                    decoded_tokens[:, t] = out_syms_buf
+                    # int32 → int64 cast in place; bufs['last_input'] is
+                    # the graph's input buffer — must stay at same address.
+                    bufs["last_input"].copy_(out_syms_buf)
+            else:
+                # per_layer or eager
+                last_input = torch.full(
+                    (B,), BOS_TOKEN, dtype=torch.long, device=device)
+                out_syms = torch.empty(B, dtype=torch.int32, device=device)
+                fwd = (cpp_path.forward_stepped_batched_graphed_v2
+                       if graph_mode == "per_layer"
+                       else cpp_path.forward_stepped_batched)
+                for t in range(max_T):
+                    logits = fwd(weights, last_input, state)
+                    cdfs = cpp_path.softmax_cdfs_per_row(logits)
+                    krunch_ac_cuda.decode_step_batched(
+                        cdfs, input_buf, base_byte_offsets,
+                        ac_states, out_syms)
+                    decoded_tokens[:, t] = out_syms
+                    last_input = out_syms.long()
 
         # Single sync at the end.
         decoded_cpu = decoded_tokens.cpu().numpy()

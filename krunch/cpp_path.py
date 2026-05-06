@@ -292,6 +292,150 @@ def forward_stepped_batched_graphed_v2(weights: dict, last_tokens, state):
     return logits  # [B, V]
 
 
+# =============================================================================
+# Whole-step CUDA Graph (Week 1, 2026-05-06).
+# Captures emb lookup → 12 layers → LN_out → head matmul → softmax + CDF →
+# AC decode batched into ONE graph object per (model, B). Replays 1× per
+# decompress step instead of 12 (per-layer graphs) or 18+ (eager).
+#
+# Per V1_PLAN tier-3 sprint plan: closes the gap to ts_zip-class throughput
+# by collapsing the kernel-launch overhead that dominated decompress per-step
+# wall on T4 / A10G. The KTransformers SOSP'25 pattern.
+# =============================================================================
+
+_FULL_STEP_BUFS_CACHE: dict[tuple, dict] = {}
+_FULL_STEP_GRAPH_CACHE: dict[tuple, object] = {}
+
+
+def _get_full_step_bufs(weights: dict, B: int):
+    """Pointer-stable I/O buffers for the whole-step decompress graph.
+
+    Graphs are pointer-bound; `last_input` and `out_syms` MUST live at the
+    same address across replays. The graph reads `last_input` at the start
+    of each step (caller updates with previous step's decoded tokens) and
+    writes `out_syms` at the end (caller reads after replay).
+    """
+    import torch
+    key = (id(weights), B)
+    if key in _FULL_STEP_BUFS_CACHE:
+        return _FULL_STEP_BUFS_CACHE[key]
+    device = weights["device"]
+    bufs = {
+        "last_input": torch.empty(B, dtype=torch.long, device=device),
+        "out_syms":   torch.empty(B, dtype=torch.int32, device=device),
+    }
+    _FULL_STEP_BUFS_CACHE[key] = bufs
+    return bufs
+
+
+def _eager_full_step(weights, last_input_long, ac_state, input_buf,
+                      base_byte_offsets, state, out_syms, B: int):
+    """One full decompress step: emb → 12 layers → ln_out → head → softmax+CDF
+    → AC decode batched. Mutates state, ac_state, out_syms in place. Used for
+    warmup before graph capture and as the eager fallback path."""
+    import torch
+    import krunch_ac_cuda
+    import torch.nn.functional as F
+    from krunch_ac.cdf import T as CDF_T
+
+    n_embd = weights["n_embd"]
+    layers = weights["layers"]
+    emb_w = weights["emb_w"]
+    ln_out_w = weights["ln_out_w"]
+    ln_out_b = weights["ln_out_b"]
+    head_w = weights["head_w"]
+
+    x = emb_w[last_input_long].view(B, 1, n_embd).contiguous()
+    for i in range(N_LAYER):
+        x = krunch_ac_cuda.rwkv4_layer_step_cpp(
+            x.contiguous(),
+            state[0][i], state[1][i], state[2][i], state[3][i], state[4][i],
+            *layers[i],
+        )
+    xn = F.layer_norm(x.view(B, n_embd), (n_embd,),
+                       weight=ln_out_w, bias=ln_out_b)
+    logits = krunch_ac_cuda.det_matmul(xn.contiguous(), head_w.contiguous())
+    # softmax + CDF (per-row, bit-identical between encoder T-pack and
+    # decoder B-batched paths because the kernel is shape-invariant).
+    cdfs = krunch_ac_cuda.det_softmax_cdf(logits.contiguous(), CDF_T)
+    cdfs[:, 1:] = torch.cumsum(cdfs[:, 1:], dim=-1)
+    krunch_ac_cuda.decode_step_batched(
+        cdfs, input_buf, base_byte_offsets, ac_state, out_syms)
+
+
+def forward_step_full_graphed_v3(weights: dict, ac_state, input_buf,
+                                   base_byte_offsets, state, B: int):
+    """Capture & replay one full decompress step in a single CUDA graph.
+
+    REQUIRES: `KRUNCH_OWN_WKV=1` (graph-safe WKV is prerequisite — the pip
+    rwkv WKV op uses a c10 dispatcher lookup that doesn't replay
+    deterministically; verified by test_t31_graph_diagnostic.py).
+
+    First call captures (snapshots state, runs 2 warmup passes, captures on
+    a side stream, restores state). Subsequent calls replay the captured
+    graph — no Python or ATen launch overhead per step beyond `g.replay()`.
+
+    Reads `bufs['last_input']` (stable). Writes `bufs['out_syms']` (stable).
+    Mutates `state[*][i]` and `ac_state` per replay.
+
+    Caller pattern:
+
+        bufs = _get_full_step_bufs(weights, B)
+        bufs['last_input'].fill_(BOS_TOKEN)
+        for t in range(max_T):
+            out_syms_buf = forward_step_full_graphed_v3(
+                weights, ac_state, input_buf, base_byte_offsets, state, B)
+            decoded_tokens[:, t] = out_syms_buf
+            bufs['last_input'].copy_(out_syms_buf)  # int32 → int64 cast
+    """
+    import torch
+
+    bufs = _get_full_step_bufs(weights, B)
+    # Cache key includes data ptrs so a graph captured against one set of
+    # caller-passed buffers (ac_state, input_buf) is invalidated if the
+    # caller passes different ones — would dangle on replay.
+    cache_key = (id(weights), B, ac_state.data_ptr(), input_buf.data_ptr())
+
+    if cache_key not in _FULL_STEP_GRAPH_CACHE:
+        # Capture warmup mutates state / ac_state / last_input. Snapshot
+        # so the first real replay sees the caller's clean starting state.
+        snap_state = _snapshot_state(state)
+        snap_ac = ac_state.clone()
+        snap_li = bufs["last_input"].clone()
+
+        # 2 warmup passes prime cuBLAS workspaces and allocator pool.
+        for _ in range(2):
+            _eager_full_step(weights, bufs["last_input"], ac_state,
+                              input_buf, base_byte_offsets, state,
+                              bufs["out_syms"], B)
+        torch.cuda.synchronize()
+
+        # Restore for the capture pass.
+        _restore_state(state, snap_state)
+        ac_state.copy_(snap_ac)
+        bufs["last_input"].copy_(snap_li)
+
+        g = torch.cuda.CUDAGraph()
+        cap_stream = torch.cuda.Stream()
+        cap_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(cap_stream):
+            with torch.cuda.graph(g):
+                _eager_full_step(weights, bufs["last_input"], ac_state,
+                                  input_buf, base_byte_offsets, state,
+                                  bufs["out_syms"], B)
+        torch.cuda.current_stream().wait_stream(cap_stream)
+
+        # Final restore — capture mutated state once more.
+        _restore_state(state, snap_state)
+        ac_state.copy_(snap_ac)
+        bufs["last_input"].copy_(snap_li)
+
+        _FULL_STEP_GRAPH_CACHE[cache_key] = g
+
+    _FULL_STEP_GRAPH_CACHE[cache_key].replay()
+    return bufs["out_syms"]
+
+
 def _snapshot_state(state):
     return [[t.clone() for t in state[k]] for k in range(5)]
 
