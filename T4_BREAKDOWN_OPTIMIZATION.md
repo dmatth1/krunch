@@ -85,23 +85,45 @@ holds — it's just buried inside the matmul phase numbers in this profile.
 
 ### What would move the decompress number
 
+Per-step on T4 today (B=16):
+```
+5.49 ms / step
+├── layer-step (12 layers × ~13 ATen launches each)  4.32 ms  (78 %)
+└── outside (softmax + CDF + decode_step + .item() + Python)  1.16 ms  (22 %)
+```
+
 1. **CUDA Graph capture of the per-step batched forward** —
    `forward_stepped_batched_graphed` (already in V1_PLAN backlog).
-   Collapses 12 × ~13 ATen launches per step into 12 graph replays.
-   Expected: ~10× per-step speedup → roughly **130 KB/s on T4**, more on
-   A10G+. This is the actual unlock; everything else is rounding error.
-2. Remove the per-step `.item()` sync — would require multi-step decode
-   pipelining or speculative decoding. ~1 ms / step today.
-3. Fused softmax+CDF kernel — saves one kernel launch + one cumsum pass.
-   Small win (~5 % decompress).
+   Collapses 12 × ~13 ATen launches per step → 12 graph replays.
+   Layer-step drops from 4.32 ms → ~120-300 µs (mostly compute floor).
+   Outside-layer-step (1.16 ms) **does not shrink** — `.item()` sync to
+   feed next token is autoregressive-irreducible.
+   Realistic per-step: ~1.3-1.5 ms → **~3-4× decompress speedup → ~50 KB/s on T4**.
+   On A10G B=128-640 the relative win is bigger (launches dominate per-step
+   wall more) → projected **150-200 KB/s, the tier-3 unlock**.
+2. Fused softmax+CDF kernel — saves one launch + one cumsum pass per
+   step. ~5-8 % decompress, would help all GPUs.
+3. Multi-step / speculative decode — would amortize the `.item()` sync
+   across N tokens. Significant architectural change; saves the
+   irreducible 1.16 ms above. Distant lever.
 
 ## Bottom line
 
-| Path | Bound on | Bound on | Lever (T4) | Lever (A10G+) |
+| Path | Bottleneck (T4) | Bottleneck (A10G+) | Lever (T4) | Lever (A10G+) |
 |---|---|---|---|---|
-| Compress | matmul kernel work | matmul kernel work | det_matmul_tc improvements | cp.async WMMA already lands |
-| Decompress | launch overhead (hidden in matmul phases) | launch overhead | CUDA-graph stepped forward | CUDA-graph stepped forward |
+| Compress | layer matmul kernel speed | softmax+CDF + remaining matmul | extend `det_matmul_tc_mw` to layer shapes (~1.5×) | softmax+CDF fusion (~5-10 %) |
+| Decompress | launch overhead (hidden in matmul phases) | launch overhead | graph-capture stepped forward (~3-4×) | graph-capture stepped forward (~4×) |
 
-The single highest-impact change for both T4 and A10G is the same:
-**graph-capture the stepped batched forward**. Captured as a follow-up
-in V1_PLAN.md.
+**Highest-ROI lever overall: graph-capture decompress on A10G.** Closes
+the 4× gap to the 200 KB/s gate on gate hardware. T4 gets a smaller
+side-benefit (~3-4× → ~50 KB/s) but won't clear the gate regardless;
+T4 is not the gate hardware. Captured as a follow-up in V1_PLAN.md.
+
+### Why ~130 KB/s on T4 was wrong
+
+An earlier draft of this doc claimed graph capture would hit ~130 KB/s
+on T4. That assumed the outside-layer-step bucket (softmax + CDF +
+`.item()` + Python loop) was small. The phase profile shows it's
+**1.16 ms per step = 21 % of wall**, and `.item()` is irreducible
+(autoregressive sync). A 12× speedup on the 4.3 ms layer-step bucket
+still leaves ~1.4 ms/step floor → ~50 KB/s on T4, not 130.
