@@ -727,7 +727,9 @@ def softmax_cdfs_per_row(logits_TxV):
     Bit-identical between [T,V] and [1,V] invocation (verified) so
     encoder and decoder produce the same CDFs. The kernel writes
     counts; we scan with torch.cumsum (much faster than the kernel's
-    own serial cumsum at V=50277)."""
+    own serial cumsum at V=50277; D1 Phase 0c fused-scan attempt
+    regressed compress 25-30% vs this — torch.cumsum's thrust-based
+    scan is very tuned; not worth replacing)."""
     import torch
     import krunch_ac_cuda
     from krunch_ac.cdf import T as CDF_T

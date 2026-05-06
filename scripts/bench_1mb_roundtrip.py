@@ -65,7 +65,9 @@ def main():
         t0 = time.perf_counter()
         # Per-chunk packed compress (matches production cli.py default; the
         # batched-stepped compress path is 5× slower).
-        compressed_chunks = [engine.compress_chunk(c) for c in chunks]
+        # D3 (Phase 0b): use compress_chunks so tokenization is batched
+        # via tokenizer.encode_batch — same per-chunk bytes, faster.
+        compressed_chunks = engine.compress_chunks(chunks)
         torch.cuda.synchronize()
         t_compress = time.perf_counter() - t0
 

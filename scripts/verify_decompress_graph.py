@@ -59,7 +59,8 @@ def main():
     print("\nCompressing chunks (production per-chunk packed path)...",
           flush=True)
     t0 = time.perf_counter()
-    compressed = [engine.compress_chunk(c) for c in chunks]
+    # D3: batch-tokenize via compress_chunks (Phase 0b)
+    compressed = engine.compress_chunks(chunks)
     t_compress = time.perf_counter() - t0
     print(f"  compress: {t_compress:.2f}s ({len(raw)/1024/t_compress:.1f} KB/s)",
           flush=True)

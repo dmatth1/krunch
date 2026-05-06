@@ -167,6 +167,12 @@ class InferenceEngine:
         self._device = "cpu"  # resolved in load() after torch is imported
         self._ready = False
         self._load_start: Optional[float] = None
+        # D2 (Phase 0a, 2026-05-06): cached compress buffers reused across
+        # _compress_chunk_cpp calls. Sized to max chunk seen so far. Reset
+        # in place each call (zero output_buf head + reset ac_state).
+        # Avoids 16× output_buf alloc + 16× empty_cache() per 1 MB compress.
+        self._compress_output_buf = None
+        self._compress_ac_state = None
 
     def load(self):
         """Load model + tokenizer. Blocks until ready."""
@@ -200,6 +206,43 @@ class InferenceEngine:
     def ready(self) -> bool:
         return self._ready
 
+    def compress_chunks(self, chunks: list[bytes]) -> list[bytes]:
+        """Batch-tokenize then per-chunk compress. ~10-20× faster
+        tokenization than calling compress_chunk in a list comprehension
+        (HF tokenizer.encode_batch parallelizes internally; the per-call
+        overhead of encode() is ~10-50 ms each, dominated by Python+
+        Rust crossings).
+
+        D3 (Phase 0b, 2026-05-06): production callers (cli.py
+        compress_all path, bench scripts) should prefer this over the
+        list-comprehension pattern. Equivalent bytes per chunk to
+        compress_chunk(c) called individually.
+        """
+        if len(chunks) == 0:
+            return []
+        if len(chunks) == 1:
+            return [self.compress_chunk(chunks[0])]
+        # Decode all to text once, then a single batch-encode call.
+        # tokenizer.encode_batch is the Rust tokenizers library's
+        # parallel path — much faster than 16× sequential encode().
+        texts = [d.decode("utf-8", errors="replace") for d in chunks]
+        encodings = self._tokenizer.encode_batch(texts)
+        all_tokens = [e.ids for e in encodings]
+        return [self._compress_chunk_with_tokens(d, t)
+                for d, t in zip(chunks, all_tokens)]
+
+    def _compress_chunk_with_tokens(self, data: bytes,
+                                      tokens: list[int]) -> bytes:
+        """Inner compress that takes pre-tokenized input. Used by
+        compress_chunks (after batch-tokenize) and by compress_chunk
+        (after single tokenize). Behavior identical between paths."""
+        from krunch import cpp_path
+        if len(tokens) < 1:
+            raise ValueError("chunk has no tokens after tokenization")
+        if cpp_path.cpp_path_enabled():
+            return self._compress_chunk_cpp(data, tokens)
+        return self._compress_chunk_legacy(data, tokens)
+
     def compress_chunk(self, data: bytes) -> bytes:
         """
         Compress a single chunk to a range-coded bitstream + mini-header.
@@ -216,19 +259,23 @@ class InferenceEngine:
         byte-identical to what `decompress_chunk` reproduces stepped.
 
         Peak memory: O(SEQ_BATCH × vocab) for probs + ~200 MB for CDF.
+
+        For multi-chunk callers, prefer `compress_chunks([…])` which
+        batch-tokenizes (D3, Phase 0b) — same per-chunk bytes, faster
+        overall via Rust tokenizer's parallel path.
         """
+        text = data.decode("utf-8", errors="replace")
+        tokens = self._tokenizer.encode(text).ids
+        return self._compress_chunk_with_tokens(data, tokens)
+
+    def _compress_chunk_legacy(self, data: bytes,
+                                 tokens: list[int]) -> bytes:
+        """Legacy non-cpp_path compress (kept for benchmark comparisons;
+        cpp_path is the only correct GPU AC path). Refactored from the
+        body of compress_chunk in the D3 Phase 0b refactor."""
         import torch
         import krunch_ac_cuda
         from krunch_ac.gpu_encode import probs_to_cdf_gpu
-        from krunch import cpp_path
-
-        text = data.decode("utf-8", errors="replace")
-        tokens = self._tokenizer.encode(text).ids
-        if len(tokens) < 1:
-            raise ValueError("chunk has no tokens after tokenization")
-
-        if cpp_path.cpp_path_enabled():
-            return self._compress_chunk_cpp(data, tokens)
 
         SEQ_BATCH = int(os.environ.get("KRUNCH_FORWARD_BATCH", 1024))
         full_input = [BOS_TOKEN] + tokens[:-1]
@@ -280,11 +327,8 @@ class InferenceEngine:
         bit_offset = int(state[3].item())
         n_bytes = (bit_offset + 7) // 8
         ac_bytes = bytes(output_buf[:n_bytes].cpu().numpy())
-
-        try:
-            torch.cuda.empty_cache()
-        except Exception:
-            pass
+        # D2 (Phase 0a): empty_cache() removed here too. Legacy non-cpp
+        # path; kept for benchmark comparisons. Same rationale as above.
 
         # Mini-header: original byte length (4) + token count (4)
         mini_header = struct.pack(">II", len(data), len(tokens))
@@ -323,9 +367,19 @@ class InferenceEngine:
         # at once (when memory allows).
         SEQ_BATCH = int(os.environ.get("KRUNCH_FORWARD_BATCH", "1024"))
         cap = max(len(data) * 2, 64 << 10)
-        output_buf = torch.zeros(cap, dtype=torch.uint8, device=self._device)
-        ac_state = torch.zeros(4, dtype=torch.uint32, device=self._device)
-        ac_state[1] = 0xFFFFFFFF
+        # D2 (Phase 0a): reuse engine-level buffers across compress calls.
+        # Grow `output_buf` to max cap seen; ac_state is fixed-size [4].
+        if self._compress_output_buf is None or self._compress_output_buf.size(0) < cap:
+            self._compress_output_buf = torch.zeros(
+                cap, dtype=torch.uint8, device=self._device)
+            self._compress_ac_state = torch.zeros(
+                4, dtype=torch.uint32, device=self._device)
+        # Reset in place — zero only the head we'll touch (faster than full).
+        self._compress_output_buf[:cap].zero_()
+        self._compress_ac_state.zero_()
+        self._compress_ac_state[1] = 0xFFFFFFFF
+        output_buf = self._compress_output_buf
+        ac_state = self._compress_ac_state
         symbols = torch.as_tensor(tokens, dtype=torch.int32, device=self._device).contiguous()
 
         with torch.no_grad():
@@ -353,10 +407,10 @@ class InferenceEngine:
                 "forward=%.1fms cdf=%.1fms ac=%.1fms copy=%.1fms total=%.1fms",
                 T, (t1-t0)*1000, (t2-t1)*1000, (t3-t2)*1000,
                 (t4-t3)*1000, (t5-t4)*1000, (t6-t5)*1000, (t6-t0)*1000)
-        try:
-            torch.cuda.empty_cache()
-        except Exception:
-            pass
+        # D2 (Phase 0a): empty_cache() removed. Every call paid 30-50 ms
+        # of allocator-flush + sync, ~16× per 1 MB compress = ~500-800 ms.
+        # Buffers are now reused across calls (cached on engine), so the
+        # allocator doesn't accumulate per-chunk allocations to flush.
         mini_header = struct.pack(">II", len(data), len(tokens))
         return mini_header + ac_bytes
 

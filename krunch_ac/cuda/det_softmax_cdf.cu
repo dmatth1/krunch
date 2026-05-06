@@ -180,8 +180,20 @@ extern "C" __global__ void det_softmax_cdf_kernel(
     // NOTE: cumsum is done by the caller (torch.cumsum on the output
     // slice). Earlier we did a serial cumsum-by-thread-0 here, but
     // that was dramatically slower than torch's tuned scan
-    // (1.9 ms → 0.1 ms per row at V=50277 on T4). The kernel writes
-    // counts; caller scans.
+    // (1.9 ms → 0.1 ms per row at V=50277 on T4).
+    //
+    // D1 attempt (Phase 0c, reverted 2026-05-06): tried fusing a
+    // Brent-Kung block-scan into this kernel to save one launch per
+    // row per call. Two attempts (per-thread register buffer +
+    // two-pass global memory) both REGRESSED compress by ~25-30%
+    // because at V=50K the cumsum portion is non-trivial work and
+    // torch.cumsum is heavily-tuned (likely thrust-based) — our
+    // hand-rolled parallel scan can't beat it. Bit-exactness was
+    // preserved (integer scan is associative) but throughput lost.
+    //
+    // Lesson: if torch's op is well-tuned (cumsum is one of those),
+    // the launch saving doesn't pay vs writing a slower hand kernel.
+    // Kernel writes counts; caller scans.
 }
 
 extern "C" void launch_det_softmax_cdf(
