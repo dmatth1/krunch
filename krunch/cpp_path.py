@@ -39,6 +39,39 @@ N_LAYER = 12
 _WEIGHTS_CACHE: dict[int, dict] = {}
 
 
+def _quantize_dequant_uint8_per_input_channel(w):
+    """Per-input-channel uint8 quantization SPIKE: quantizes a [K, N]
+    fp16 matrix to uint8 then dequantizes back to fp16, simulating the
+    numerical precision of an int8 weight × fp16 activation matmul kernel
+    without actually building one yet.
+
+    Quality test: does AC ratio degrade enough to disqualify int8?
+    Encoder + decoder both apply the same quantize→dequant transform,
+    so output bytes are bit-identical between them; the only question
+    is ratio vs the fp16 baseline. If ratio holds → invest in the real
+    int8 kernel. If ratio tanks → revert.
+
+    Per-row (per-input-channel) scheme matches Bellard / harrisonvanderbyl
+    /rwkv-cpp-accelerated:
+        for i in [0, K):
+            mn = min(W[i, :]); mx = max(W[i, :])
+            scale[i] = (mx - mn) / 255
+            offset[i] = mn
+            W_q[i, :] = round((W[i, :] - mn) / scale[i])  ∈ [0, 255]
+            W_dequant[i, :] = W_q[i, :] * scale[i] + offset[i]
+    """
+    import torch
+    if w.dim() != 2:
+        return w
+    w_f = w.to(torch.float32)
+    mn = w_f.min(dim=1, keepdim=True).values
+    mx = w_f.max(dim=1, keepdim=True).values
+    scale = ((mx - mn) / 255).clamp(min=1e-8)
+    w_q = ((w_f - mn) / scale).round().clamp(0, 255)
+    w_d = (w_q * scale + mn).to(w.dtype)
+    return w_d
+
+
 def init_weights(model, device: str = "cuda") -> dict:
     """Extract per-layer weights once per (model, device). Cached by
     id(model).
@@ -48,20 +81,31 @@ def init_weights(model, device: str = "cuda") -> dict:
     weight dtype and routes through the bf16 cp.async WMMA kernel.
     Bytes diverge from the fp16 codec → v2 model_id territory; encoder
     + decoder must both set the flag for the AC roundtrip to hold.
-    Other weights (LN, time_mix, time_decay, head, emb) stay fp16/fp32.
+
+    KRUNCH_INT8_WEIGHTS=1 quantizes all matmul weights (KVR, Ow, FFN
+    R/K/V) + emb + head to per-input-channel uint8, then dequantizes
+    back to fp16 in-place. Bytes diverge from the fp16 codec → v2
+    model_id (set 2 in the blob header, encoder + decoder must agree).
+    Spike phase: validates ratio quality before committing to a real
+    int8 kernel.
     """
     import torch
-    key = id(model)
+    key = (id(model),
+           os.environ.get("KRUNCH_BF16", "0"),
+           os.environ.get("KRUNCH_INT8_WEIGHTS", "0"))
     if key in _WEIGHTS_CACHE:
         return _WEIGHTS_CACHE[key]
 
     w = model.w
     use_bf16 = os.environ.get("KRUNCH_BF16") == "1"
+    use_int8 = os.environ.get("KRUNCH_INT8_WEIGHTS") == "1"
 
-    def fix(t, dt=None):
+    def fix(t, dt=None, quantize=False):
         t = t.to(device).contiguous()
         if dt is not None and t.dtype != dt:
             t = t.to(dtype=dt).contiguous()
+        if use_int8 and quantize:
+            t = _quantize_dequant_uint8_per_input_channel(t).contiguous()
         return t
 
     def matmul_dtype():
@@ -80,25 +124,31 @@ def init_weights(model, device: str = "cuda") -> dict:
             fix(w[att+'time_mix_r'].squeeze(), torch.float16),
             fix(w[att+'time_decay'], torch.float32),
             fix(w[att+'time_first'], torch.float32),
-            fix(w[att+'key.weight'], matmul_dtype()),
-            fix(w[att+'value.weight'], matmul_dtype()),
-            fix(w[att+'receptance.weight'], matmul_dtype()),
-            fix(w[att+'output.weight'], matmul_dtype()),
+            fix(w[att+'key.weight'],        matmul_dtype(), quantize=True),
+            fix(w[att+'value.weight'],      matmul_dtype(), quantize=True),
+            fix(w[att+'receptance.weight'], matmul_dtype(), quantize=True),
+            fix(w[att+'output.weight'],     matmul_dtype(), quantize=True),
             fix(w[bbb+'ln2.weight'], torch.float16),
             fix(w[bbb+'ln2.bias'], torch.float16),
             fix(w[ffn+'time_mix_k'].squeeze(), torch.float16),
             fix(w[ffn+'time_mix_r'].squeeze(), torch.float16),
-            fix(w[ffn+'key.weight'], matmul_dtype()),
-            fix(w[ffn+'value.weight'], matmul_dtype()),
-            fix(w[ffn+'receptance.weight'], matmul_dtype()),
+            fix(w[ffn+'key.weight'],        matmul_dtype(), quantize=True),
+            fix(w[ffn+'value.weight'],      matmul_dtype(), quantize=True),
+            fix(w[ffn+'receptance.weight'], matmul_dtype(), quantize=True),
         ])
 
     bundle = {
         "layers": layers,
-        "emb_w": fix(w['emb.weight'], torch.float16),
+        # emb.weight is [vocab, n_embd] = [50277, 768] = 38M params (~22% of
+        # the model). Quantize too for the spike — the embedding lookup just
+        # reads a single row per token, so int8 dequant during read is
+        # straightforward in a real kernel.
+        "emb_w": fix(w['emb.weight'], torch.float16, quantize=True),
         "ln_out_w": fix(w['ln_out.weight'], torch.float16),
         "ln_out_b": fix(w['ln_out.bias'], torch.float16),
-        "head_w": fix(w['head.weight'], torch.float16),
+        # head.weight is [vocab, n_embd] = [50277, 768] = 38M params, the
+        # other big chunk. Quantize for the spike.
+        "head_w": fix(w['head.weight'], torch.float16, quantize=True),
         "n_embd": int(model.args.n_embd),
         "n_att": int(model.args.n_att),
         "device": device,
