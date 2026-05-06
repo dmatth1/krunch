@@ -419,14 +419,28 @@ class InferenceEngine:
         krunch_ac_cuda.decode_init_batched(input_buf, base_byte_offsets, ac_states)
 
         weights = cpp_path.init_weights(self._model, self._device)
-        state = cpp_path.fresh_state_batched(weights, B)
+        # CUDA-graph-captured per-layer stepped forward — collapses 12 × ~13
+        # ATen launches per step into 12 graph replays. Default ON when
+        # KRUNCH_OWN_WKV=1 (graph-safety prerequisite); disable explicitly via
+        # KRUNCH_DECOMPRESS_GRAPH=0 for debugging or non-own-WKV runs.
+        own_wkv = os.environ.get("KRUNCH_OWN_WKV") == "1"
+        graph_default = "1" if own_wkv else "0"
+        use_graph = os.environ.get("KRUNCH_DECOMPRESS_GRAPH", graph_default) == "1"
+        # Graphs are pointer-bound; reuse same state tensors across calls
+        # (in-place reset). Eager path uses fresh allocations as before.
+        if use_graph:
+            state = cpp_path.fresh_state_batched_cached(weights, B)
+        else:
+            state = cpp_path.fresh_state_batched(weights, B)
         last_input = torch.full((B,), BOS_TOKEN, dtype=torch.long, device=device)
         out_syms = torch.empty(B, dtype=torch.int32, device=device)
         decoded_tokens = torch.zeros((B, max_T), dtype=torch.int32, device=device)
+        fwd = (cpp_path.forward_stepped_batched_graphed_v2 if use_graph
+               else cpp_path.forward_stepped_batched)
 
         with torch.no_grad():
             for t in range(max_T):
-                logits = cpp_path.forward_stepped_batched(weights, last_input, state)
+                logits = fwd(weights, last_input, state)
                 cdfs = cpp_path.softmax_cdfs_per_row(logits)
                 krunch_ac_cuda.decode_step_batched(
                     cdfs, input_buf, base_byte_offsets, ac_states, out_syms)

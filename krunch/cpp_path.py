@@ -441,6 +441,31 @@ def fresh_state_batched(weights: dict, B: int):
     )
 
 
+# Cached state tensors per (weights, B) — required for CUDA-graph-captured
+# decompress because graphs are bound to specific tensor data-pointer addresses.
+# Re-creating state across decompress calls would dangle captured graphs.
+_BATCHED_STATE_CACHE: dict[tuple, tuple] = {}
+
+
+def fresh_state_batched_cached(weights: dict, B: int):
+    """Get cached B-batched state (same tensor identity across calls), reset
+    in place. Required when graph capture is used (graphs are pointer-bound;
+    re-allocating state would dangle them). Bit-equivalent to fresh_state_batched
+    on first call after reset."""
+    import torch
+    key = (id(weights), B)
+    if key not in _BATCHED_STATE_CACHE:
+        _BATCHED_STATE_CACHE[key] = fresh_state_batched(weights, B)
+    state = _BATCHED_STATE_CACHE[key]
+    # In-place reset to fresh values (matches fresh_state_batched return).
+    for t in state[0]: t.zero_()  # att_xx (fp16)
+    for t in state[1]: t.zero_()  # aa (fp32)
+    for t in state[2]: t.zero_()  # bb (fp32)
+    for t in state[3]: t.fill_(-1e30)  # pp (fp32)
+    for t in state[4]: t.zero_()  # ffn_xx (fp16)
+    return state
+
+
 def forward_stepped_batched(weights: dict, last_tokens, state):
     """Run all 12 layers stepped (T=1) for B chunks in parallel.
     `last_tokens`: int32/long tensor [B] with each chunk's previous

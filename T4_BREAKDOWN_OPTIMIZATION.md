@@ -127,3 +127,36 @@ on T4. That assumed the outside-layer-step bucket (softmax + CDF +
 **1.16 ms per step = 21 % of wall**, and `.item()` is irreducible
 (autoregressive sync). A 12× speedup on the 4.3 ms layer-step bucket
 still leaves ~1.4 ms/step floor → ~50 KB/s on T4, not 130.
+
+### Graph capture: implemented, T4-neutral, A10G-TBD (2026-05-06)
+
+`forward_stepped_batched_graphed_v2` is now wired into
+`_decompress_chunks_batched_cpp` and defaults ON when `KRUNCH_OWN_WKV=1`
+(the graph-safety prerequisite). State tensors are now cached across
+calls (`fresh_state_batched_cached`) since CUDA graphs are pointer-bound.
+
+**T4 measurement (g4dn.xlarge, 1 MB WildChat, B=16):**
+- Eager: 13.6 KB/s, byte_exact ✓
+- Graph: 13.4 KB/s, byte_exact ✓
+- `eager_eq_graph_bytes: True` — graph replay is bit-exact
+
+**Result: 0.99× speedup on T4 — no win.** Why:
+
+The diagnosis I had ("decompress = ATen launch-overhead bound") was only
+partly right. `rwkv4_layer_step_cpp` already fuses all 13 ATen ops per
+layer into one C++ call → eager mode pays just 12 Python→C++ calls/step,
+not 156 ATen launches. CPU-side dispatch overhead was already low.
+The remaining 4.3 ms/step layer-step time is **GPU-side kernel launch
+latency** — each WMMA matmul at M=16 has ~50–100 µs of in-flight
+scheduling latency from the GPU's hardware scheduler. Graphs reduce
+host-side launch dispatch, but the GPU-side launch latency on T4
+(sm_75, older scheduler) is largely irreducible by graphs.
+
+A10G (sm_86) has a newer scheduler that pipelines captured graphs more
+aggressively + B=128–640 batches push GPU launch latency down to a
+smaller fraction of per-step wall. The expected 3–4× win still holds
+for A10G+; we'll confirm next time we spin one up.
+
+The change shipped as opt-in-default-on under `KRUNCH_OWN_WKV=1`. T4
+neutral (no regression), A10G-TBD positive. Disable explicitly via
+`KRUNCH_DECOMPRESS_GRAPH=0`.
