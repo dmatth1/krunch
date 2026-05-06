@@ -38,6 +38,9 @@ setup(
                 "det_matmul_tc_async.cu", "det_matmul_tc_3way.cu",
                 "det_matmul_tc_3way_async.cu", "det_matmul_tc_mw.cu",
                 "det_matmul_cublas.cu", "det_matmul_tc_bf16.cu",
+                # int8 weight × fp16 act WMMA — Phase 2 of int8 sprint
+                # (per-input-channel uint8, inline dequant in K-loop).
+                "det_matmul_int8_tc.cu",
             ],
             extra_compile_args={
                 "cxx": ["-O3", "-std=c++17"],
