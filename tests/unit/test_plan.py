@@ -18,6 +18,7 @@ CTX_BASE = {
     "image":             "ghcr.io/dmatth1/krunch:latest",
     "queue":             "krunch-queue",
     "job_definition":    "krunch-job",
+    "finalize_job_definition": "krunch-job-finalize",
     "cpus":              4,
     "gpus":              1,
     "memory_mb":         16384,
