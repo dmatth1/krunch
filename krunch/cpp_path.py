@@ -56,18 +56,16 @@ def _quantize_int8_per_output_channel(w):
 
 
 def _quantize_dequant_int8_per_output_channel(w):
-    """Per-output-channel SYMMETRIC int8 quantization SPIKE for the
-    W8A8 path (Phase 2A, 2026-05-06). Validates quality before
-    investing in the int8 WMMA kernel.
+    """Per-output-channel SYMMETRIC int8 quantization for the W8A8 path.
 
     For [K, N] matrix, quantizes per-column (per-output-channel):
         scale[j] = max(|W[:, j]|) / 127
         W_q[k, j] = round(W[k, j] / scale[j])  ∈ [-127, 127]
         W_dequant[k, j] = W_q[k, j] * scale[j]
 
-    Per-OUTPUT-channel (vs Phase 1 spike's per-INPUT-channel) because
-    in the W8A8 int8-WMMA path, the scale must be applied AFTER WMMA
-    accumulates along K → scale must be constant across K, i.e. per-N.
+    Per-OUTPUT-channel because in the W8A8 int8-WMMA path the scale must
+    be applied AFTER WMMA accumulates along K → constant across K, i.e.
+    per-N.
 
     SYMMETRIC (no offset) because it's the standard W8A8 recipe — the
     inner WMMA is pure int8 × int8 → int32; output is multiplied by
@@ -135,12 +133,11 @@ def init_weights(model, device: str = "cuda") -> dict:
     R/K/V) + emb + head to per-input-channel uint8, then dequantizes
     back to fp16 in-place. Bytes diverge from the fp16 codec → v2
     model_id (set 2 in the blob header, encoder + decoder must agree).
-    Phase 1 spike: validated ratio quality (+0.15% on WildChat T4).
+    Validated ratio cost: +0.15% on WildChat.
 
     KRUNCH_INT8_W8A8=1 uses per-OUTPUT-channel SYMMETRIC int8 quant
-    (matches the W8A8 int8-WMMA kernel recipe). Phase 2A spike
-    validates ratio for the W8A8 path before building the kernel.
-    Mutually exclusive with KRUNCH_INT8_WEIGHTS=1.
+    (matches the W8A8 int8-WMMA kernel recipe). Mutually exclusive
+    with KRUNCH_INT8_WEIGHTS=1.
     """
     import torch
     key = (id(model),
@@ -214,13 +211,11 @@ def init_weights(model, device: str = "cuda") -> dict:
         "device": device,
     }
 
-    # W8A8 (Phase 2A Step 3 integration): also store raw int8 weights +
-    # per-output-channel scales for the 7 layer matmul weights. These are
-    # what `rwkv4_layer_step_cpp_w8a8` consumes; the existing fp16 layer
-    # weights in `layers` (already dequant-of-int8 per `fix(quantize=True)`)
-    # are kept for the decompress path which still uses the fp16 kernel
-    # (W8A8 regresses at small M; M-fallback handled at the layer-step
-    # level).
+    # W8A8: also store raw int8 weights + per-output-channel scales for
+    # the 7 layer matmul weights. These are what `rwkv4_layer_step_cpp_w8a8`
+    # consumes; the existing fp16 layer weights in `layers` are kept for
+    # the decompress path which still uses the fp16 kernel (W8A8 regresses
+    # at small M; M-fallback handled at the layer-step level).
     if use_w8a8:
         # Order MUST match rwkv4_layer_step_cpp's matmul arg order:
         # 0:Kw, 1:Vw, 2:Rw, 3:Ow, 4:ffn_Kw, 5:ffn_Vw, 6:ffn_Rw.
@@ -310,16 +305,13 @@ def forward_packed_window(weights: dict, input_ids, state, off: int, n: int):
     T_w = int(ids_w.shape[0])
     x = emb_w[ids_w].view(1, T_w, n_embd).contiguous()
 
-    # W8A8 dispatch (Phase 2A Step 3): compress packed forward at M >= 256
-    # uses the int8 Tensor Core path (1.5-2.2× per-call speedup at our
-    # shapes). Decompress (small M) keeps using the existing fp16 layer
-    # step on the dequant-fp16 weights stored in `layers` — same effective
-    # weights, so encoder W8A8 and decoder fp16 produce identical outputs
-    # (modulo activation-quant noise; verified by AC roundtrip at
-    # integration time).
-    # Must mirror decoder's gate exactly (forward_stepped_batched line ~825)
-    # for AC bit-exactness — encoder fp16 + decoder W8A8 produces different
-    # logits and breaks roundtrip on partial windows.
+    # W8A8 dispatch: compress packed forward at M >= 256 uses the int8
+    # Tensor Core path (1.5-2.2× per-call speedup at our shapes).
+    # Decompress (small M) keeps using the fp16 layer step on the
+    # dequant-fp16 weights stored in `layers` — same effective weights,
+    # so encoder W8A8 and decoder fp16 produce identical outputs.
+    # Must mirror decoder's gate (in forward_stepped_batched) exactly
+    # for AC bit-exactness.
     use_w8a8 = ("w8a8_int8" in weights)
     if use_w8a8:
         w8a8_int8 = weights["w8a8_int8"]
@@ -473,14 +465,10 @@ def forward_stepped_batched_graphed_v2(weights: dict, last_tokens, state):
 
 
 # =============================================================================
-# Whole-step CUDA Graph (Week 1, 2026-05-06).
+# Whole-step CUDA Graph.
 # Captures emb lookup → 12 layers → LN_out → head matmul → softmax + CDF →
 # AC decode batched into ONE graph object per (model, B). Replays 1× per
 # decompress step instead of 12 (per-layer graphs) or 18+ (eager).
-#
-# Per V1_PLAN tier-3 sprint plan: closes the gap to ts_zip-class throughput
-# by collapsing the kernel-launch overhead that dominated decompress per-step
-# wall on T4 / A10G. The KTransformers SOSP'25 pattern.
 # =============================================================================
 
 _FULL_STEP_BUFS_CACHE: dict[tuple, dict] = {}
@@ -798,12 +786,11 @@ def forward_stepped_batched(weights: dict, last_tokens, state):
     Bit-identical per-chunk to running forward_stepped sequentially
     on each chunk (verified via tests/gpu/test_batched_stepped.py).
 
-    W8A8 dispatch (Phase 2A Step 3, 2026-05-06): when bundle has
-    `w8a8_int8` (set by init_weights when KRUNCH_INT8_W8A8=1), uses the
-    W8A8 layer step. Required for bit-exact AC roundtrip — encoder
-    uses W8A8 packed; decoder must use SAME quant scheme to produce
-    matching logits. Cost: W8A8 regresses at small M (microbench
-    0.49× at M=16); the regression is the price of bit-exact W8A8.
+    W8A8 dispatch: when bundle has `w8a8_int8` (set by init_weights
+    when KRUNCH_INT8_W8A8=1), uses the W8A8 layer step. Required for
+    bit-exact AC roundtrip — encoder uses W8A8 packed; decoder must
+    use SAME quant scheme to produce matching logits. Cost: W8A8
+    regresses at small M; the regression is the price of bit-exactness.
     """
     import torch
     import krunch_ac_cuda
@@ -880,12 +867,10 @@ def forward_stepped(weights: dict, last_token: int, state):
 
 def softmax_cdfs_per_row(logits_TxV):
     """Batched softmax + CDF via det_softmax_cdf kernel + torch.cumsum.
-    Bit-identical between [T,V] and [1,V] invocation (verified) so
-    encoder and decoder produce the same CDFs. The kernel writes
-    counts; we scan with torch.cumsum (much faster than the kernel's
-    own serial cumsum at V=50277; D1 Phase 0c fused-scan attempt
-    regressed compress 25-30% vs this — torch.cumsum's thrust-based
-    scan is very tuned; not worth replacing)."""
+    Bit-identical between [T,V] and [1,V] invocation so encoder and
+    decoder produce the same CDFs. The kernel writes counts; we scan
+    with torch.cumsum (thrust-tuned, much faster than rolling our own
+    at V=50277)."""
     import torch
     import krunch_ac_cuda
     from krunch_ac.cdf import T as CDF_T
@@ -917,28 +902,17 @@ _PER_BATCH_MEMORY_BYTES = 1.5 * 1024 * 1024
 def compute_decompress_batch(n_chunks: int = -1, default: int = 64) -> int:
     """Pick cross-chunk batch B from runtime GPU specs + n_chunks.
 
-    Replaces the prior static per-GPU table (which was extrapolated, not
-    measured for non-T4 classes). Formula derived from kernel tile geometry:
+    Formula derived from kernel tile geometry:
 
       cp.async path (sm_80+, 64x64 tile, 4 warps):
-        bottleneck matmul has N=768 -> 12 col-tiles. Want 1.5-wave
-        coverage: ceil(B/64) * 12 ~= n_sms * 1.5  -> sat_B ~= n_sms * 8.
+        bottleneck matmul has N=768 -> 12 col-tiles. 1.5-wave coverage:
+        ceil(B/64) * 12 ~= n_sms * 1.5  -> sat_B ~= n_sms * 8.
 
-      legacy path (T4 sm_75, 16x16 single-warp):
-        smaller per-tile work, more tiles -> sat_B ~= n_sms * 2.
+      sm_75 fallback (16x16 single-warp): sat_B ~= n_sms * 2.
 
     Result clamped by (a) n_chunks for the current call and (b) a memory
-    budget that fits inside 80 % of VRAM.
-
-    Predicted vs prior static table:
-      T4 (40 SMs, sm_75):    ~80   (table: 64)
-      A10G (80 SMs, sm_86):  ~640  (table: 128) -- table was 5x low
-      L4 (58 SMs, sm_89):    ~464  (table: 128) -- table was 3.6x low
-      L40S (142 SMs, sm_89): ~1136 (table: 256) -- table was 4.4x low
-      A100 (108 SMs, sm_80): ~864  (table: 256) -- table was 3.4x low
-      H100 (132 SMs, sm_90): ~1056 (table: 512) -- table was 2x low
-
-    Override via env `KRUNCH_DECOMPRESS_BATCH=N`.
+    budget that fits inside 80% of VRAM. Override via
+    `KRUNCH_DECOMPRESS_BATCH=N`.
     """
     env = os.environ.get("KRUNCH_DECOMPRESS_BATCH")
     if env:
@@ -955,7 +929,7 @@ def compute_decompress_batch(n_chunks: int = -1, default: int = 64) -> int:
         n_sms = int(p.multi_processor_count)
         if p.major >= 8:           # cp.async path (A10G/A100/L4/L40S/H100)
             saturation = n_sms * 8
-        else:                       # T4 sm_75 legacy path
+        else:                       # sm_75 fallback (T4)
             saturation = n_sms * 2
         mem_cap = int(p.total_memory * 0.8 / _PER_BATCH_MEMORY_BYTES)
         upper = max(1, min(saturation, mem_cap))

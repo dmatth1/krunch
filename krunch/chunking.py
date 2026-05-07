@@ -23,11 +23,10 @@ from typing import Callable, Optional
 logger = logging.getLogger(__name__)
 
 # Floor for compress chunk size. Smaller chunks get less model context →
-# worse ratio. 64 KB measured cost vs 1 MB on a 3 MB WildChat sample:
-# +0.08% ratio (essentially noise). Set 2026-04-30. Bigger chunks → better
-# ratio (more model context, smaller cold-start fraction); smaller chunks
-# → more cross-chunk parallelism for cross-chunk batched decode (each
-# chunk is one batch slot in the stepped forward).
+# worse ratio. Bigger chunks → better ratio (more context, smaller
+# cold-start fraction); smaller chunks → more cross-chunk parallelism
+# for cross-chunk batched decode (each chunk is one batch slot in the
+# stepped forward).
 _CHUNK_SIZE_FLOOR = 64 * 1024
 
 # Cross-chunk batch size hint used to size chunks. Workers auto-tune
@@ -67,17 +66,11 @@ def compute_chunk_size(total_size: int) -> int:
 # otherwise the floor — for the new sizing call compute_chunk_size(total).
 CHUNK_SIZE = int(os.environ.get("KRUNCH_CHUNK_SIZE", _CHUNK_SIZE_FLOOR))
 
-# Number of chunks decompressed concurrently on a single worker. Each
-# concurrent stream maintains its own RNN state and AC decoder; threads
-# overlap their forward calls so the GPU isn't idle between Python steps.
-# Larger = more GPU utilization but more memory for state + logits.
-# Default 1 (sequential): with the GPU AC kernel landing in v1.1, each
-# decode step ends in a `.item()` GPU sync that blocks the calling thread,
-# and 8 threads contending for one GPU + one Python GIL ran ~1.7× SLOWER
-# than sequential on T4 (32m vs 19m on a 3 MB / 3-chunk sample, 2026-04-28).
-# Per-thread CUDA streams didn't fix it — bottleneck is per-token
-# Python+launch overhead, not GPU SM occupancy. Set >1 only for the older
-# CPU-AC code path or for a future batched-WKV decode redesign.
+# Number of chunks decompressed concurrently on a single worker. Default
+# 1 (sequential): each decode step ends in a `.item()` GPU sync that
+# blocks the calling thread, and threads contending for one GPU + one
+# Python GIL run slower than sequential. Per-thread CUDA streams don't
+# fix it — bottleneck is per-token launch overhead, not SM occupancy.
 DECOMPRESS_BATCH = int(os.environ.get("KRUNCH_DECOMPRESS_BATCH", 1))
 
 # Per-chunk entry: orig_len(4) + comp_len(4) + neural_compressed_data
@@ -152,13 +145,11 @@ def decompress_all(entries_bytes: bytes, n_chunks: int,
                    neural_fn: Callable[[bytes], bytes],
                    neural_batch_fn: Optional[Callable[[list], list]] = None
                    ) -> bytes:
-    """
-    Decompress all chunks. If `neural_batch_fn` is supplied (the
+    """Decompress all chunks. If `neural_batch_fn` is supplied (the
     GPU-batched chunk path), invoke it once with all chunks; otherwise
-    fall back to per-chunk via `neural_fn` (sequential or, when
-    `KRUNCH_DECOMPRESS_BATCH > 1`, ThreadPoolExecutor — only useful for
-    the legacy CPU-AC path; see chunking.py module docstring + V1_PLAN
-    for why we default sequential under GPU AC).
+    fall back to per-chunk via `neural_fn` (sequential, or with
+    `KRUNCH_DECOMPRESS_BATCH > 1` a ThreadPoolExecutor for the rare
+    callers that need it).
     """
     # Pre-parse all chunks (cheap — just slicing + 8 bytes per entry)
     pos = 0

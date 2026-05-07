@@ -167,10 +167,9 @@ class InferenceEngine:
         self._device = "cpu"  # resolved in load() after torch is imported
         self._ready = False
         self._load_start: Optional[float] = None
-        # D2 (Phase 0a, 2026-05-06): cached compress buffers reused across
-        # _compress_chunk_cpp calls. Sized to max chunk seen so far. Reset
-        # in place each call (zero output_buf head + reset ac_state).
-        # Avoids 16× output_buf alloc + 16× empty_cache() per 1 MB compress.
+        # Cached compress buffers reused across _compress_chunk_cpp calls.
+        # Sized to max chunk seen so far; reset in place each call (zero
+        # output_buf head + reset ac_state).
         self._compress_output_buf = None
         self._compress_ac_state = None
 
@@ -185,14 +184,9 @@ class InferenceEngine:
         # trained with `"normalizer": {"type": "NFC"}` baked in, which
         # silently maps compatibility-equivalent Unicode codepoints to
         # their canonical form on encode (e.g. U+2126 OHM SIGN → U+03A9
-        # GREEK CAPITAL OMEGA, 3 bytes → 2 bytes). That makes the codec
-        # not byte-exact on text containing such characters — discovered
-        # 2026-05-07 in the T4 100MB / 4-worker run (125 bytes lost
-        # across 3 worker shards, all from compatibility-decomposable
-        # codepoints). Disabling the normalizer at load time gives
-        # byte-exact roundtrip with measured ~0.003% token-count
-        # overhead (BPE byte-level tokenization handles the original
-        # codepoints fine without the canonicalization pass).
+        # GREEK CAPITAL OMEGA, 3 bytes → 2 bytes), breaking byte-exact
+        # roundtrip on text with such characters. BPE byte-level
+        # tokenization handles the originals fine without the pass.
         self._tokenizer.normalizer = None
 
         logger.info("Loading RWKV-4-Pile-169M from %s (device=%s)",
@@ -222,14 +216,8 @@ class InferenceEngine:
     def compress_chunks(self, chunks: list[bytes]) -> list[bytes]:
         """Batch-tokenize then per-chunk compress. ~10-20× faster
         tokenization than calling compress_chunk in a list comprehension
-        (HF tokenizer.encode_batch parallelizes internally; the per-call
-        overhead of encode() is ~10-50 ms each, dominated by Python+
-        Rust crossings).
-
-        D3 (Phase 0b, 2026-05-06): production callers (cli.py
-        compress_all path, bench scripts) should prefer this over the
-        list-comprehension pattern. Equivalent bytes per chunk to
-        compress_chunk(c) called individually.
+        — `tokenizer.encode_batch` parallelizes in Rust. Equivalent
+        bytes per chunk to compress_chunk(c) called individually.
         """
         if len(chunks) == 0:
             return []
@@ -302,8 +290,8 @@ class InferenceEngine:
         # at once (when memory allows).
         SEQ_BATCH = int(os.environ.get("KRUNCH_FORWARD_BATCH", "1024"))
         cap = max(len(data) * 2, 64 << 10)
-        # D2 (Phase 0a): reuse engine-level buffers across compress calls.
-        # Grow `output_buf` to max cap seen; ac_state is fixed-size [4].
+        # Reuse engine-level buffers across compress calls. Grow
+        # `output_buf` to max cap seen; ac_state is fixed-size [4].
         if self._compress_output_buf is None or self._compress_output_buf.size(0) < cap:
             self._compress_output_buf = torch.zeros(
                 cap, dtype=torch.uint8, device=self._device)
@@ -342,10 +330,9 @@ class InferenceEngine:
                 "forward=%.1fms cdf=%.1fms ac=%.1fms copy=%.1fms total=%.1fms",
                 T, (t1-t0)*1000, (t2-t1)*1000, (t3-t2)*1000,
                 (t4-t3)*1000, (t5-t4)*1000, (t6-t5)*1000, (t6-t0)*1000)
-        # D2 (Phase 0a): empty_cache() removed. Every call paid 30-50 ms
-        # of allocator-flush + sync, ~16× per 1 MB compress = ~500-800 ms.
-        # Buffers are now reused across calls (cached on engine), so the
-        # allocator doesn't accumulate per-chunk allocations to flush.
+        # No empty_cache() here — buffers are reused across calls
+        # (cached on engine), so the allocator doesn't accumulate
+        # per-chunk allocations to flush.
         mini_header = struct.pack(">II", len(data), len(tokens))
         return mini_header + ac_bytes
 
@@ -408,19 +395,17 @@ class InferenceEngine:
         krunch_ac_cuda.decode_init_batched(input_buf, base_byte_offsets, ac_states)
 
         weights = cpp_path.init_weights(self._model, self._device)
-        # W8A8 mode (Phase 2A): decoder must use same path as encoder for
-        # bit-exact AC roundtrip. Force eager (graph captures aren't yet
-        # threaded through the W8A8 layer step).
+        # W8A8 mode: decoder must use same path as encoder for bit-exact
+        # AC roundtrip. Force eager (graph captures aren't yet threaded
+        # through the W8A8 layer step).
         w8a8_active = ("w8a8_int8" in weights)
         # CUDA-graph dispatch: three modes via KRUNCH_DECOMPRESS_GRAPH.
         #   "full"      (default if KRUNCH_OWN_WKV=1): emb → 12 layers →
-        #               ln_out → head → softmax+CDF → AC decode all in one
-        #               captured graph. 1 g.replay() per step.
-        #               (Week 1 lever, KTransformers SOSP'25 pattern.)
-        #   "per_layer" (legacy): 12 graphs, one per layer; softmax+CDF
-        #               + decode outside graph. Effectively neutral on
-        #               T4 / A10G B=16 measurements (1.03×).
-        #   "eager"     (KRUNCH_OWN_WKV=0 or "0"): no graph; for debugging.
+        #               ln_out → head → softmax+CDF → AC decode all in
+        #               one captured graph. 1 replay() per step.
+        #   "per_layer": 12 graphs, one per layer; softmax+CDF + decode
+        #                outside the graph. Effectively neutral.
+        #   "eager"     (KRUNCH_OWN_WKV=0): no graph; for debugging.
         own_wkv = os.environ.get("KRUNCH_OWN_WKV") == "1"
         graph_mode = os.environ.get(
             "KRUNCH_DECOMPRESS_GRAPH", "full" if own_wkv else "eager")
