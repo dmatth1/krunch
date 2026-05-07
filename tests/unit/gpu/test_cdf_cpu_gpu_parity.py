@@ -26,24 +26,27 @@ def probs():
 
 def test_gpu_cdf_matches_cpu_reference_per_row(probs):
     """For each row, GPU CDF must equal CPU CDF byte-for-byte."""
+    import numpy as np
     from krunch.codec.gpu_encode import probs_to_cdf_gpu
 
     gpu_cdfs = probs_to_cdf_gpu(probs).cpu()
-    cpu_cdfs = []
-    for row in probs.cpu().numpy():
-        cpu_cdfs.append(probs_to_cdf(row))
-    cpu_cdfs = torch.tensor(cpu_cdfs, dtype=torch.int32)
+    # probs_to_cdf accepts a (V,) row and returns (1, V+1); squeeze to
+    # (V+1,) so np.stack gives the same (N, V+1) shape as the GPU output.
+    cpu_rows = [np.asarray(probs_to_cdf(row)).reshape(-1)
+                for row in probs.cpu().numpy()]
+    cpu_cdfs = torch.from_numpy(np.stack(cpu_rows)).to(torch.int32)
     assert torch.equal(gpu_cdfs, cpu_cdfs), \
         "GPU CDF diverged from CPU reference — AC roundtrip would break"
 
 
 def test_cpu_cdf_invariants(probs):
     """CDF[0]=0, CDF[V]=T, monotonically non-decreasing."""
+    import numpy as np
     for row in probs.cpu().numpy():
-        cdf = probs_to_cdf(row)
+        cdf = np.asarray(probs_to_cdf(row)).reshape(-1)
         assert cdf[0] == 0
         assert cdf[-1] == CDF_T
-        assert (cdf[1:] >= cdf[:-1]).all(), "CPU CDF not monotonic"
+        assert bool(np.all(cdf[1:] >= cdf[:-1])), "CPU CDF not monotonic"
 
 
 def test_cdf_uniform_distribution_within_one_lsb():
