@@ -80,7 +80,7 @@ level + 128 MB window — the de-facto modern strong-text baseline).
 
 | corpus | krunch | ts_zip | zstd -22 --long | krunch vs zstd |
 |---|---|---|---|---|
-| WildChat-English (100 MB) | **0.114** | _tbd_ | _tbd_ | _tbd_ |
+| WildChat-English (100 MB) | **0.114** | _tbd_ | 0.170 | **−33%** |
 | enwik8 | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
 | enwik9 | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
 | nginx logs | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
