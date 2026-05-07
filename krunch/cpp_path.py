@@ -694,49 +694,6 @@ def forward_stepped_graphed_v2(weights: dict, last_token: int, state):
     return logits
 
 
-def forward_stepped_graphed(weights: dict, last_token: int, state):
-    """Graph-captured per-layer T=1 forward.
-
-    KNOWN BROKEN — DO NOT ENABLE FOR ROUNDTRIP. The underlying C++
-    wrapper `rwkv4_layer_step_cpp_graphed` warms up the kernel
-    twice + captures once on first invocation, all of which mutate
-    the shared state tensors (att_xx, aa, bb, pp, ffn_xx) via
-    copy_(). For per-token decoding that means state is advanced
-    3× on the first token instead of 1×, corrupting subsequent
-    decode steps. Confirmed by tests/unit/gpu/test_engine_cpp_roundtrip.py
-    failing with KRUNCH_CPP_GRAPH=1.
-
-    Fix path: either expose a separate `capture_layer_graph` +
-    `replay_layer_graph` pair from C++ (so Python can snapshot/
-    restore state around the warm-up), or reimplement the graph
-    capture from Python using torch.cuda.graph against a non-
-    state-mutating wrapper. Both ~half-day items.
-    """
-    import torch
-    import krunch_ac_cuda
-    import torch.nn.functional as F
-    n_embd = weights["n_embd"]
-    layers = weights["layers"]
-    emb_w = weights["emb_w"]
-    ln_out_w = weights["ln_out_w"]
-    ln_out_b = weights["ln_out_b"]
-    head_w = weights["head_w"]
-    bufs = _get_stepped_bufs(weights)
-
-    # Fill input buffer with the embedding of last_token.
-    bufs[0].copy_(emb_w[last_token].view(1, 1, n_embd))
-    for i in range(N_LAYER):
-        krunch_ac_cuda.rwkv4_layer_step_cpp_graphed(
-            i, bufs[i], bufs[i + 1],
-            state[0][i], state[1][i], state[2][i], state[3][i], state[4][i],
-            *layers[i],
-        )
-    xn = F.layer_norm(bufs[N_LAYER].view(1, n_embd), (n_embd,),
-                      weight=ln_out_w, bias=ln_out_b)
-    logits = krunch_ac_cuda.det_matmul(xn.contiguous(), head_w.contiguous()).flatten()
-    return logits
-
-
 def fresh_state_batched(weights: dict, B: int):
     """B-way batched RWKV state (att_xx[B,C], aa/bb/pp[B,n_att],
     ffn_xx[B,C]) per layer."""

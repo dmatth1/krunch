@@ -868,80 +868,6 @@ at::Tensor rwkv4_layer_step_cpp_w8a8(
 // tensors so they don't change across calls.
 // =============================================================================
 
-#include <ATen/cuda/CUDAGraph.h>
-#include <unordered_map>
-#include <memory>
-
-struct LayerGraphCache {
-    std::unordered_map<int64_t, std::shared_ptr<at::cuda::CUDAGraph>> graphs;
-};
-
-// Per-layer-index cache (12 layers in the model). Indexed by layer_id × 100000 + T.
-static std::unordered_map<int64_t, std::shared_ptr<at::cuda::CUDAGraph>> g_graphs;
-
-at::Tensor rwkv4_layer_step_cpp_graphed(
-    int64_t layer_id,
-    at::Tensor x_buf,                  // [1, T, C] fp16 — static buffer
-    at::Tensor x_out_buf,               // [1, T, C] fp16 — static output
-    at::Tensor att_xx, at::Tensor aa, at::Tensor bb, at::Tensor pp,
-    at::Tensor ffn_xx,
-    at::Tensor ln1_w, at::Tensor ln1_b,
-    at::Tensor tm_k, at::Tensor tm_v, at::Tensor tm_r,
-    at::Tensor time_decay, at::Tensor time_first,
-    at::Tensor Kw, at::Tensor Vw, at::Tensor Rw, at::Tensor Ow,
-    at::Tensor ln2_w, at::Tensor ln2_b,
-    at::Tensor ffn_tm_k, at::Tensor ffn_tm_r,
-    at::Tensor ffn_Kw, at::Tensor ffn_Vw, at::Tensor ffn_Rw)
-{
-    const int64_t T = x_buf.size(1);
-    const int64_t key = layer_id * 100000 + T;
-
-    auto it = g_graphs.find(key);
-    if (it == g_graphs.end()) {
-        // Warm up on default stream first (cuBLAS workspaces, alloc).
-        for (int i = 0; i < 2; i++) {
-            auto out = rwkv4_layer_step_cpp(
-                x_buf, att_xx, aa, bb, pp, ffn_xx,
-                ln1_w, ln1_b, tm_k, tm_v, tm_r, time_decay, time_first,
-                Kw, Vw, Rw, Ow,
-                ln2_w, ln2_b, ffn_tm_k, ffn_tm_r,
-                ffn_Kw, ffn_Vw, ffn_Rw);
-            x_out_buf.copy_(out);
-        }
-        at::cuda::getCurrentCUDAStream().synchronize();
-
-        // Capture on a side stream — required by CUDA Graph API.
-        // Replay later happens on whatever stream is current.
-        auto capture_stream = at::cuda::getStreamFromPool();
-        auto saved_stream = at::cuda::getCurrentCUDAStream();
-        at::cuda::setCurrentCUDAStream(capture_stream);
-
-        auto graph = std::make_shared<at::cuda::CUDAGraph>();
-        graph->capture_begin();
-        auto out = rwkv4_layer_step_cpp(
-            x_buf, att_xx, aa, bb, pp, ffn_xx,
-            ln1_w, ln1_b, tm_k, tm_v, tm_r, time_decay, time_first,
-            Kw, Vw, Rw, Ow,
-            ln2_w, ln2_b, ffn_tm_k, ffn_tm_r,
-            ffn_Kw, ffn_Vw, ffn_Rw);
-        x_out_buf.copy_(out);
-        graph->capture_end();
-
-        at::cuda::setCurrentCUDAStream(saved_stream);
-        g_graphs[key] = graph;
-    } else {
-        it->second->replay();
-    }
-
-    return x_out_buf;
-}
-
-// Reset the per-process graph cache (call when weights change or
-// between unrelated runs).
-void clear_layer_graph_cache() {
-    g_graphs.clear();
-}
-
 // Direct binding for launch_det_matmul, used by tests to verify
 // shape-invariance of the kernel without going through the full layer.
 // Computes y = x @ W. x: [M,K] fp16, W: [K,N] fp16, returns [M,N] in
@@ -1032,10 +958,6 @@ void register_layer_cpp(pybind11::module& m) {
           "rwkv4_layer_step_cpp. Accepts (W_q, W_s) tuples for the 7 "
           "matmul weights. Use only for compress (M >= 256) — regresses "
           "at small M; for decompress, dispatch back to the fp16 version.");
-    m.def("rwkv4_layer_step_cpp_graphed", &rwkv4_layer_step_cpp_graphed,
-          "Graph-captured version of rwkv4_layer_step_cpp; replays after first call.");
-    m.def("clear_layer_graph_cache", &clear_layer_graph_cache,
-          "Drop all cached CUDA graphs (call when weights change).");
     m.def("det_matmul", &det_matmul_py,
           "Deterministic shape-invariant matmul: y = x @ W.",
           pybind11::arg("x"), pybind11::arg("W"),
