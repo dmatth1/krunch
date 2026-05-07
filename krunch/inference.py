@@ -349,7 +349,7 @@ class InferenceEngine:
         overhead is fixed; the GPU is saturated within each group.
 
         Same numerics as `_decompress_chunk_cpp` per-chunk, just processed
-        in lockstep — verified bit-exact in tests/gpu/test_batched_stepped.py
+        in lockstep — verified bit-exact in tests/unit/gpu/test_batched_stepped.py
         (3-chunk batched == 3-chunk sequential, all state diffs = 0).
         """
         import torch

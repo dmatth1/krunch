@@ -537,7 +537,7 @@ def forward_step_full_graphed_v3(weights: dict, ac_state, input_buf,
 
     REQUIRES: `KRUNCH_OWN_WKV=1` (graph-safe WKV is prerequisite — the pip
     rwkv WKV op uses a c10 dispatcher lookup that doesn't replay
-    deterministically; verified by tests/gpu/test_t31_graph_diagnostic.py).
+    deterministically; verified by tests/unit/gpu/test_t31_graph_diagnostic.py).
 
     First call captures (snapshots state, runs 2 warmup passes, captures on
     a side stream, restores state). Subsequent calls replay the captured
@@ -703,7 +703,7 @@ def forward_stepped_graphed(weights: dict, last_token: int, state):
     the shared state tensors (att_xx, aa, bb, pp, ffn_xx) via
     copy_(). For per-token decoding that means state is advanced
     3× on the first token instead of 1×, corrupting subsequent
-    decode steps. Confirmed by tests/gpu/test_engine_cpp_roundtrip.py
+    decode steps. Confirmed by tests/unit/gpu/test_engine_cpp_roundtrip.py
     failing with KRUNCH_CPP_GRAPH=1.
 
     Fix path: either expose a separate `capture_layer_graph` +
@@ -784,7 +784,7 @@ def forward_stepped_batched(weights: dict, last_tokens, state):
     decoded token. Returns logits [B, V]. Mutates state in place.
 
     Bit-identical per-chunk to running forward_stepped sequentially
-    on each chunk (verified via tests/gpu/test_batched_stepped.py).
+    on each chunk (verified via tests/unit/gpu/test_batched_stepped.py).
 
     W8A8 dispatch: when bundle has `w8a8_int8` (set by init_weights
     when KRUNCH_INT8_W8A8=1), uses the W8A8 layer step. Required for

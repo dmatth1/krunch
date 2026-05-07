@@ -1,4 +1,4 @@
-"""Skip the whole tests/gpu/ tree when pytest is run without a GPU.
+"""Skip the whole tests/unit/gpu/ tree when pytest is run without a GPU.
 
 These scripts can also be invoked directly (`python test_X.py`) inside
 the published Docker image — that path doesn't go through pytest and is
