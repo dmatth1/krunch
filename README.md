@@ -33,7 +33,7 @@ whatever batch system you already use. `krunch plan` emits a
 ready-to-run artifact for the target you pick.
 
 ```bash
-# Compress (AWS Batch — only target shipped today)
+# Compress
 krunch plan --target aws-batch --mode compress \
     --source s3://… --dest s3://… --workers 16 > compress.json
 
