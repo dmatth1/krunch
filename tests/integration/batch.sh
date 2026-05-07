@@ -204,52 +204,35 @@ submit_pair() {
     return 0
   fi
 
-  # AWS CLI's --cli-input-json file:/// requires a real path
-  # (file:///dev/stdin parses unreliably across CLI versions). Stage
-  # each spec to a temp file.
-  local main_spec finalize_spec
-  main_spec=$(mktemp)
-  finalize_spec=$(mktemp)
-  # AWS Batch requires arrayProperties.size >= 2. For workers=1 we
-  # have to submit as a non-array job and replace the Ref:: array-
-  # index substitution with a literal "0". This IS a real AWS Batch
-  # API limitation that real-user tooling has to work around.
-  if [[ $WORKERS -eq 1 ]]; then
-    jq -c '.main
-              | del(.arrayProperties)
-              | .containerOverrides.environment |= map(
-                  if .name == "KRUNCH_PART_INDEX" then .value = "0" else . end)' \
-        "$plan_json" > "$main_spec"
-  else
-    jq -c '.main' "$plan_json" > "$main_spec"
-  fi
-  jq -c '.finalize' "$plan_json" > "$finalize_spec"
-
-  # Orchestrator-specific args (queue + JD) come from CFN outputs and
-  # are passed via aws-CLI flags — the rendered JSON stays
-  # orchestrator-agnostic. AWS CLI merges --job-queue / --job-definition
-  # / --depends-on into the spec at submit time.
+  # Submit using the SAME incantation the deploy/aws-cdk/README
+  # documents to customers — pipe each half through `aws batch
+  # submit-job --cli-input-json file:///dev/stdin`, supplying the
+  # orchestrator-specific args (queue, job-definition, depends-on)
+  # via aws-CLI flags. krunch plan emits a submission-ready spec for
+  # any worker count (workers=1 is handled inside plan_cli, not here).
   local main_id finalize_id
-  main_id=$(aws batch submit-job --region "$REGION" \
-              --cli-input-json "file://${main_spec}" \
-              --job-queue "$QUEUE" --job-definition "$jd" \
-              --query jobId --output text)
+  main_id=$(jq -c '.main' "$plan_json" \
+              | aws batch submit-job --region "$REGION" \
+                  --cli-input-json file:///dev/stdin \
+                  --job-queue "$QUEUE" --job-definition "$jd" \
+                  --query jobId --output text)
   if [[ -z $main_id || $main_id == None ]]; then
     echo "FAIL ${mode} submit-job returned no jobId; spec was:" >&2
-    cat "$main_spec" >&2
+    jq '.main' "$plan_json" >&2
     return 1
   fi
   echo "  ${mode} array submitted: ${main_id}" >&2
   poll_job "$main_id" "${mode}-array" >&2 || return 1
 
-  finalize_id=$(aws batch submit-job --region "$REGION" \
-                  --cli-input-json "file://${finalize_spec}" \
-                  --job-queue "$QUEUE" --job-definition "$FINALIZE_JD" \
-                  --depends-on "jobId=${main_id},type=SEQUENTIAL" \
-                  --query jobId --output text)
+  finalize_id=$(jq -c '.finalize' "$plan_json" \
+                  | aws batch submit-job --region "$REGION" \
+                      --cli-input-json file:///dev/stdin \
+                      --job-queue "$QUEUE" --job-definition "$FINALIZE_JD" \
+                      --depends-on "jobId=${main_id},type=SEQUENTIAL" \
+                      --query jobId --output text)
   if [[ -z $finalize_id || $finalize_id == None ]]; then
     echo "FAIL ${mode} finalize submit-job returned no jobId; spec was:" >&2
-    cat "$finalize_spec" >&2
+    jq '.finalize' "$plan_json" >&2
     return 1
   fi
   echo "  ${mode} finalize submitted: ${finalize_id}" >&2
@@ -257,7 +240,7 @@ submit_pair() {
 
   # Expose the array/main job id to the caller for post-run log parsing.
   LAST_MAIN_ID=$main_id
-  rm -f "$plan_json" "$main_spec" "$finalize_spec"
+  rm -f "$plan_json"
 }
 
 # ---------------------------------------------------------------------------

@@ -64,6 +64,7 @@ def main(argv=None):
     }
     try:
         rendered = krunch_plan.render(args.target, ctx)
+        rendered = _post_process(args.target, args.workers, rendered)
         krunch_plan.validate(args.target, rendered)
     except ValueError as e:
         print(f"plan render failed: {e}", file=sys.stderr)
@@ -74,6 +75,30 @@ def main(argv=None):
         return 0
     sys.stdout.write(rendered)
     return 0
+
+
+def _post_process(target: str, workers: int, rendered: str) -> str:
+    """Apply target-specific fixups to the rendered spec so it's
+    submission-ready as-is (user shouldn't have to jq-massage the
+    output to work around orchestrator quirks).
+
+    Currently only one fixup: AWS Batch rejects `arrayProperties.size
+    < 2` ("Array Job size must be greater than 1"). For workers=1 we
+    emit a non-array job by dropping `arrayProperties` and replacing
+    the `Ref::AWS_BATCH_JOB_ARRAY_INDEX` placeholder (which only
+    substitutes inside array-job submissions) with the literal
+    string `"0"`."""
+    if target != "aws-batch" or workers != 1:
+        return rendered
+    import json
+    spec = json.loads(rendered)
+    main = spec.get("main") or {}
+    main.pop("arrayProperties", None)
+    for env in main.get("containerOverrides", {}).get("environment", []):
+        if env.get("name") == "KRUNCH_PART_INDEX" \
+                and env.get("value", "").startswith("Ref::"):
+            env["value"] = "0"
+    return json.dumps(spec, indent=2)
 
 
 if __name__ == "__main__":
