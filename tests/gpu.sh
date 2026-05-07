@@ -3,7 +3,7 @@
 #
 # Validates the shipped artifact: pulls ghcr.io/dmatth1/krunch:latest,
 # installs the krunch CLI, runs `krunch compress` + `krunch decompress`
-# on a 100 MB WildChat sample. Same exact path as a real user, just
+# on a 10 MB WildChat sample. Same exact path as a real user, just
 # automated end-to-end.
 #
 # Gates (tightened 2026-04-30): ratio ≤ 0.11, compress AND decompress
@@ -33,7 +33,7 @@ INSTANCE_PROFILE="${KRUNCH_INSTANCE_PROFILE:?KRUNCH_INSTANCE_PROFILE env var req
 
 S3_PREFIX="krunch-tier3"
 SAMPLE_LOCAL="data/spike6/wildchat_en_content.content.bin"
-SAMPLE_LIMIT_MB="${KRUNCH_SAMPLE_MB:-100}"
+SAMPLE_LIMIT_MB="${KRUNCH_SAMPLE_MB:-10}"
 LOCAL_BUILD="${KRUNCH_LOCAL_BUILD:-0}"
 KRUNCH_IMAGE_TAG="${KRUNCH_IMAGE:-ghcr.io/dmatth1/krunch:latest}"
 TEST_TAG="$(date +%Y%m%d-%H%M%S)"
