@@ -42,41 +42,41 @@ Stack outputs (read by `krunch plan --target aws-batch`):
 
 ## Submit a compression job
 
-After deploy, render a job spec with `krunch plan` and submit it via
-the AWS CLI. `krunch plan` produces two specs (`main` for the array
-job, `finalize` for the stitcher) — submit `main` first, then
-`finalize` with `dependsOn` on the array job.
+After deploy, render a job spec with `krunch plan` and submit via the
+AWS CLI. `krunch plan` produces two specs (`main` for the array job,
+`finalize` for the stitcher) — submit `main` first, then `finalize`
+with `dependsOn` on the array job.
+
+`krunch plan --target aws-batch` auto-resolves the `--queue`,
+`--job-definition`, and `--finalize-job-definition` ARNs from the
+deployed stack's CloudFormation outputs (default stack name:
+`KrunchStack`; override with `--stack-name`). `--input-len` auto-
+resolves from `--source` when it's an S3 URL.
 
 ```bash
-INPUT_LEN=$(aws s3api head-object \
-    --bucket <your-bucket> --key logs/data.jsonl --query ContentLength --output text)
-
-krunch plan --target aws-batch \
-  --mode compress \
+krunch plan --target aws-batch --mode compress \
   --source s3://<your-bucket>/logs/data.jsonl \
   --dest   s3://<your-bucket>/logs/data.krunch \
-  --workers 8 \
-  --input-len $INPUT_LEN \
-  --queue $(aws cloudformation describe-stacks --stack-name KrunchStack \
-              --query 'Stacks[0].Outputs[?OutputKey==`JobQueueArn`].OutputValue' --output text) \
-  --job-definition $(aws cloudformation describe-stacks --stack-name KrunchStack \
-              --query 'Stacks[0].Outputs[?OutputKey==`CompressJobDefOutput`].OutputValue' --output text) \
-  > job.json
+  --workers 4 > job.json
 
-ARRAY_ID=$(jq .main job.json | aws batch submit-job --cli-input-json file:///dev/stdin \
-            --query jobId --output text)
+ARRAY_ID=$(jq .main job.json | aws batch submit-job \
+    --cli-input-json file:///dev/stdin --query jobId --output text)
 
-jq .finalize job.json | aws batch submit-job --cli-input-json file:///dev/stdin \
-  --depends-on jobId=$ARRAY_ID,type=SEQUENTIAL \
-  --job-definition $(aws cloudformation describe-stacks --stack-name KrunchStack \
-              --query 'Stacks[0].Outputs[?OutputKey==`FinalizeJobDefOutput`].OutputValue' --output text)
+jq .finalize job.json | aws batch submit-job \
+    --cli-input-json file:///dev/stdin \
+    --depends-on jobId=$ARRAY_ID,type=SEQUENTIAL
 ```
 
-For decompress, swap `--mode decompress` and use `DecompressJobDefOutput`.
-`--workers` controls the array size (parallel GPU instances). The
-compute environment caps total parallelism via `maxWorkers` (default 4 —
-matches the fresh-account 16 vCPU On-Demand G+VT quota in us-east-1;
-override higher only if your AWS quota allows).
+For decompress, swap `--mode decompress`. `--workers` controls the
+array size (parallel GPU instances). The compute environment caps
+total parallelism via `maxWorkers` (default 4 — matches the fresh-
+account 16 vCPU On-Demand G+VT quota in us-east-1; override higher
+only if your AWS quota allows).
+
+If your stack has a non-default name, pass `--stack-name <name>`. To
+override individual ARNs (e.g. point at a different queue), pass
+`--queue <arn>` / `--job-definition <arn>` / `--finalize-job-definition
+<arn>` explicitly — those skip auto-resolution.
 
 See `tests/integration/batch.sh` at the repo root for a full working end-to-end
 example that compresses + decompresses + verifies byte-exact roundtrip

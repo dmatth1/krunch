@@ -182,12 +182,14 @@ submit_pair() {
   # Invoke `krunch plan` via the host wrapper — the same entry point a real
   # user gets from install.sh. Bypassing it would skip arg-passthrough +
   # env-handling that the wrapper does.
+  # `krunch plan` auto-resolves --queue / --job-definition /
+  # --finalize-job-definition from the deployed CDK stack outputs when
+  # --target=aws-batch — no need to thread them in here.
   KRUNCH_IMAGE="$KRUNCH_IMAGE_TAG" scripts/krunch plan \
     --target aws-batch --mode "$mode" \
     --source "$input_url" --dest "$output_url" \
     --workers "$WORKERS" --input-len "$input_len" \
     --image "$KRUNCH_IMAGE_TAG" \
-    --queue "$QUEUE" --job-definition "$jd" \
     --run-id "${TEST_TAG}-${mode}" > "$plan_json"
 
   if [[ $DRY_RUN == 1 ]]; then
@@ -195,34 +197,23 @@ submit_pair() {
     echo "  [dry-run] .main env (would be submitted to ${jd##*/}):" >&2
     jq '.main.containerOverrides.environment' "$plan_json" >&2
     echo "  [dry-run] .finalize would submit with: " \
-         "--depends-on jobId=<main-id>,type=SEQUENTIAL " \
-         "--job-definition ${FINALIZE_JD##*/}" >&2
+         "--depends-on jobId=<main-id>,type=SEQUENTIAL" >&2
     echo "  [dry-run] .finalize env:" >&2
     jq '.finalize.containerOverrides.environment' "$plan_json" >&2
     rm -f "$plan_json"
     return 0
   fi
 
-  # AWS CLI's --cli-input-json file:/// requires a real path (file:///dev/stdin
-  # parses unreliably across CLI versions). Stage each spec to a temp file.
-  # Also strip containerOverrides.image — the published image template
-  # wrongly includes it; AWS Batch only accepts image at JobDefinition
-  # registration time, not per-submission. Template was fixed
-  # 2026-05-06 but the strip stays as defensive cover for older images.
+  # AWS CLI's --cli-input-json file:/// requires a real path
+  # (file:///dev/stdin parses unreliably across CLI versions). Stage
+  # each spec to a temp file.
   local main_spec finalize_spec
   main_spec=$(mktemp)
   finalize_spec=$(mktemp)
-  # AWS Batch requires arrayProperties.size >= 2. For workers=1 we have
-  # to submit as a non-array job and replace the Ref:: array-index
-  # substitution with a literal "0". This IS a real AWS Batch API
-  # limitation that real-user tooling has to work around.
-  #
-  # We also override `finalize.jobDefinition` to the FinalizeJobDef ARN
-  # because `krunch plan` emits the same JD for both main and finalize
-  # — the rendered finalize block needs the CPU-only finalize JD, not
-  # the GPU compress/decompress JD. Real-user tooling has to do this
-  # mapping too. (Plan template could grow a --finalize-job-definition
-  # flag; v1 backlog.)
+  # AWS Batch requires arrayProperties.size >= 2. For workers=1 we
+  # have to submit as a non-array job and replace the Ref:: array-
+  # index substitution with a literal "0". This IS a real AWS Batch
+  # API limitation that real-user tooling has to work around.
   if [[ $WORKERS -eq 1 ]]; then
     jq -c '.main
               | del(.arrayProperties)
@@ -232,7 +223,7 @@ submit_pair() {
   else
     jq -c '.main' "$plan_json" > "$main_spec"
   fi
-  jq -c '.finalize | .jobDefinition = "'"$FINALIZE_JD"'"' "$plan_json" > "$finalize_spec"
+  jq -c '.finalize' "$plan_json" > "$finalize_spec"
 
   local main_id finalize_id
   main_id=$(aws batch submit-job --region "$REGION" \
