@@ -1,12 +1,8 @@
 """engine.compress_chunks(list) must produce the same per-chunk bytes
 as [engine.compress_chunk(c) for c in list]. The batch path tokenizes
 all chunks in one Rust call (faster) but must not change the output.
-
-Workaround for docs/Bugs.md #1: forces W8A8 off so small chunks roundtrip
-on T4. Drop once the W8A8 sm_75 path is fixed.
 """
 import os
-os.environ["KRUNCH_INT8_W8A8"] = "0"
 os.environ.setdefault("KRUNCH_DETERMINISTIC_MATMUL", "1")
 os.environ.setdefault("RWKV_CUDA_ON", "1")
 
