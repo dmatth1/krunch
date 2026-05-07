@@ -1,7 +1,7 @@
 # Krunch
 
 > **Krunch is a neural codec for text.** It works on any NVIDIA GPU
-> and beats traditional compression algorithms (like `zstd -22 --long`) by 20-40%
+> and beats traditional compression algorithms (like zstd-22) by 20-40%
 > on text-heavy data (logs, chat, support tickets, code).
 >
 > Run it on one machine or parallelize across a cluster with any batch
@@ -73,10 +73,9 @@ amortizes to zero on warm fleets and on large jobs.*
 
 ## Ratio comparisons
 
-Compressed-size ratio (smaller = better) on a single A10G g5.xlarge.
-Krunch numbers come from `tests/integration/batch.sh` runs; zstd
-numbers are reproducible via `zstd -22 --long=27 -k <input>` (max
-level + 128 MB window — the de-facto modern strong-text baseline).
+Compressed-size ratio (smaller = better) on a single A10G g5.xlarge,
+1 MB chunks. Other corpora are pending; ts_zip hasn't been benched
+locally yet.
 
 | corpus | krunch | ts_zip | zstd -22 --long | krunch vs zstd |
 |---|---|---|---|---|
@@ -85,10 +84,6 @@ level + 128 MB window — the de-facto modern strong-text baseline).
 | enwik9 | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
 | nginx logs | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
 | The Stack (Python) | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
-
-Reproduce locally with `scripts/bench_ratio.sh <input.bin>` — runs
-zstd at max level on the same input, prints both ratios + the
-percentage advantage.
 
 ## What's inside the Docker image
 

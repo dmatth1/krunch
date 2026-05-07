@@ -14,14 +14,10 @@ import os
 # afterward has no effect.
 os.environ.setdefault("KRUNCH_DETERMINISTIC_MATMUL", "1")
 
-# Auto-disable sm_80+-only kernels on sm_75 and older (e.g. T4):
-#  - det_matmul_tc_async / det_matmul_tc_3way_async have empty kernel
-#    bodies under #if __CUDA_ARCH__ >= 800 (invoking them on sm_75
-#    leaves outputs uninitialized → broken roundtrip).
-#  - W8A8 layer step uses int8 WMMA which is sm_80+-only; on sm_75 the
-#    kernel still runs but produces an asymmetry between encoder and
-#    decoder that breaks AC roundtrip on small chunks (was Bugs.md #1
-#    and #4 — open until 2026-05-07; closed by this auto-disable).
+# Auto-disable sm_80+ kernels (cp.async WMMA) on sm_75 and older (e.g. T4).
+# Both det_matmul_tc_async and det_matmul_tc_3way_async have empty kernel
+# bodies under #if __CUDA_ARCH__ >= 800 — invoking them on sm_75 leaves
+# outputs uninitialized (garbage from at::empty), breaking the roundtrip.
 # Must run before krunch_ac_cuda import so the C++ statics read correctly.
 try:
     import torch as _torch
@@ -30,7 +26,6 @@ try:
         if _sm < 8:
             os.environ.setdefault("KRUNCH_HEAD_ASYNC", "0")
             os.environ.setdefault("KRUNCH_3WAY_ASYNC", "0")
-            os.environ.setdefault("KRUNCH_INT8_W8A8", "0")
     del _torch, _sm
 except Exception:
     pass
