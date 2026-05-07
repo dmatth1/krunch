@@ -16,8 +16,8 @@
 // roundtrip.
 //
 // Drift vs `rwkv::wkv_forward` is fp16-noise-level on the boundary
-// between fp32 inner-loop and fp16-cast at the layer output (verified
-// by scripts/test_own_wkv.py); both paths use the same RWKV-4 math.
+// between fp32 inner-loop and fp16-cast at the layer output; both
+// paths use the same RWKV-4 math.
 // AC encoder + decoder both must run with the same WKV implementation
 // or roundtrip breaks — toggle via KRUNCH_OWN_WKV=1 on both sides.
 

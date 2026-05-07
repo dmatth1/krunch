@@ -34,7 +34,7 @@ def _matmul(x, w, output_dtype=None):
     `torch.ops.rwkv.gemm_fp16_cublas` is opaque to dynamo and triggers
     FakeTensor errors during graph trace). Use this when wrapping the
     forward in torch.compile / torch.cuda.graph. Drift implications
-    are measured separately by bench_forward.py.
+    are measured separately by tests/gpu/bench_forward.py.
     """
     import os
     if output_dtype is None:

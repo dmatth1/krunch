@@ -9,7 +9,7 @@
 // runs on 1 SM out of 40. v2 spreads the 768 channels across 24
 // blocks so 24 SMs read HBM in parallel.
 //
-// Numerical contract: matches scripts/rwkv4_step_ref.py::_layer_step
+// Numerical contract: matches tests/gpu/rwkv4_step_ref.py::_layer_step
 // within fp16 noise (verified).
 
 #include <cuda_runtime.h>

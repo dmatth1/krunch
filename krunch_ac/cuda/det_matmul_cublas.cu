@@ -17,7 +17,7 @@
 // Fixed algo for layer matmuls. CUBLAS_GEMM_ALGO0_TENSOR_OP picks
 // a 128x128x32 tile schedule that fits our M (any), K=768, N∈{768, 3072}.
 // Verified bit-stable across M∈{1, 16, 64, 1024} — see
-// scripts/test_cublas_pinned.py.
+// tests/gpu/test_cublas_pinned.py.
 //
 // For the head matmul (K=768, N=50277), N isn't a clean multiple
 // of any common tile size — cuBLAS pads internally; output is still
