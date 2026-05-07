@@ -2,6 +2,7 @@ import * as cdk from "aws-cdk-lib";
 import * as ec2 from "aws-cdk-lib/aws-ec2";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as batch from "aws-cdk-lib/aws-batch";
+import * as logs from "aws-cdk-lib/aws-logs";
 import * as s3 from "aws-cdk-lib/aws-s3";
 import { Construct } from "constructs";
 
@@ -11,10 +12,26 @@ export interface KrunchStackProps extends cdk.StackProps {
    * G+VT instances in us-east-1; 4× g5.xlarge = 16 vCPU). Override
    * higher only if your AWS quota allows. */
   maxWorkers?: number;
-  /** GPU instance type. Default: g5.xlarge (A10G, 16 GB VRAM) */
+  /** GPU instance type. Default: g5.xlarge (A10G, 16 GB VRAM).
+   * If overriding, also set `vcpusPerInstance` to match (the default
+   * 4 is correct for g5.xlarge / g6.xlarge / g6e.xlarge). */
   instanceType?: ec2.InstanceType;
+  /** vCPUs per instance — used for ASG cap math. Default: 4 (xlarge). */
+  vcpusPerInstance?: number;
   /** Docker image. Default: ghcr.io/dmatth1/krunch:latest */
   image?: string;
+  /**
+   * Optional pre-baked AMI (with the krunch image already pulled) to
+   * eliminate the ~3.5 GB image-pull tax on cold-start. The AMI must
+   * be Amazon-Linux-2 / ECS-AL2023-NVIDIA compatible (so the ECS
+   * agent registers with the Batch CE) and must have the krunch
+   * image present in the docker cache at AMI-build time.
+   *
+   * If unset, Batch picks the latest ECS GPU AMI and pulls the image
+   * on first run. See the V1_PLAN backlog item "Custom AMI with
+   * pre-pulled image".
+   */
+  imageId?: string;
   /**
    * S3 bucket for temp parts + compressed output.
    * Created fresh if not provided.
@@ -23,9 +40,18 @@ export interface KrunchStackProps extends cdk.StackProps {
   /**
    * Use spot instances. Default: true.
    * Set to false for on-demand (higher cost, no interruption risk).
-   * Both queues are always created; this controls the default priority.
+   * Both compute environments are always created; this controls the
+   * default priority order in the queue. Disable a CE entirely via
+   * `aws batch update-compute-environment --state DISABLED` if spot
+   * capacity is reliably unavailable in your region.
    */
   spot?: boolean;
+  /**
+   * CloudWatch retention for `/aws/batch/job` logs. Default: 30 days
+   * (cuts indefinite log accumulation). Set to `INFINITE` only if
+   * compliance/audit requires it.
+   */
+  logRetention?: logs.RetentionDays;
 }
 
 /**
@@ -47,10 +73,10 @@ export interface KrunchStackProps extends cdk.StackProps {
  *   # Then: krunch plan --target aws-batch ...  (see deploy/aws-cdk/README.md)
  *
  * Cold-start note:
- *   First job on a fresh compute environment takes ~15 min (EC2 launch +
- *   Docker image pull). Subsequent jobs on warm instances: ~1-2 min.
- *   To eliminate cold pull time, bake the image into a custom AMI and
- *   set the imageId on the compute environment.
+ *   First job on a fresh CE: ~13.5 min wall (T4 measurement 2026-05-07)
+ *   = EC2 launch + 3.5 GB image pull + model load + WKV-kernel JIT.
+ *   Subsequent jobs on warm instances: ~30 s. Pass `imageId` to use a
+ *   pre-baked AMI and skip the image-pull portion.
  */
 export class KrunchStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: KrunchStackProps = {}) {
@@ -60,8 +86,15 @@ export class KrunchStack extends cdk.Stack {
     const instanceType =
       props.instanceType ??
       ec2.InstanceType.of(ec2.InstanceClass.G5, ec2.InstanceSize.XLARGE);
+    const vcpusPerInstance = props.vcpusPerInstance ?? 4;
     const image = props.image ?? "ghcr.io/dmatth1/krunch:latest";
     const preferSpot = props.spot ?? true;
+    const logRetention = props.logRetention ?? logs.RetentionDays.ONE_MONTH;
+
+    // Stack-level tags propagate to all taggable resources for cost
+    // allocation + identification in the Resource Groups console.
+    cdk.Tags.of(this).add("Project", "krunch");
+    cdk.Tags.of(this).add("ManagedBy", "cdk");
 
     // ---------------------------------------------------------------------------
     // VPC — default VPC, no NAT gateway needed (Batch uses public subnets)
@@ -131,12 +164,11 @@ export class KrunchStack extends cdk.Stack {
     const sharedResources = {
       instanceTypes: [instanceType.toString()],
       minvCpus: 0,
-      maxvCpus: maxWorkers * 4, // g5.xlarge = 4 vCPUs
+      maxvCpus: maxWorkers * vcpusPerInstance,
       subnets: vpc.publicSubnets.map((s) => s.subnetId),
       securityGroupIds: [sg.securityGroupId],
       instanceRole: instanceProfile.attrArn,
-      // Override imageId with a custom AMI (pre-pulled image) to eliminate cold-pull time
-      // imageId: "ami-0xxxxxxxxxxxxxxxxx",
+      ...(props.imageId ? { imageId: props.imageId } : {}),
     };
 
     // ---------------------------------------------------------------------------
@@ -180,6 +212,21 @@ export class KrunchStack extends cdk.Stack {
       ],
     });
 
+    // Cap CloudWatch retention on the Batch job log group. AWS Batch
+    // creates `/aws/batch/job` lazily on first task; without explicit
+    // retention it accumulates forever. We use `LogRetention` (a
+    // Lambda-backed custom resource that calls PutRetentionPolicy)
+    // rather than `new LogGroup(...)` because the log group may
+    // already exist from prior Batch activity in the account — and
+    // `LogGroup` creation would fail in that case. `LogRetention`
+    // is idempotent and works whether the log group exists yet or
+    // not, and survives `cdk destroy` (it just stops managing
+    // retention; the group itself is owned by Batch).
+    new logs.LogRetention(this, "BatchJobLogRetention", {
+      logGroupName: "/aws/batch/job",
+      retention: logRetention,
+    });
+
     // ---------------------------------------------------------------------------
     // Job definitions
     // ---------------------------------------------------------------------------
@@ -211,7 +258,6 @@ export class KrunchStack extends cdk.Stack {
       containerProperties: containerProps,
       retryStrategy: { attempts: 2 },  // retry once on spot interruption
       timeout: { attemptDurationSeconds: 3600 },
-      tags: { rev: "v2-mem14336" },
     });
 
     const decompressJobDef = new batch.CfnJobDefinition(this, "DecompressJobDef", {
@@ -219,7 +265,6 @@ export class KrunchStack extends cdk.Stack {
       containerProperties: containerProps,
       retryStrategy: { attempts: 2 },
       timeout: { attemptDurationSeconds: 3600 },
-      tags: { rev: "v2-mem14336" },
     });
 
     // Finalize job: CPU only — stitches partial blobs into the final
