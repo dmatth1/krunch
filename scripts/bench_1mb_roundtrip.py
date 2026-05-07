@@ -31,8 +31,17 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--sample", required=True, help="Path to WildChat binary sample")
     ap.add_argument("--mb", type=float, default=1.0, help="MB to read from sample")
-    ap.add_argument("--warmup", type=int, default=1, help="Warmup compress+decompress rounds")
+    # Warmup amortizes JIT + CUDA-graph capture + cuBLAS handle init etc.
+    # Production CLI pays these once at engine.load() and forever after; the
+    # bench needs an explicit warmup pass to match that steady state.
+    # Don't pass --warmup 0 unless you specifically want cold-start numbers.
+    ap.add_argument("--warmup", type=int, default=1, help="Warmup compress+decompress rounds (default 1 — match production steady state)")
     args = ap.parse_args()
+    if args.warmup < 1:
+        print("WARNING: --warmup 0 measures cold-start (JIT + cuBLAS init + "
+              "graph capture) cost as part of throughput. Production never "
+              "pays this. Use --warmup 1 for production-comparable numbers.",
+              flush=True)
 
     n_bytes = int(args.mb * 1024 * 1024)
     with open(args.sample, "rb") as f:
