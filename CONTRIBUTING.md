@@ -1,24 +1,28 @@
 # Contributing
 
-Two areas are the most useful right now.
+Two areas where contributions are most useful right now.
 
-## 1. Batch-target validation
+## 1. Batch-system support
 
-`krunch plan` emits artifacts for seven batch targets. Only **AWS Batch**
-has been run end-to-end. The rest render + schema-validate in CI but
-haven't been launched against a real orchestrator. If you run krunch
-on one of these and hit a bug in the rendered artifact, file an issue
-or PR with the fix and a small repro.
+AWS Batch is the only orchestrator shipped today. We'd like to support
+the rest. Each row below means: writing a Jinja template under
+`krunch/plan/templates/`, registering it in `krunch/plan/__init__.py`,
+and validating it end-to-end against the real orchestrator.
 
-| Target | Template renders | Schema validates | End-to-end run |
-|---|---|---|---|
-| AWS Batch | ✅ | ✅ | ✅ |
-| Kubernetes | ✅ | ✅ | ❌ |
-| Modal | ✅ | ✅ | ❌ |
-| Ray | ✅ | ✅ | ❌ |
-| Slurm | ✅ | ✅ | ❌ |
-| GCP Batch | ✅ | ✅ | ❌ |
-| Local (single host) | ✅ | ✅ | ❌ |
+| Target | Status |
+|---|---|
+| AWS Batch | ✅ shipped, end-to-end validated |
+| Kubernetes | ❌ wanted |
+| Modal | ❌ wanted |
+| Ray | ❌ wanted |
+| Slurm | ❌ wanted |
+| GCP Batch | ❌ wanted |
+| Local (single host) | ❌ wanted |
+
+The worker contract is documented in `README.md` ("Adding a new batch
+target") — `krunch/job.py` reads a small set of env vars
+(`KRUNCH_INPUT_URL`, `KRUNCH_PART_INDEX`, `KRUNCH_PART_COUNT`, …) that
+any framework can inject.
 
 ## 2. Compress / decompress speed and ratio
 
@@ -27,5 +31,7 @@ WKV / det-matmul / W8A8 paths are the hot spots; ratio is bounded by
 the model, so improvements come from a better predictor or better
 context handling. Microbench against the production kernel on the
 production hardware before claiming an X× projection.
+
+---
 
 Open a PR; CI runs unit tests + CDK type-check. License is Apache-2.0.

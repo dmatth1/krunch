@@ -8,8 +8,8 @@ Commands:
   krunch warmup                                    Prime the local cache volume
   krunch plan        --target TARGET --source URL --dest URL --workers N
                                                    Render a runnable artifact for any
-                                                   batch system (aws-batch, k8s, modal,
-                                                   ray, slurm, gcp-batch, local)
+                                                   batch system (aws-batch only;
+                                                   others planned)
 
 `compress` / `decompress` shell out to Docker. Default image is
 ghcr.io/dmatth1/krunch:latest; override with KRUNCH_IMAGE env var.
@@ -229,10 +229,9 @@ def main():
     # plan — emit a runnable artifact for the user's batch system
     p_plan = sub.add_parser(
         "plan",
-        help="Render a runnable artifact for any batch system (aws-batch, k8s, modal, ray, slurm, gcp-batch, local)")
+        help="Render a runnable artifact for AWS Batch (k8s/Modal/Ray/Slurm/GCP Batch planned — see CONTRIBUTING.md)")
     p_plan.add_argument("--target", required=True,
-                        choices=["aws-batch", "k8s", "modal", "ray",
-                                 "slurm", "gcp-batch", "local"])
+                        choices=["aws-batch"])
     p_plan.add_argument("--mode", required=True,
                         choices=["compress", "decompress"],
                         help="Whether workers compress or decompress")

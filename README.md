@@ -40,22 +40,14 @@ krunch plan --target aws-batch --mode compress \
 # Decompress
 krunch plan --target aws-batch --mode decompress \
     --source s3://… --dest s3://… --workers 16 > decompress.json
-
-# Other targets — same flags (template-validated; not yet run end-to-end)
-krunch plan --target k8s    --mode compress --source … --dest … --workers 16 > job.yaml
-krunch plan --target modal  --mode compress --source … --dest … --workers 16 > run.py
-krunch plan --target ray    --mode compress --source … --dest … --workers 16 > run.py
-krunch plan --target slurm  --mode compress --source … --dest … --workers 16 > run.sbatch
 ```
 
-> Only the AWS Batch path is end-to-end validated today. Templates for
-> k8s / Modal / Ray / Slurm / GCP Batch render + schema-validate in CI
-> but haven't been launched against a real orchestrator. See
-> [CONTRIBUTING.md](CONTRIBUTING.md) — contributions welcome here.
+Then submit with your own tooling and credentials:
+`aws batch submit-job --cli-input-json file://compress.json`.
 
-Then run it with your own tooling and credentials:
-`aws batch submit-job --cli-input-json file://compress.json`,
-`kubectl apply -f job.yaml`, `modal run run.py`, etc.
+> AWS Batch is the only target shipped today. k8s / Modal / Ray /
+> Slurm / GCP Batch / local are planned — see
+> [CONTRIBUTING.md](CONTRIBUTING.md).
 
 See [`deploy/aws-cdk/`](deploy/aws-cdk/) for a working AWS Batch
 reference stack you can `cdk deploy` as-is.

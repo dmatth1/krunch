@@ -32,42 +32,14 @@ COMMON_CONTEXT_KEYS = (
 )
 
 # Targets shipped at v1. Each must have <name>.<ext>.j2 in
-# krunch/plan/templates/.
+# krunch/plan/templates/. AWS Batch is the only target shipped today;
+# k8s / Modal / Ray / Slurm / GCP Batch / local are planned (see
+# CONTRIBUTING.md).
 TARGETS = {
     "aws-batch": {
         "ext": "json",
         "template": "aws_batch.json.j2",
         "validator": "_validate_json",
-    },
-    "k8s": {
-        "ext": "yaml",
-        "template": "k8s.yaml.j2",
-        "validator": "_validate_yaml",
-    },
-    "modal": {
-        "ext": "py",
-        "template": "modal.py.j2",
-        "validator": "_validate_py",
-    },
-    "ray": {
-        "ext": "py",
-        "template": "ray.py.j2",
-        "validator": "_validate_py",
-    },
-    "slurm": {
-        "ext": "sbatch",
-        "template": "slurm.sbatch.j2",
-        "validator": "_validate_text",
-    },
-    "gcp-batch": {
-        "ext": "json",
-        "template": "gcp_batch.json.j2",
-        "validator": "_validate_json",
-    },
-    "local": {
-        "ext": "sh",
-        "template": "local.sh.j2",
-        "validator": "_validate_text",
     },
 }
 

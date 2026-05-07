@@ -22,7 +22,6 @@ CTX_BASE = {
     "gpus":              1,
     "memory_mb":         16384,
     "timeout_s":         3600,
-    "slurm_time":        "01:00:00",
     "run_id":            "test-run",
 }
 

@@ -64,7 +64,6 @@ def main(argv=None):
         "gpus":              args.gpus,
         "memory_mb":         args.memory_mb,
         "timeout_s":         args.timeout_s,
-        "slurm_time":        "01:00:00",
         "run_id":            run_id,
     }
     try:
