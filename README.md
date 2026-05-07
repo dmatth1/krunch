@@ -61,8 +61,9 @@ we don't have a template for in ~30 lines.
 See `examples/` for full reference deployments (including an AWS
 Batch CDK stack you can deploy as-is).
 
-> `krunch submit` is deprecated and will be removed in a future
-> release; use `krunch plan --target aws-batch` instead.
+See `tests/batch.sh` for a working end-to-end example
+(compress + decompress + byte-exact roundtrip on a 100 MB WildChat
+sample via AWS Batch).
 
 ## What's inside the Docker image
 
@@ -77,8 +78,26 @@ Batch CDK stack you can deploy as-is).
   context.
 
 Architecture validated on real GPU: ratio **0.111** on WildChat-English
-(vs zstd-22's 0.167 — a 33% reduction), compress throughput **≥ 800
-KB/s** on A10G fp16, byte-exact decompression.
+(vs zstd-22's 0.167 — a 33% reduction) and byte-exact decompression.
+
+### Tier-3 throughput gate status (A10G g5.xlarge, 2026-05-06)
+
+W8A8 (int8 weights + activations, cp.async double-buffered K) is the
+production codec; old fp16 path remains via `KRUNCH_INT8_W8A8=0`.
+
+| Gate | Status |
+|---|---|
+| Byte-exact roundtrip | ✅ |
+| Compress ≥ 200 KB/s | ⚠ 198.5 (1 MB) — 0.75% short |
+| Decompress ≥ 200 KB/s | ❌ 75 (10 MB B=161) — 2.7× short |
+| Ratio ≤ 0.11 | ❌ 0.116 — 5% short |
+
+Phase 2A (W8A8) lifted compress 1.24× and decompress +7-26% (B-saturated
+regime) over the fp16 baseline. Remaining work is tracked in
+`docs/TIER_3_OPTIMIZATION.md`: A3 (`torch.compile` spike) + Phase 2B
+(CUTLASS StreamK `kDeterministic`) for compress, Phase 3 (adaptive bias
+head, Nacrith pattern) for ratio, Phase 2C (custom persistent fused
+kernel) for decompress.
 
 ## Ratio comparisons
 
