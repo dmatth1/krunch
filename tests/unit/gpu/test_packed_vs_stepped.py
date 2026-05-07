@@ -52,6 +52,19 @@ def test_packed_full_window_matches_stepped_sequence(weights):
             f"packed[{t}] != stepped[{TOKENS[t]}] — AC roundtrip would break here"
 
 
+def test_forward_packed_wrapper_matches_window(weights):
+    """`forward_packed(weights, ids, state)` is a thin wrapper around
+    `forward_packed_window(weights, ids, state, off=0, n=T)`. Confirm
+    the wrapper produces bit-identical output to the underlying call."""
+    state_a = cpp_path.fresh_state(weights)
+    state_b = cpp_path.fresh_state(weights)
+    input_t = torch.as_tensor(TOKENS, dtype=torch.long, device="cuda")
+    a = cpp_path.forward_packed(weights, input_t, state_a)
+    b = cpp_path.forward_packed_window(weights, input_t, state_b, off=0,
+                                        n=len(TOKENS))
+    assert torch.equal(a, b), "forward_packed diverged from forward_packed_window"
+
+
 def test_packed_window_offset_matches_stepped_resume(weights):
     """forward_packed_window(off=k) on existing state must equal
     forward_stepped through tokens[k:] from the same state. This is
