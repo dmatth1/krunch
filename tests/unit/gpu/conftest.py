@@ -8,7 +8,7 @@ Two things this conftest does:
    at top level and would crash the collector otherwise).
 
 2. Default `KRUNCH_INT8_W8A8=0` for every test in this directory.
-   Reason: Bugs.md #1 — small-chunk codec break on sm_75 with W8A8=1.
+   Reason: docs/Bugs.md #1 — small-chunk codec break on sm_75 with W8A8=1.
    Tests that explicitly want to exercise W8A8 dispatch toggle the
    var inside the test (and clear the init_weights cache).
 """

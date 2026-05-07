@@ -7,7 +7,7 @@ AC encoder emits bits in a different order. Symmetry contract is
 between batched-compress and batched-decompress: compressed-batched
 chunks must roundtrip byte-exact when decompressed by either path.
 
-Skipped on sm_75 — Bugs.md #4 (small-chunk roundtrip break in the
+Skipped on sm_75 — docs/Bugs.md #4 (small-chunk roundtrip break in the
 cross-chunk batched compress path on T4). Production cli.py never
 hits this code path.
 """
@@ -16,7 +16,7 @@ import torch
 
 pytestmark = pytest.mark.skipif(
     torch.cuda.get_device_properties(0).major < 8,
-    reason="Bugs.md #4: compress_chunks_batched broken on sm_75 small chunks",
+    reason="docs/Bugs.md #4: compress_chunks_batched broken on sm_75 small chunks",
 )
 
 

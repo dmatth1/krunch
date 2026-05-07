@@ -6,7 +6,7 @@ For each B from 2 to 4: compress B independent chunks, then run
 _decompress_chunks_batched_cpp on the encodings. Each recovered
 chunk must byte-match its input.
 
-W8A8 off (conftest default) — Bugs.md #1.
+W8A8 off (conftest default) — docs/Bugs.md #1.
 """
 import pytest
 
