@@ -97,9 +97,6 @@ parallelize.
   HF transformers' eval-mode fallback.
 - **constriction** arithmetic coder — turns the model's
   next-token distribution into a bitstream.
-- **1 MB chunks (default)** — independent across chunks, parallelizable; large
-  enough to amortize per-chunk overhead and give the model useful
-  context.
 
 ## Adding a new batch target
 
