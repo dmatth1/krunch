@@ -248,13 +248,10 @@ class InferenceEngine:
                                       tokens: list[int]) -> bytes:
         """Inner compress that takes pre-tokenized input. Used by
         compress_chunks (after batch-tokenize) and by compress_chunk
-        (after single tokenize). Behavior identical between paths."""
-        from krunch import cpp_path
+        (after single tokenize)."""
         if len(tokens) < 1:
             raise ValueError("chunk has no tokens after tokenization")
-        if cpp_path.cpp_path_enabled():
-            return self._compress_chunk_cpp(data, tokens)
-        return self._compress_chunk_legacy(data, tokens)
+        return self._compress_chunk_cpp(data, tokens)
 
     def compress_chunk(self, data: bytes) -> bytes:
         """
@@ -280,72 +277,6 @@ class InferenceEngine:
         text = data.decode("utf-8", errors="replace")
         tokens = self._tokenizer.encode(text).ids
         return self._compress_chunk_with_tokens(data, tokens)
-
-    def _compress_chunk_legacy(self, data: bytes,
-                                 tokens: list[int]) -> bytes:
-        """Legacy non-cpp_path compress (kept for benchmark comparisons;
-        cpp_path is the only correct GPU AC path). Refactored from the
-        body of compress_chunk in the D3 Phase 0b refactor."""
-        import torch
-        import krunch_ac_cuda
-        from krunch_ac.gpu_encode import probs_to_cdf_gpu
-
-        SEQ_BATCH = int(os.environ.get("KRUNCH_FORWARD_BATCH", 1024))
-        full_input = [BOS_TOKEN] + tokens[:-1]
-        tokens_arr_gpu = torch.as_tensor(tokens, dtype=torch.int32, device=self._device)
-
-        # Compile-and-cache probs_to_cdf_gpu once per process. Default mode
-        # (not reduce-overhead) — last batch in a chunk has variable shape,
-        # which is incompatible with reduce-overhead's CUDA graphs. Default
-        # mode still gets ~2× over eager. reduce-overhead is a v1.2 win
-        # if we add a static-shape padded path for the tail.
-        if not hasattr(self, "_cdf_compiled"):
-            self._cdf_compiled = torch.compile(probs_to_cdf_gpu)
-
-        # Output buffer + state on GPU. Worst case AC output ~= input
-        # (zstd-equivalent uniform encoding); allocate len(data) + slack.
-        cap = max(len(data) * 2, 64 << 10)
-        output_buf = torch.zeros(cap, dtype=torch.uint8, device=self._device)
-        state = torch.zeros(4, dtype=torch.uint32, device=self._device)
-        state[1] = 0xFFFFFFFF
-
-        # Synchronous default-stream pipeline. Per-batch breakdown on
-        # A10G: forward ~10.8 ms, softmax 3.6 ms, cdf 4.4 ms, encode 0.7 ms
-        # = ~19.5 ms/batch ≈ 52K tok/s ≈ 200 KB/s steady-state. The forward
-        # pass is now the wall (56% of per-batch time). Side-stream AC
-        # pipelining was tried and gave ~7% gain on this hardware/torch
-        # version — not worth the complexity. The real next win is
-        # cross-chunk batched forward (v1.1 backlog "true batched RWKV
-        # decode"), which collapses 16 sequential per-token forwards
-        # into one launch and unblocks the 300+ KB/s tier.
-        rwkv_state = None
-        pos = 0
-        for i in range(0, len(full_input), SEQ_BATCH):
-            batch = full_input[i:i + SEQ_BATCH]
-            logits, rwkv_state = self._model.forward(
-                batch, rwkv_state, full_output=True)
-            if not isinstance(logits, torch.Tensor):
-                logits = torch.as_tensor(logits, device=self._device)
-            B = logits.size(0)
-            with torch.no_grad():
-                probs = torch.softmax(logits.float(), dim=-1)
-                cdf = self._cdf_compiled(probs).contiguous()
-            sym_batch = tokens_arr_gpu[pos:pos + B].contiguous()
-            krunch_ac_cuda.encode_step(cdf, sym_batch, output_buf, state)
-            pos += B
-
-        krunch_ac_cuda.encode_finalize(output_buf, state)
-        torch.cuda.synchronize()
-
-        bit_offset = int(state[3].item())
-        n_bytes = (bit_offset + 7) // 8
-        ac_bytes = bytes(output_buf[:n_bytes].cpu().numpy())
-        # D2 (Phase 0a): empty_cache() removed here too. Legacy non-cpp
-        # path; kept for benchmark comparisons. Same rationale as above.
-
-        # Mini-header: original byte length (4) + token count (4)
-        mini_header = struct.pack(">II", len(data), len(tokens))
-        return mini_header + ac_bytes
 
     def _compress_chunk_cpp(self, data: bytes, tokens: list[int]) -> bytes:
         """Bit-exact C++ orchestration path. Encoder runs all 12 layers
@@ -504,11 +435,6 @@ class InferenceEngine:
             "KRUNCH_DECOMPRESS_GRAPH", "full" if own_wkv else "eager")
         # W8A8 layer step has no graph capture support yet — force eager.
         if w8a8_active:
-            graph_mode = "eager"
-        # Back-compat: prior env was "0"/"1" → map "1" to legacy per_layer.
-        if graph_mode == "1":
-            graph_mode = "per_layer"
-        elif graph_mode == "0":
             graph_mode = "eager"
         use_graph = graph_mode in ("full", "per_layer")
         # Graphs are pointer-bound; reuse same state tensors across calls
