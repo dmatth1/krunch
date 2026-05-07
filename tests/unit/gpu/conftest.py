@@ -21,7 +21,7 @@ except Exception:
     _HAS_CUDA = False
 
 if not _HAS_CUDA:
-    collect_ignore_glob = ["test_*.py", "bench_*.py", "rwkv4_step_ref.py"]
+    collect_ignore_glob = ["test_*.py", "bench_*.py"]
 
 
 # Set BEFORE any test module imports cpp_path / krunch.inference; pytest
