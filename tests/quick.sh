@@ -47,7 +47,7 @@ report $synth_rc "cdk synth"
 
 # 4. krunch plan --target aws-batch --dry-run
 echo "[4/4] krunch plan --target aws-batch --dry-run"
-output=$(scripts/krunch plan --target aws-batch \
+output=$(scripts/krunch plan --target aws-batch --mode compress \
   --source s3://test/in --dest s3://test/out \
   --workers 4 --input-len 1048576 --dry-run 2>&1)
 rc=$?

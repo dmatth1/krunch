@@ -212,31 +212,27 @@ submit_pair() {
   local main_spec finalize_spec
   main_spec=$(mktemp)
   finalize_spec=$(mktemp)
-  # AWS Batch requires arrayProperties.size >= 2. For workers=1 we have to
-  # submit as a non-array job and replace the Ref:: array-index substitution
-  # with a literal "0". Detect via $WORKERS so we don't ship a busted spec.
-  # Also defensively override containerOverrides.command to ["job"] —
-  # the published image's plan template wrongly emits ["python","-m","krunch.job"]
-  # which entrypoint.sh rejects ("Unknown mode: python"). Fixed in source
-  # template 2026-05-07; strip stays as defensive cover for older images.
+  # AWS Batch requires arrayProperties.size >= 2. For workers=1 we have
+  # to submit as a non-array job and replace the Ref:: array-index
+  # substitution with a literal "0". This IS a real AWS Batch API
+  # limitation that real-user tooling has to work around.
+  #
+  # We also override `finalize.jobDefinition` to the FinalizeJobDef ARN
+  # because `krunch plan` emits the same JD for both main and finalize
+  # — the rendered finalize block needs the CPU-only finalize JD, not
+  # the GPU compress/decompress JD. Real-user tooling has to do this
+  # mapping too. (Plan template could grow a --finalize-job-definition
+  # flag; v1 backlog.)
   if [[ $WORKERS -eq 1 ]]; then
     jq -c '.main
-              | del(.containerOverrides.image)
-              | .containerOverrides.command = ["job"]
               | del(.arrayProperties)
               | .containerOverrides.environment |= map(
                   if .name == "KRUNCH_PART_INDEX" then .value = "0" else . end)' \
         "$plan_json" > "$main_spec"
   else
-    jq -c '.main
-              | del(.containerOverrides.image)
-              | .containerOverrides.command = ["job"]' \
-        "$plan_json" > "$main_spec"
+    jq -c '.main' "$plan_json" > "$main_spec"
   fi
-  jq -c '.finalize
-            | .jobDefinition = "'"$FINALIZE_JD"'"
-            | del(.containerOverrides.image)
-            | .containerOverrides.command = ["job"]' "$plan_json" > "$finalize_spec"
+  jq -c '.finalize | .jobDefinition = "'"$FINALIZE_JD"'"' "$plan_json" > "$finalize_spec"
 
   local main_id finalize_id
   main_id=$(aws batch submit-job --region "$REGION" \
