@@ -79,10 +79,11 @@ locally yet.
 
 | corpus | krunch | ts_zip | zstd -22 --long | krunch vs zstd |
 |---|---|---|---|---|
-| WildChat-English (100 MB) | **0.114** | _tbd_ | 0.170 | **−33%** |
-| enwik8 | _tbd_ | _tbd_ | 0.253 | _tbd_ |
-| nginx logs | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
-| The Stack (Python) | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
+| Chat — WildChat-English (100 MB) | **0.114** | _tbd_ | 0.170 | **−33%** |
+| Wikipedia — enwik8 (100 MB) | _tbd_ | _tbd_ | 0.253 | _tbd_ |
+| HTTP logs — NASA Apache (100 MB) | _tbd_ | _tbd_ | 0.061 | _tbd_ |
+| Support tickets — Bitext (19 MB) | _tbd_ | _tbd_ | 0.083 | _tbd_ |
+| Python code — CodeParrot (100 MB) | _tbd_ | _tbd_ | 0.154 | _tbd_ |
 
 ## What's inside the Docker image
 

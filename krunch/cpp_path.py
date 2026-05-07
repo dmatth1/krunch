@@ -307,12 +307,16 @@ def forward_packed_window(weights: dict, input_ids, state, off: int, n: int):
 
     # W8A8 dispatch: compress packed forward at M >= 256 uses the int8
     # Tensor Core path (1.5-2.2× per-call speedup at our shapes).
-    # Decompress (small M) keeps using the fp16 layer step on the
-    # dequant-fp16 weights stored in `layers` — same effective weights,
-    # so encoder W8A8 and decoder fp16 produce identical outputs.
-    # Must mirror decoder's gate (in forward_stepped_batched) exactly
-    # for AC bit-exactness.
-    use_w8a8 = ("w8a8_int8" in weights)
+    # Below that, fall back to the fp16 layer step on the dequant-fp16
+    # weights stored in `layers` — same code path the decoder uses
+    # (`forward_stepped` / `forward_stepped_batched` always M=1), so
+    # encoder and decoder produce bit-identical logits and AC roundtrip
+    # holds. Without this gate, encoder W8A8 + decoder fp16 produce
+    # slightly-different logits whose softmax+CDF can disagree by 1 LSB
+    # → AC bitstream un-recoverable. (On Turing, the W8A8 int8-WMMA
+    # kernel produces garbage output entirely — see docs/Bugs.md.)
+    M = T_w
+    use_w8a8 = ("w8a8_int8" in weights) and M >= 256
     if use_w8a8:
         w8a8_int8 = weights["w8a8_int8"]
         w8a8_scale = weights["w8a8_scale"]
@@ -743,11 +747,10 @@ def forward_stepped_batched(weights: dict, last_tokens, state):
     Bit-identical per-chunk to running forward_stepped sequentially
     on each chunk (verified via tests/unit/gpu/test_batched_stepped.py).
 
-    W8A8 dispatch: when bundle has `w8a8_int8` (set by init_weights
-    when KRUNCH_INT8_W8A8=1), uses the W8A8 layer step. Required for
-    bit-exact AC roundtrip — encoder uses W8A8 packed; decoder must
-    use SAME quant scheme to produce matching logits. Cost: W8A8
-    regresses at small M; the regression is the price of bit-exactness.
+    Always uses the fp16 layer step (no W8A8 dispatch). T=1 means
+    M=1, which is below `forward_packed_window`'s W8A8 threshold of
+    M >= 256 → encoder also takes the fp16 path at this M, keeping
+    the encoder/decoder pair symmetric and AC roundtrip bit-exact.
     """
     import torch
     import krunch_ac_cuda
@@ -765,30 +768,12 @@ def forward_stepped_batched(weights: dict, last_tokens, state):
     B = int(last_tokens.shape[0])
     x = emb_w[last_tokens].view(B, 1, n_embd).contiguous()
 
-    use_w8a8 = ("w8a8_int8" in weights)
-    if use_w8a8:
-        w8a8_int8 = weights["w8a8_int8"]
-        w8a8_scale = weights["w8a8_scale"]
-        for i in range(N_LAYER):
-            L = layers[i]
-            ints = w8a8_int8[i]
-            scales = w8a8_scale[i]
-            x = krunch_ac_cuda.rwkv4_layer_step_cpp_w8a8(
-                x.contiguous(),
-                state[0][i], state[1][i], state[2][i], state[3][i], state[4][i],
-                L[0], L[1], L[2], L[3], L[4], L[5], L[6],
-                ints[0], scales[0], ints[1], scales[1],
-                ints[2], scales[2], ints[3], scales[3],
-                L[11], L[12], L[13], L[14],
-                ints[4], scales[4], ints[5], scales[5], ints[6], scales[6],
-            )
-    else:
-        for i in range(N_LAYER):
-            x = krunch_ac_cuda.rwkv4_layer_step_cpp(
-                x.contiguous(),
-                state[0][i], state[1][i], state[2][i], state[3][i], state[4][i],
-                *layers[i],
-            )
+    for i in range(N_LAYER):
+        x = krunch_ac_cuda.rwkv4_layer_step_cpp(
+            x.contiguous(),
+            state[0][i], state[1][i], state[2][i], state[3][i], state[4][i],
+            *layers[i],
+        )
     xn = F.layer_norm(x.view(B, n_embd), (n_embd,),
                       weight=ln_out_w, bias=ln_out_b)
     logits = krunch_ac_cuda.det_matmul(xn.contiguous(), head_w.contiguous())
