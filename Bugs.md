@@ -141,3 +141,53 @@ docker run --rm --gpus all -v /tmp/gpu-tests:/gpu-tests \
   -c "pip install -q pytest && cd /gpu-tests && python -m pytest -v"
 # 7 fail. Same tests pass with `pytest <file>.py` in isolation.
 ```
+
+---
+
+## 4. compress_chunks_batched on T4: small-chunk roundtrip break
+
+**Severity:** correctness — silent data corruption on cross-chunk
+batched compress with small chunks.
+**Surface:** `engine.compress_chunks_batched(small_chunks)` on sm_75.
+
+**Symptom.** `decompress_chunks_batched(compress_chunks_batched(chunks))`
+fails byte-exact recovery; decoded output is free-running model text
+("Anti-China brotherhood help…" instead of "Hello there, this is
+chunk one of three…"). Same failure pattern as Bug #1 (small-chunk
+encoder produces a near-empty bitstream the decoder can't reconstruct
+from).
+
+Reproduces with `KRUNCH_INT8_W8A8=0`, in isolation, on a fresh T4
+container — so it's NOT bug #1 hiding behind a different name. The
+**decompress** side (`_decompress_chunks_batched_cpp`) passes all
+its tests at the same chunk sizes; only **compress** is broken.
+
+**What's broken specifically.** Cross-chunk batched compress runs
+B chunks lockstep (B=N forward + B=N AC encode per timestep).
+Symmetric encoder/decoder pair: `compress_chunks_batched`
+↔ `decompress_chunks_batched`. The encoder side appears to mis-emit
+AC bits when running lockstep on small T4 chunks.
+
+**Why production didn't catch it.** `cli.py:cmd_compress` uses the
+per-chunk compress path (`compress_chunk` in a loop), not the
+batched variant. `compress_chunks_batched` is reachable only via
+direct API calls — no production CLI path hits it.
+
+**Workaround.** Use `compress_chunk(c) for c in chunks` (or the
+simple `engine.compress_chunks(chunks)` batch-tokenize-then-encode
+path). Both roundtrip cleanly.
+
+**Suspected root cause.** Likely the same family as Bug #1: small-T
+fp16 path on sm_75 has encoder/decoder asymmetry. The cross-chunk
+batched compress stresses a different code path
+(`forward_stepped_batched` with B>1 instead of `forward_packed_window`)
+but ends up in the same kind of mis-encoded bitstream.
+
+**Repro:**
+```bash
+docker run --rm --gpus all -v /tmp/gpu-tests:/gpu-tests \
+  --entrypoint bash ghcr.io/dmatth1/krunch:latest \
+  -c "pip install -q pytest && cd /gpu-tests && \
+      python -m pytest -v test_compress_chunks_batched.py"
+# 2 fail in isolation on T4.
+```
