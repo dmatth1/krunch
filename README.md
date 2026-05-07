@@ -37,16 +37,22 @@ ready-to-run artifact for the target you pick.
 krunch plan --target aws-batch --mode compress \
     --source s3://… --dest s3://… --workers 16 > compress.json
 
-# Decompress (separate plan, run after compress completes)
+# Decompress
 krunch plan --target aws-batch --mode decompress \
     --source s3://… --dest s3://… --workers 16 > decompress.json
 
-# Other targets — same flags
+# Other targets — same flags (template-validated; not yet run end-to-end)
 krunch plan --target k8s    --mode compress --source … --dest … --workers 16 > job.yaml
 krunch plan --target modal  --mode compress --source … --dest … --workers 16 > run.py
 krunch plan --target ray    --mode compress --source … --dest … --workers 16 > run.py
 krunch plan --target slurm  --mode compress --source … --dest … --workers 16 > run.sbatch
 ```
+
+> Only the AWS Batch path is end-to-end validated today. Templates for
+> k8s / Modal / Ray / Slurm / GCP Batch render + schema-validate in CI
+> but haven't been launched against a real orchestrator. See
+> [CONTRIBUTING.md](CONTRIBUTING.md#batch-target-validation-matrix) —
+> contributions welcome here.
 
 Then run it with your own tooling and credentials:
 `aws batch submit-job --cli-input-json file://compress.json`,
@@ -112,6 +118,13 @@ If your data isn't text-heavy enough that the language model can
 predict it, krunch can produce *larger* output than the input. For
 arbitrary binary data, mixed media, or already-compressed payloads, use 
 a different compressor.
+
+## Contributing
+
+Bug reports, real-orchestrator validation runs (k8s / Modal / Ray /
+Slurm / GCP Batch), corpus benchmarks, and fixes welcome — see
+[CONTRIBUTING.md](CONTRIBUTING.md). What's planned ahead is in
+[ROADMAP.md](ROADMAP.md).
 
 ## License
 
