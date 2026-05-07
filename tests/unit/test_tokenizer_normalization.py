@@ -1,20 +1,15 @@
 """Tier-1 test: the tokenizer must not apply Unicode normalization.
 
 The 20B_tokenizer ships with `"normalizer": {"type": "NFC"}` in its
-JSON config, which silently maps compatibility-equivalent codepoints to
-their canonical form on encode — e.g. U+2126 OHM SIGN → U+03A9 GREEK
-CAPITAL OMEGA. Same glyph, different bytes (3 → 2). That breaks
+JSON config, which silently maps compatibility-equivalent codepoints
+to their canonical form on encode — e.g. U+2126 OHM SIGN → U+03A9
+GREEK CAPITAL OMEGA. Same glyph, different bytes (3 → 2). That breaks
 byte-exact roundtrip on any text containing such characters.
 
-`InferenceEngine.load()` disables the normalizer immediately after
-loading the tokenizer to recover byte-exact roundtrip. This test pins
-that behavior so a future tokenizer reload doesn't reintroduce the
-NFC pass without us noticing.
-
-Discovered 2026-05-07 in the T4 100 MB / 4-worker AWS Batch run:
-WildChat content includes "0.20 Ω" (the Ohm sign for resistance), and
-the codec lost 2 bytes per occurrence × dozens of occurrences = 125
-bytes across the 100 MB corpus.
+`InferenceEngine.load()` replaces the normalizer with an empty Sequence
+(no-op) immediately after loading the tokenizer to recover byte-exact
+roundtrip. This test pins that behavior so a future tokenizer reload
+doesn't reintroduce the NFC pass without us noticing.
 """
 from pathlib import Path
 
@@ -72,11 +67,13 @@ def test_default_tokenizer_breaks_byte_exact_on_traps():
 
 @_skip_if_missing
 def test_disabling_normalizer_gives_byte_exact_roundtrip():
-    """Setting `tokenizer.normalizer = None` after load (what
-    `InferenceEngine.load()` does) recovers byte-exact roundtrip on
-    text containing compatibility-equivalent codepoints."""
+    """Replacing the tokenizer's normalizer with an empty Sequence
+    (what `InferenceEngine.load()` does) recovers byte-exact roundtrip
+    on text containing compatibility-equivalent codepoints."""
+    from tokenizers.normalizers import Sequence
+
     tok = Tokenizer.from_file(str(_TOKENIZER_PATH))
-    tok.normalizer = None
+    tok.normalizer = Sequence([])  # production fix
 
     orig_text = _NORMALIZATION_TRAPS
     back_text = tok.decode(tok.encode(orig_text).ids)
@@ -86,18 +83,26 @@ def test_disabling_normalizer_gives_byte_exact_roundtrip():
 
 
 def test_inference_engine_disables_normalizer_on_load():
-    """InferenceEngine.load() must include `self._tokenizer.normalizer
-    = None` (otherwise compress is silently lossy)."""
+    """InferenceEngine.load() must replace the tokenizer's normalizer
+    with a no-op Sequence (otherwise compress is silently lossy on
+    compatibility-equivalent Unicode codepoints).
+
+    Note: `tokenizer.normalizer = None` doesn't work — the tokenizers
+    package rejects None and only accepts Normalizer instances, which
+    is why we use Sequence([]) (an empty no-op normalizer)."""
     import inspect
 
     from krunch.inference import InferenceEngine
 
     src = inspect.getsource(InferenceEngine.load)
-    assert "_tokenizer.normalizer" in src and "= None" in src, (
+    assert "_tokenizer.normalizer" in src, (
         "InferenceEngine.load() must explicitly disable the tokenizer's "
         "NFC normalizer (see comment block in inference.py near "
         "Tokenizer.from_file). If this assertion failed, the lossy-codec "
         "regression has reappeared.")
+    assert "Sequence" in src, (
+        "InferenceEngine.load() should disable the normalizer via an "
+        "empty Sequence([]); the tokenizers package rejects `None`.")
 
 
 if __name__ == "__main__":
