@@ -321,7 +321,10 @@ def forward_packed_window(weights: dict, input_ids, state, off: int, n: int):
     # weights, so encoder W8A8 and decoder fp16 produce identical outputs
     # (modulo activation-quant noise; verified by AC roundtrip at
     # integration time).
-    use_w8a8 = ("w8a8_int8" in weights) and (T_w >= 256)
+    # Must mirror decoder's gate exactly (forward_stepped_batched line ~825)
+    # for AC bit-exactness — encoder fp16 + decoder W8A8 produces different
+    # logits and breaks roundtrip on partial windows.
+    use_w8a8 = ("w8a8_int8" in weights)
     if use_w8a8:
         w8a8_int8 = weights["w8a8_int8"]
         w8a8_scale = weights["w8a8_scale"]

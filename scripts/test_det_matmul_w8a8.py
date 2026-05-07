@@ -113,36 +113,41 @@ def main():
     print("\n" + "=" * 60)
     print("STEP 2: M-INVARIANCE — encoder M=large vs decoder M=small")
     print("=" * 60)
+    # Test multiple slice sizes including M=1 (decoder stepped B=1, T=1)
+    # which the original microbench did NOT cover — minimum was M=16.
+    # The Phase 2A bit-exactness bug appears at the W8A8 layer step's
+    # T=1 call site; if M=1 produces different row 0 from M=32 row 0,
+    # we've found the integration-level bug zone.
     for (K, N) in [(768, 768), (768, 3072), (3072, 768)]:
         x_large = torch.randn(1024, K, dtype=torch.float16, device=device) * 0.5
         w_fp16 = (torch.randn(K, N, device=device) * 0.05).to(torch.float16)
         w_q, scale_w = quantize_weight_per_output_channel_int8(w_fp16)
 
-        # Quantize full + sliced; both must produce identical first-16-rows.
-        # Note: scale_x[m] depends on row m's values, NOT on M, so identical.
         x_q_large, sx_large = krunch_ac_cuda.quantize_per_row_int8(x_large)
-        x_q_small, sx_small = krunch_ac_cuda.quantize_per_row_int8(
-            x_large[:16].contiguous())
-        sx_diff = (sx_large[:16].to(torch.float32) -
-                    sx_small.to(torch.float32)).abs().max().item()
-        # Quant int8 must also match (same fp16 input + same scale → same q)
-        xq_diff = (x_q_large[:16].to(torch.int32) -
-                    x_q_small.to(torch.int32)).abs().max().item()
-
         y_large = krunch_ac_cuda.det_matmul_w8a8(
             x_q_large, sx_large, w_q, scale_w)
-        y_small = krunch_ac_cuda.det_matmul_w8a8(
-            x_q_small, sx_small, w_q, scale_w)
-        y_diff = (y_large[:16].to(torch.float32) -
-                   y_small.to(torch.float32)).abs().max().item()
 
-        ok = (sx_diff == 0.0 and xq_diff == 0 and y_diff == 0.0)
-        status = "✓" if ok else "✗"
-        print(f"  {status}  K={K:4d} N={N:4d}  "
-              f"scale_x_diff={sx_diff}  X_q_diff={xq_diff}  y_diff={y_diff}")
-        if not ok:
-            print(f"    → BIT-STABILITY VIOLATION; AC roundtrip would break")
-            failed += 1
+        # Test multiple smaller M values
+        for M_small in [1, 16, 32]:
+            x_q_small, sx_small = krunch_ac_cuda.quantize_per_row_int8(
+                x_large[:M_small].contiguous())
+            sx_diff = (sx_large[:M_small].to(torch.float32) -
+                        sx_small.to(torch.float32)).abs().max().item()
+            xq_diff = (x_q_large[:M_small].to(torch.int32) -
+                        x_q_small.to(torch.int32)).abs().max().item()
+
+            y_small = krunch_ac_cuda.det_matmul_w8a8(
+                x_q_small, sx_small, w_q, scale_w)
+            y_diff = (y_large[:M_small].to(torch.float32) -
+                       y_small.to(torch.float32)).abs().max().item()
+
+            ok = (sx_diff == 0.0 and xq_diff == 0 and y_diff == 0.0)
+            status = "✓" if ok else "✗"
+            print(f"  {status}  K={K:4d} N={N:4d}  M_small={M_small:3d}  "
+                  f"sx={sx_diff:.4f}  Xq={xq_diff}  y={y_diff:.4f}")
+            if not ok:
+                print(f"    → BIT-STABILITY VIOLATION; AC roundtrip breaks")
+                failed += 1
 
     if failed:
         sys.exit(f"FAIL: {failed} M-invariance checks failed")
