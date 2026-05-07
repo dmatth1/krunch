@@ -181,6 +181,19 @@ class InferenceEngine:
         self._device = "cuda" if torch.cuda.is_available() else "cpu"
         logger.info("Loading tokenizer from %s", TOKENIZER_PATH)
         self._tokenizer = Tokenizer.from_file(str(TOKENIZER_PATH))
+        # Disable the tokenizer's NFC normalizer. The 20B_tokenizer was
+        # trained with `"normalizer": {"type": "NFC"}` baked in, which
+        # silently maps compatibility-equivalent Unicode codepoints to
+        # their canonical form on encode (e.g. U+2126 OHM SIGN → U+03A9
+        # GREEK CAPITAL OMEGA, 3 bytes → 2 bytes). That makes the codec
+        # not byte-exact on text containing such characters — discovered
+        # 2026-05-07 in the T4 100MB / 4-worker run (125 bytes lost
+        # across 3 worker shards, all from compatibility-decomposable
+        # codepoints). Disabling the normalizer at load time gives
+        # byte-exact roundtrip with measured ~0.003% token-count
+        # overhead (BPE byte-level tokenization handles the original
+        # codepoints fine without the canonicalization pass).
+        self._tokenizer.normalizer = None
 
         logger.info("Loading RWKV-4-Pile-169M from %s (device=%s)",
                     MODEL_PATH, self._device)
