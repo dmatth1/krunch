@@ -1,7 +1,7 @@
 """
 GPU kernel correctness: byte-identical to CPU reference.
 
-Only runs on a CUDA host. Requires krunch_ac.cuda extension built
+Only runs on a CUDA host. Requires krunch/kernels extension built
 (cd krunch_ac/cuda && python setup.py build_ext --inplace).
 """
 
@@ -17,8 +17,8 @@ try:
 except ImportError:
     pytest.skip("krunch_ac_cuda extension not built", allow_module_level=True)
 
-from krunch_ac.cpu_reference import encode as cpu_encode
-from krunch_ac.gpu_encode import probs_to_cdf_gpu
+from krunch.codec.cpu_reference import encode as cpu_encode
+from krunch.codec.gpu_encode import probs_to_cdf_gpu
 
 
 def _rand_probs(N, V, seed=0):

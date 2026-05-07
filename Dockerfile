@@ -35,17 +35,16 @@ m.forward([0], None); print('kernel warm-up ok') \
 " || echo "kernel warm-up skipped (no GPU at build time — will compile on first request)"
 
 # Application code
-COPY src/krunch/ /app/krunch/
-COPY src/krunch_ac/ /app/krunch_ac/
+COPY krunch/ /app/krunch/
 
-# Build the GPU AC kernel (nvcc + ninja). Devel base has nvcc; ninja
-# is already installed above. No GPU needed at build time — nvcc only
-# compiles, doesn't run, and TORCH_CUDA_ARCH_LIST hints at expected SMs.
+# Build the GPU kernels extension (nvcc + ninja). Devel base has nvcc;
+# ninja is already installed above. No GPU needed at build time —
+# nvcc only compiles. TORCH_CUDA_ARCH_LIST hints at expected SMs.
 ENV TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;8.9;9.0"
-RUN cd /app/krunch_ac/cuda && python setup.py build_ext --inplace && \
+RUN cd /app/krunch/kernels && python setup.py build_ext --inplace && \
     cp krunch_ac_cuda*.so /app/
 
-ENV PYTHONPATH=/app:/app/krunch_ac/cuda
+ENV PYTHONPATH=/app
 
 WORKDIR /app
 

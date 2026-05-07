@@ -16,12 +16,12 @@ try:
 except ImportError:
     torch = None
 
-from krunch_ac.cdf import T as CDF_T
+from krunch.codec.cdf import T as CDF_T
 
 
 def probs_to_cdf_gpu(probs):
     """
-    GPU probs → int32 CDF. Mirrors krunch_ac.cdf.probs_to_cdf bit-for-bit
+    GPU probs → int32 CDF. Mirrors krunch.codec.cdf.probs_to_cdf bit-for-bit
     (same MIN_PROB=1, same deficit-distribution rule).
 
     Returns int32 (not uint16) because cdf[:, V] == T == 65536, which

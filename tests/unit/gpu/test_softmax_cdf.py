@@ -33,7 +33,7 @@ def test_one_row_matches_per_row_bit_exact(logits):
 def test_cdf_starts_at_zero_ends_at_T(logits):
     """A valid CDF over a discrete distribution starts at 0 and ends at
     the AC kernel's fixed-point ceiling (CDF_T)."""
-    from krunch_ac.cdf import T as CDF_T
+    from krunch.codec.cdf import T as CDF_T
     cdfs = softmax_cdfs_per_row(logits)
     assert (cdfs[:, 0] == 0).all().item()
     assert (cdfs[:, -1] == CDF_T).all().item()
@@ -49,7 +49,7 @@ def test_cdf_monotonic_nondecreasing(logits):
 def test_one_row_handles_extreme_logits():
     """Confident predictions (one logit dominates) should still produce
     a valid CDF — no NaN, no overflow, sum = CDF_T."""
-    from krunch_ac.cdf import T as CDF_T
+    from krunch.codec.cdf import T as CDF_T
     logits = torch.full((50277,), -1e3, dtype=torch.float16, device="cuda")
     logits[42] = 1000.0  # token 42 is "nearly certain"
     cdf = softmax_cdf_one_row(logits)
@@ -65,7 +65,7 @@ def test_per_row_handles_uniform_logits():
     kernel allocates rounding residue to one bin, so we check
     (a) total bin counts sum to CDF_T, (b) almost all bins are at the
     expected uniform width, and (c) no bin is zero (would break AC)."""
-    from krunch_ac.cdf import T as CDF_T
+    from krunch.codec.cdf import T as CDF_T
     V = 50277
     logits = torch.zeros(2, V, dtype=torch.float16, device="cuda")
     cdfs = softmax_cdfs_per_row(logits)

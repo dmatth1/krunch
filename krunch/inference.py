@@ -522,7 +522,7 @@ class InferenceEngine:
         """
         import torch
         import krunch_ac_cuda
-        from krunch_ac.gpu_encode import probs_to_cdf_gpu
+        from krunch.codec.gpu_encode import probs_to_cdf_gpu
         from krunch import cpp_path
 
         B = len(chunks)

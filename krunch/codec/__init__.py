@@ -1,5 +1,5 @@
 """
-krunch_ac: GPU-native arithmetic coder for krunch.
+krunch.codec: GPU-native arithmetic coder for krunch.
 
 Two implementations behind one interface:
 
@@ -18,8 +18,8 @@ Both consume:
 Output: bytes (the encoded bitstream).
 """
 
-from krunch_ac.cdf import probs_to_cdf, CDF_PRECISION
-from krunch_ac.cpu_reference import (
+from krunch.codec.cdf import probs_to_cdf, CDF_PRECISION
+from krunch.codec.cpu_reference import (
     encode as encode_cpu,
     decode as decode_cpu,
 )

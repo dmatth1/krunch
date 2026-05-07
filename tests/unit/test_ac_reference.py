@@ -7,8 +7,8 @@ This is the spec the CUDA kernel must match byte-for-byte.
 import numpy as np
 import pytest
 
-from krunch_ac.cdf import probs_to_cdf, T as CDF_T
-from krunch_ac.cpu_reference import encode, decode
+from krunch.codec.cdf import probs_to_cdf, T as CDF_T
+from krunch.codec.cpu_reference import encode, decode
 
 
 def _rand_probs(N, V, seed=0):

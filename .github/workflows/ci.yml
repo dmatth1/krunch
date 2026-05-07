@@ -36,7 +36,7 @@ jobs:
 
       - name: Unit tests
         run: |
-          PYTHONPATH=src pytest tests/unit/ -v
+          PYTHONPATH=. pytest tests/unit/ -v
 
       - name: Set up Node for CDK
         uses: actions/setup-node@v4
@@ -57,7 +57,7 @@ jobs:
           # Exercises the in-image plan_cli argparse path against the
           # source tree. Emits the rendered plan to the CI log for quick
           # visual diff when templates change.
-          PYTHONPATH=src python -m krunch.plan_cli \
+          PYTHONPATH=. python -m krunch.plan_cli \
             --target aws-batch --mode compress \
             --source s3://test/in --dest s3://test/out \
             --workers 4 --image ghcr.io/dmatth1/krunch:latest \

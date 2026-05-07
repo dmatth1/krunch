@@ -504,7 +504,7 @@ def _eager_full_step(weights, last_input_long, ac_state, input_buf,
     import torch
     import krunch_ac_cuda
     import torch.nn.functional as F
-    from krunch_ac.cdf import T as CDF_T
+    from krunch.codec.cdf import T as CDF_T
 
     n_embd = weights["n_embd"]
     layers = weights["layers"]
@@ -873,7 +873,7 @@ def softmax_cdfs_per_row(logits_TxV):
     at V=50277)."""
     import torch
     import krunch_ac_cuda
-    from krunch_ac.cdf import T as CDF_T
+    from krunch.codec.cdf import T as CDF_T
     counts = krunch_ac_cuda.det_softmax_cdf(logits_TxV.contiguous(), CDF_T)
     counts[:, 1:] = torch.cumsum(counts[:, 1:], dim=-1)
     return counts
@@ -883,7 +883,7 @@ def softmax_cdf_one_row(logits_V):
     """Single-row softmax + CDF for the stepped decoder path."""
     import torch
     import krunch_ac_cuda
-    from krunch_ac.cdf import T as CDF_T
+    from krunch.codec.cdf import T as CDF_T
     counts = krunch_ac_cuda.det_softmax_cdf(
         logits_V.reshape(1, -1).contiguous(), CDF_T)
     counts[:, 1:] = torch.cumsum(counts[:, 1:], dim=-1)

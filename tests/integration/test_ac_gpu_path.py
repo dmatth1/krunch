@@ -17,7 +17,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from krunch_ac.cpu_reference import encode as cpu_encode, decode as cpu_decode
+from krunch.codec.cpu_reference import encode as cpu_encode, decode as cpu_decode
 
 
 def _rand_probs(N, V, seed=0):
@@ -30,7 +30,7 @@ def _rand_probs(N, V, seed=0):
 def _torch_probs_to_cdf_cpu(probs):
     """Mirror of probs_to_cdf_gpu but runs on CPU device — same arithmetic
     so we exercise the GPU code path locally on Mac."""
-    from krunch_ac.cdf import T as CDF_T
+    from krunch.codec.cdf import T as CDF_T
     N, V = probs.shape
     p = probs.to(torch.float32)
     p = p / p.sum(dim=1, keepdim=True).clamp_min(1e-30)
@@ -65,7 +65,7 @@ def test_gpu_cdf_roundtrip(N, V, seed):
 
 def test_gpu_cdf_invariants():
     """Torch CDF satisfies the same invariants as numpy CDF."""
-    from krunch_ac.cdf import T as CDF_T
+    from krunch.codec.cdf import T as CDF_T
     p = _rand_probs(64, 1024, seed=99)
     cdf = _torch_probs_to_cdf_cpu(torch.from_numpy(p)).numpy().astype(np.int64)
     assert (cdf[:, 0] == 0).all()
