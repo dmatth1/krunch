@@ -80,8 +80,7 @@ locally yet.
 | corpus | krunch | ts_zip | zstd -22 --long | krunch vs zstd |
 |---|---|---|---|---|
 | WildChat-English (100 MB) | **0.114** | _tbd_ | 0.170 | **−33%** |
-| enwik8 | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
-| enwik9 | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
+| enwik8 | _tbd_ | _tbd_ | 0.253 | _tbd_ |
 | nginx logs | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
 | The Stack (Python) | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
 
