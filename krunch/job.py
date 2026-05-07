@@ -40,6 +40,7 @@ correctly per task. Common mappings:
 
 import os
 import sys
+import time
 import zlib
 import logging
 
@@ -96,9 +97,15 @@ def _run_compress_worker():
     # a worker on a small slice would derive a smaller chunk_size from
     # its own len(raw) and emit chunks that don't line up with the
     # byte-range alignment chosen above.
+    work_start = time.monotonic()
     chunk_entries, n_chunks = compress_all(
         raw, engine.compress_chunk, total_size=total_size,
     )
+    work_elapsed = time.monotonic() - work_start
+    rate_kbps = (len(raw) / 1024.0) / work_elapsed if work_elapsed > 0 else 0.0
+    logger.info("KRUNCH_WORK_TIME mode=compress part=%d bytes=%d "
+                "elapsed=%.3f rate_kbps=%.1f n_chunks=%d",
+                part_index, len(raw), work_elapsed, rate_kbps, n_chunks)
     entries_bytes = b"".join(chunk_entries)
     crc = zlib.crc32(raw) & 0xFFFFFFFF
     blob = encode_header(len(raw), n_chunks, crc) + entries_bytes
@@ -166,9 +173,15 @@ def _run_decompress_worker():
     # can reuse decompress_all.
     my_entries = b"".join(struct.pack(">II", ol, len(enc)) + enc
                            for ol, enc in my_chunks)
+    work_start = time.monotonic()
     raw = decompress_all(my_entries, len(my_chunks),
                          engine.decompress_chunk,
                          neural_batch_fn=engine.decompress_chunks_batched)
+    work_elapsed = time.monotonic() - work_start
+    rate_kbps = (len(raw) / 1024.0) / work_elapsed if work_elapsed > 0 else 0.0
+    logger.info("KRUNCH_WORK_TIME mode=decompress part=%d bytes=%d "
+                "elapsed=%.3f rate_kbps=%.1f n_chunks=%d",
+                part_index, len(raw), work_elapsed, rate_kbps, len(my_chunks))
     url_io.write(part_url, raw)
     logger.info("wrote %d raw bytes (%d chunks) to %s",
                 len(raw), len(my_chunks), part_url)

@@ -217,7 +217,64 @@ submit_pair() {
   echo "  ${mode} finalize submitted: ${finalize_id}" >&2
   poll_job "$finalize_id" "${mode}-finalize" >&2 || return 1
 
+  # Expose the array/main job id to the caller for post-run log parsing.
+  LAST_MAIN_ID=$main_id
   rm -f "$plan_json" "$main_spec" "$finalize_spec"
+}
+
+# ---------------------------------------------------------------------------
+# parse_work_times — pull KRUNCH_WORK_TIME log lines from CloudWatch for
+# each child (or single non-array job) and report per-worker real-work
+# numbers + aggregate.
+#
+# AWS-specific (uses /aws/batch/job log group + describe-jobs to get
+# log stream names). For non-AWS orchestrators this would need a
+# different impl — see TIER_4.md "Real-work measurement" section.
+# ---------------------------------------------------------------------------
+parse_work_times() {
+  local mode=$1       # "compress" | "decompress"
+  local parent_id=$2
+  local n=$3          # workers count
+  local total_bytes=0 max_elapsed=0 streams=()
+
+  if [[ $n -eq 1 ]]; then
+    streams+=( "$(aws batch describe-jobs --region "$REGION" --jobs "$parent_id" \
+                  --query 'jobs[0].attempts[-1].container.logStreamName' --output text 2>/dev/null)" )
+  else
+    for i in $(seq 0 $((n-1))); do
+      streams+=( "$(aws batch describe-jobs --region "$REGION" --jobs "${parent_id}:${i}" \
+                    --query 'jobs[0].attempts[-1].container.logStreamName' --output text 2>/dev/null)" )
+    done
+  fi
+
+  echo "  --- $mode: real-work timing per worker (excludes cold start, AWS-specific) ---"
+  for s in "${streams[@]}"; do
+    [[ -z $s || $s == None ]] && { echo "    (no log stream)"; continue; }
+    local line bytes elapsed rate part nch
+    line=$(aws logs filter-log-events --region "$REGION" --log-group-name /aws/batch/job \
+            --log-stream-names "$s" --filter-pattern '"KRUNCH_WORK_TIME"' \
+            --query 'events[0].message' --output text 2>/dev/null)
+    if [[ -z $line || $line == None ]]; then
+      echo "    stream=${s##*/}: no KRUNCH_WORK_TIME line yet (image may pre-date instrumentation?)"
+      continue
+    fi
+    bytes=$(  echo "$line" | sed -nE 's/.*bytes=([0-9]+).*/\1/p')
+    elapsed=$(echo "$line" | sed -nE 's/.*elapsed=([0-9.]+).*/\1/p')
+    rate=$(   echo "$line" | sed -nE 's/.*rate_kbps=([0-9.]+).*/\1/p')
+    part=$(   echo "$line" | sed -nE 's/.*part=([0-9]+).*/\1/p')
+    nch=$(    echo "$line" | sed -nE 's/.*n_chunks=([0-9]+).*/\1/p')
+    printf "    part=%s  bytes=%s  chunks=%s  real=%ss  per-worker=%s KB/s\n" \
+           "$part" "$bytes" "$nch" "$elapsed" "$rate"
+    total_bytes=$((total_bytes + bytes))
+    awk_cmp=$(awk "BEGIN{print ($elapsed > $max_elapsed) ? 1 : 0}")
+    [[ $awk_cmp == 1 ]] && max_elapsed=$elapsed
+  done
+  if [[ $total_bytes -gt 0 ]]; then
+    local agg
+    agg=$(awk "BEGIN{printf \"%.1f\", ($total_bytes/1024)/$max_elapsed}")
+    printf "    AGGREGATE: %s bytes / %ss max-wall = %s KB/s real work\n" \
+           "$total_bytes" "$max_elapsed" "$agg"
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -246,6 +303,8 @@ else
   echo "  compressed:  ${COMP_LEN} bytes"
   echo "  ratio:       ${RATIO}"
   echo "  wall:        ${COMPRESS_S}s aggregate (${COMP_KBS} KB/s including cold start)"
+  COMPRESS_PARENT_ID=$LAST_MAIN_ID
+  parse_work_times compress "$COMPRESS_PARENT_ID" "$WORKERS"
 fi
 
 # ---------------------------------------------------------------------------
@@ -278,6 +337,8 @@ DECOMP_LEN=$(aws s3api head-object --region "$REGION" --bucket "$BUCKET" \
 DECOMP_KBS=$(awk "BEGIN{printf \"%.1f\", ($DECOMP_LEN/1024)/${DECOMPRESS_S}}")
 echo "  decompressed: ${DECOMP_LEN} bytes"
 echo "  wall:         ${DECOMPRESS_S}s aggregate (${DECOMP_KBS} KB/s including cold start)"
+DECOMPRESS_PARENT_ID=$LAST_MAIN_ID
+parse_work_times decompress "$DECOMPRESS_PARENT_ID" "$WORKERS"
 
 # ---------------------------------------------------------------------------
 # Roundtrip byte-exact
