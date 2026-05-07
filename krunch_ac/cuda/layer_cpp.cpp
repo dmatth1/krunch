@@ -94,6 +94,20 @@ void launch_det_matmul_int8_tc(
     const void* A, const void* B_q,
     const void* scale, const void* offset,
     void* C, int write_fp32, int M, int K, int N, cudaStream_t stream);
+// W8A8 int8 Tensor Core matmul: int8 X * int8 W → int32 acc → fp16 out
+// scaled by per-row act scale and per-col weight scale.
+// K∈{768,3072}; M-bit-stable. See det_matmul_w8a8_tc.cu.
+void launch_det_matmul_w8a8_tc(
+    const void* X_q, const void* scale_x,
+    const void* W_q, const void* scale_w,
+    void* Y, int write_fp32, int M, int K, int N, cudaStream_t stream);
+// Per-row symmetric int8 quantization of fp16 [M, K] activations.
+// Outputs int8 X_q [M, K] + fp16 scale_x [M] (= row max_abs / 127).
+// One block per row; deterministic per-fp16-input → bit-stable encoder
+// vs decoder when both see same fp16 row values.
+void launch_quantize_per_row_int8(
+    const void* X, void* X_q, void* scale_x,
+    int M, int K, cudaStream_t stream);
 }
 
 // Detect sm_major once at process start. cp.async kernels (det_matmul_tc_async,
@@ -849,6 +863,66 @@ void register_layer_cpp(pybind11::module& m) {
     }, "int8 weight × fp16 act WMMA matmul (per-input-channel dequant).",
        pybind11::arg("x"), pybind11::arg("W_q"),
        pybind11::arg("scale"), pybind11::arg("offset"),
+       pybind11::arg("out_dtype") = c10::nullopt);
+    m.def("quantize_per_row_int8", [](at::Tensor x) {
+        // Per-row symmetric int8 quantization of fp16 [M, K] activations.
+        // Returns (X_q [M, K] int8, scale_x [M] fp16) where scale_x[m] =
+        // max(|X[m, :]|) / 127. Deterministic per-fp16-input → bit-stable
+        // encoder vs decoder.
+        auto xc = x.contiguous();
+        TORCH_CHECK(xc.scalar_type() == at::kHalf, "x must be fp16");
+        TORCH_CHECK(xc.dim() == 2, "x must be 2D [M, K]");
+        const int M = (int)xc.size(0);
+        const int K = (int)xc.size(1);
+        TORCH_CHECK(K == 768 || K == 3072,
+                    "quantize_per_row_int8 only supports K∈{768, 3072}");
+        auto X_q = at::empty({M, K}, xc.options().dtype(at::kChar));
+        auto scale_x = at::empty({M}, xc.options().dtype(at::kHalf));
+        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+        launch_quantize_per_row_int8(
+            xc.data_ptr(), X_q.data_ptr(), scale_x.data_ptr(),
+            M, K, stream);
+        return std::make_tuple(X_q, scale_x);
+    }, "Per-row symmetric int8 quantization. Returns (X_q, scale_x).",
+       pybind11::arg("x"));
+    m.def("det_matmul_w8a8", [](at::Tensor X_q, at::Tensor scale_x,
+                                  at::Tensor W_q, at::Tensor scale_w,
+                                  c10::optional<at::ScalarType> out_dtype) {
+        // W8A8 int8 Tensor Core matmul. Inputs:
+        //   X_q: int8 [M, K], scale_x: fp16 [M]
+        //   W_q: int8 [K, N], scale_w: fp16 [N]
+        // Output: Y[m, n] = scale_x[m] * scale_w[n] * sum_k(X_q[m,k] * W_q[k,n])
+        // K∈{768, 3072} (caller pre-checks).
+        auto xc = X_q.contiguous();
+        auto sc = scale_x.contiguous();
+        auto wc = W_q.contiguous();
+        auto swc = scale_w.contiguous();
+        TORCH_CHECK(xc.scalar_type() == at::kChar, "X_q must be int8");
+        TORCH_CHECK(sc.scalar_type() == at::kHalf, "scale_x must be fp16");
+        TORCH_CHECK(wc.scalar_type() == at::kChar, "W_q must be int8");
+        TORCH_CHECK(swc.scalar_type() == at::kHalf, "scale_w must be fp16");
+        const int M = (int)xc.size(0);
+        const int K = (int)xc.size(1);
+        const int N = (int)wc.size(-1);
+        TORCH_CHECK(wc.size(0) == K, "W_q shape mismatch");
+        TORCH_CHECK(sc.size(0) == M, "scale_x shape mismatch");
+        TORCH_CHECK(swc.size(0) == N, "scale_w shape mismatch");
+        TORCH_CHECK(K == 768 || K == 3072,
+                    "det_matmul_w8a8 only supports K∈{768, 3072}");
+        const auto dtype = out_dtype.has_value()
+            ? out_dtype.value() : at::kHalf;
+        auto out = at::empty({M, N}, sc.options().dtype(dtype));
+        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+        const int write_fp32 = (dtype == at::kFloat) ? 1 : 0;
+        launch_det_matmul_w8a8_tc(
+            xc.data_ptr(), sc.data_ptr(),
+            wc.data_ptr(), swc.data_ptr(),
+            out.data_ptr(), write_fp32, M, K, N, stream);
+        return out;
+    }, "W8A8 int8 Tensor Core matmul (per-output-channel weight scale, "
+       "per-row activation scale).",
+       pybind11::arg("X_q"), pybind11::arg("scale_x"),
+       pybind11::arg("W_q"), pybind11::arg("scale_w"),
        pybind11::arg("out_dtype") = c10::nullopt);
     m.def("det_matmul_bf16", [](at::Tensor x, at::Tensor W,
                                  c10::optional<at::ScalarType> out_dtype) {

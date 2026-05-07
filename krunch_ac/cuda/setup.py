@@ -41,6 +41,12 @@ setup(
                 # int8 weight × fp16 act WMMA — Phase 2 of int8 sprint
                 # (per-input-channel uint8, inline dequant in K-loop).
                 "det_matmul_int8_tc.cu",
+                # W8A8 int8-Tensor-Core matmul + per-row int8 activation
+                # quantization — Phase 2A of W8A8 sprint (per-output-channel
+                # symmetric weight, per-row symmetric activation, native
+                # int8 WMMA fragments). 2× compute throughput on Ampere
+                # (250 TOPS int8 vs 125 TFLOPS fp16 TC).
+                "det_matmul_w8a8_tc.cu",
             ],
             extra_compile_args={
                 "cxx": ["-O3", "-std=c++17"],
