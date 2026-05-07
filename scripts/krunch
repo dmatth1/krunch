@@ -233,9 +233,9 @@ def main():
     p_plan.add_argument("--target", required=True,
                         choices=["aws-batch", "k8s", "modal", "ray",
                                  "slurm", "gcp-batch", "local"])
-    p_plan.add_argument("--mode", default="compress",
+    p_plan.add_argument("--mode", required=True,
                         choices=["compress", "decompress"],
-                        help="Whether workers compress or decompress (default: compress)")
+                        help="Whether workers compress or decompress")
     p_plan.add_argument("--source", "--input", dest="input_url", required=True,
                         help="Input URL (s3://, http://, file://)")
     p_plan.add_argument("--dest", "--output", dest="output_url", required=True,

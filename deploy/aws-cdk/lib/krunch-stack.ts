@@ -6,7 +6,10 @@ import * as s3 from "aws-cdk-lib/aws-s3";
 import { Construct } from "constructs";
 
 export interface KrunchStackProps extends cdk.StackProps {
-  /** Max number of concurrent GPU workers. Default: 10 */
+  /** Max number of concurrent GPU workers. Default: 4 (matches the
+   * default fresh-account AWS service quota of 16 vCPU for On-Demand
+   * G+VT instances in us-east-1; 4× g5.xlarge = 16 vCPU). Override
+   * higher only if your AWS quota allows. */
   maxWorkers?: number;
   /** GPU instance type. Default: g5.xlarge (A10G, 16 GB VRAM) */
   instanceType?: ec2.InstanceType;
@@ -53,7 +56,7 @@ export class KrunchStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: KrunchStackProps = {}) {
     super(scope, id, props);
 
-    const maxWorkers = props.maxWorkers ?? 10;
+    const maxWorkers = props.maxWorkers ?? 4;
     const instanceType =
       props.instanceType ??
       ec2.InstanceType.of(ec2.InstanceClass.G5, ec2.InstanceSize.XLARGE);

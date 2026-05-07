@@ -22,7 +22,7 @@ def main(argv=None):
     p = argparse.ArgumentParser(prog="krunch.plan_cli")
     p.add_argument("--target", required=True,
                    choices=sorted(krunch_plan.TARGETS.keys()))
-    p.add_argument("--mode", default="compress",
+    p.add_argument("--mode", required=True,
                    choices=["compress", "decompress"])
     p.add_argument("--source", "--input", dest="input_url", required=True)
     p.add_argument("--dest", "--output", dest="output_url", required=True)

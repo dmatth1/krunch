@@ -74,7 +74,9 @@ jq .finalize job.json | aws batch submit-job --cli-input-json file:///dev/stdin 
 
 For decompress, swap `--mode decompress` and use `DecompressJobDefOutput`.
 `--workers` controls the array size (parallel GPU instances). The
-compute environment caps total parallelism via `maxWorkers` (default 10).
+compute environment caps total parallelism via `maxWorkers` (default 4 —
+matches the fresh-account 16 vCPU On-Demand G+VT quota in us-east-1;
+override higher only if your AWS quota allows).
 
 See `tests/batch.sh` at the repo root for a full working end-to-end
 example that compresses + decompresses + verifies byte-exact roundtrip
@@ -93,7 +95,12 @@ new KrunchStack(app, "KrunchStack", {
   spot: false,
 
   // Higher cap on concurrent GPU instances
-  maxWorkers: 50,
+  // Higher cap on concurrent GPU instances — first request a vCPU
+  // service-quota increase for "Running On-Demand G and VT instances"
+  // in your region (default 16 vCPU = 4× g5.xlarge). Without that, AWS
+  // will reject RunInstances with VcpuLimitExceeded regardless of this
+  // setting.
+  maxWorkers: 16,
 
   // Reuse an existing bucket instead of creating a new one
   s3BucketName: "my-existing-bucket",

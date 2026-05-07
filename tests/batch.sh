@@ -49,6 +49,50 @@ KRUNCH_IMAGE_TAG="${KRUNCH_IMAGE:-ghcr.io/dmatth1/krunch:latest}"
 TEST_TAG="$(date +%Y%m%d-%H%M%S)"
 POLL_INTERVAL="${KRUNCH_POLL_INTERVAL:-15}"
 DRY_RUN="${KRUNCH_BATCH_DRY_RUN:-0}"
+# Spin everything down on exit (success OR failure) so we don't accrue
+# idle costs after the test. Override with KRUNCH_BATCH_CLEANUP=0 to
+# keep instances warm (e.g., between back-to-back test runs).
+CLEANUP="${KRUNCH_BATCH_CLEANUP:-1}"
+
+# ---------------------------------------------------------------------------
+# Cleanup — runs on EXIT (any path). Sets every CE in the queue to
+# minvCpus=0 (so ASG drains naturally) AND force-terminates any Batch-
+# tagged g5.xlarge running right now (so we don't wait on ASG cooldown).
+# Both are safe no-ops if there's nothing to clean up.
+# ---------------------------------------------------------------------------
+cleanup() {
+  [[ $CLEANUP != 1 ]] && return 0
+  echo
+  echo "[cleanup] Spinning down compute envs + terminating workers..."
+  if [[ -n "${QUEUE:-}" ]]; then
+    for ce_arn in $(aws batch describe-job-queues --job-queues "$QUEUE" \
+                      --region "$REGION" \
+                      --query 'jobQueues[0].computeEnvironmentOrder[].computeEnvironment' \
+                      --output text 2>/dev/null); do
+      local ce_name=${ce_arn##*/}
+      aws batch update-compute-environment --compute-environment "$ce_name" \
+          --region "$REGION" --compute-resources minvCpus=0 \
+          --query 'computeEnvironmentName' --output text >/dev/null 2>&1 \
+        && echo "  $ce_name minvCpus=0" \
+        || echo "  $ce_name update failed (may be already updating; harmless)"
+    done
+  fi
+  local ids
+  ids=$(aws ec2 describe-instances --region "$REGION" \
+          --filters "Name=instance-state-name,Values=pending,running" \
+                    "Name=tag:AWSBatchServiceTag,Values=batch" \
+                    "Name=instance-type,Values=g5.xlarge" \
+          --query 'Reservations[].Instances[].InstanceId' --output text 2>/dev/null)
+  if [[ -n $ids ]]; then
+    aws ec2 terminate-instances --region "$REGION" --instance-ids $ids \
+        --query 'TerminatingInstances[].InstanceId' --output text >/dev/null 2>&1 \
+      && echo "  terminated: $ids" \
+      || echo "  ec2 terminate-instances failed for: $ids"
+  else
+    echo "  no Batch-tagged g5.xlarge instances running"
+  fi
+}
+trap cleanup EXIT
 
 # ---------------------------------------------------------------------------
 # Pre-flight: tools + sample + stack

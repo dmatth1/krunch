@@ -43,6 +43,7 @@ import sys
 import time
 import zlib
 import logging
+from typing import Optional
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s")
@@ -84,7 +85,7 @@ def _run_compress_worker():
     parts_prefix = _parts_prefix(dst)
     part_url = f"{parts_prefix}/part-{part_index:06d}"
 
-    start, end = _byte_range(part_index, part_count, total_size)
+    start, end = _byte_range(part_index, part_count, total_size, src=src)
     logger.info("compress part %d/%d: bytes [%d, %d) → %s",
                 part_index, part_count, start, end, part_url)
 
@@ -280,16 +281,70 @@ def _resolve_part_index() -> int:
                    "found in environment")
 
 
+def _snap_to_codepoint(src: str, offset: int, peek: int = 8) -> int:
+    """Return the smallest byte offset >= `offset` whose byte is the
+    start of a UTF-8 codepoint (i.e., NOT a continuation byte 0x80-0xBF).
+
+    Used to make worker byte ranges UTF-8-aligned. Two adjacent workers
+    snapping the SAME boundary offset always converge on the same
+    snapped offset (function of `src` and `offset` only — no shared
+    state needed), so handoffs are exact.
+
+    Without this, a worker whose [start, end) lands mid-codepoint feeds
+    invalid UTF-8 to `compress_chunk` (which decodes errors='replace');
+    the tokenizer roundtrip then doesn't byte-match the original, and
+    bytes are lost at every inter-worker boundary.
+
+    Reads up to `peek` bytes via ranged GET. UTF-8 codepoints are at
+    most 4 bytes, so 8 is overkill-safe. Worker 0's start (offset=0)
+    and the last worker's end (offset=total_size) skip the snap;
+    everything else snaps."""
+    if offset <= 0:
+        return 0
+    from . import url_io
+    window = url_io.read_range(src, offset, offset + peek)
+    for i, b in enumerate(window):
+        # Codepoint-start bytes are everything except continuation bytes.
+        if b < 0x80 or b >= 0xC0:
+            return offset + i
+    # No non-continuation byte in `peek` — input isn't valid UTF-8.
+    # Best-effort: return offset unchanged (the chunker will deal with
+    # errors='replace' as before; this is non-text input territory).
+    return offset
+
+
 def _byte_range(part_index: int, part_count: int,
-                total_size: int) -> tuple[int, int]:
+                total_size: int,
+                src: Optional[str] = None) -> tuple[int, int]:
     """Compute [start, end) for this part, aligned to the dynamic chunk
-    size derived from total_size. All N workers see the same total_size
-    (KRUNCH_INPUT_LEN) and so pick the same chunk_size — byte ranges
-    align across workers without coordination."""
+    size derived from total_size, then snapped to UTF-8 codepoint
+    boundaries so multi-worker compress preserves byte-exact roundtrip.
+
+    All N workers see the same total_size (KRUNCH_INPUT_LEN) and pick
+    the same chunk_size — proposed byte ranges align across workers
+    without coordination. The UTF-8 snap is also deterministic
+    per-offset, so worker N's snapped end equals worker N+1's snapped
+    start (perfect handoff).
+
+    `src` is required to perform the snap; if None, returns the raw
+    proposed range (legacy behavior; only safe for single-worker)."""
     from .chunking import compute_chunk_size
     chunk_size = compute_chunk_size(total_size)
     per_part = (total_size // part_count // chunk_size) * chunk_size
     per_part = max(per_part, chunk_size)
-    start = part_index * per_part
-    end = start + per_part if part_index < part_count - 1 else total_size
-    return start, min(end, total_size)
+    proposed_start = part_index * per_part
+    proposed_end = (proposed_start + per_part if part_index < part_count - 1
+                    else total_size)
+    proposed_end = min(proposed_end, total_size)
+
+    if src is None:
+        return proposed_start, proposed_end
+
+    # First worker's start is forced to 0 (always a codepoint boundary
+    # in any well-formed file). Last worker's end is forced to
+    # total_size (the tail must be included; if the file ends
+    # mid-codepoint that's the user's problem, not ours).
+    start = 0 if part_index == 0 else _snap_to_codepoint(src, proposed_start)
+    end = (total_size if part_index == part_count - 1
+           else _snap_to_codepoint(src, proposed_end))
+    return start, end
