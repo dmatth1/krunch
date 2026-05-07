@@ -522,7 +522,6 @@ class InferenceEngine:
         """
         import torch
         import krunch_ac_cuda
-        from krunch.codec.gpu_encode import probs_to_cdf_gpu
         from krunch import cpp_path
 
         B = len(chunks)
@@ -581,9 +580,13 @@ class InferenceEngine:
         for t in range(T_max):
             cur_in = inputs_padded[:, t].contiguous()
             logits = cpp_path.forward_stepped_batched(weights, cur_in, rwkv_state)
-            with torch.no_grad():
-                probs = torch.softmax(logits.float(), dim=-1)
-                cdfs = probs_to_cdf_gpu(probs).contiguous()  # [B, V+1]
+            # Use the same softmax+CDF kernel the decoder uses
+            # (cpp_path.softmax_cdfs_per_row → det_softmax_cdf + cumsum).
+            # Otherwise encoder builds CDFs via probs_to_cdf_gpu and
+            # decoder via softmax_cdfs_per_row — even with bit-identical
+            # logits, the two CDF kernels can differ by 1 LSB → AC
+            # bitstream un-recoverable. Pinned by docs/Bugs.md #2.
+            cdfs = cpp_path.softmax_cdfs_per_row(logits).contiguous()
             sym_t = tokens_padded[:, t].to(torch.int32).contiguous()
             krunch_ac_cuda.encode_step_batched(
                 cdfs, sym_t, output_buf, base_byte_offsets, ac_states)
