@@ -101,6 +101,16 @@ void launch_det_matmul_w8a8_tc(
     const void* X_q, const void* scale_x,
     const void* W_q, const void* scale_w,
     void* Y, int write_fp32, int M, int K, int N, cudaStream_t stream);
+// cp.async W8A8 (sm_80+ only). Bit-pattern DIFFERS from non-async W8A8
+// because the cp.async load order changes WMMA accumulator scheduling
+// (same K-loop order, but different overlap means different rounding
+// at int8 boundary cases). Encoder + decoder must use the SAME variant
+// or AC roundtrip breaks. Routing currently uses async on sm_80+ for
+// both compress and decompress; non-async is the sm_75 fallback.
+void launch_det_matmul_w8a8_tc_async(
+    const void* X_q, const void* scale_x,
+    const void* W_q, const void* scale_w,
+    void* Y, int write_fp32, int M, int K, int N, cudaStream_t stream);
 // Per-row symmetric int8 quantization of fp16 [M, K] activations.
 // Outputs int8 X_q [M, K] + fp16 scale_x [M] (= row max_abs / 127).
 // One block per row; deterministic per-fp16-input → bit-stable encoder
@@ -682,6 +692,18 @@ at::Tensor rwkv4_layer_step_cpp(
 
 // W8A8 GEMM helper: quantize x per-row, run W8A8 kernel.
 // Returns out [M, N] (fp16 by default; fp32 if write_fp32).
+//
+// Routing: on sm_80+ (A10G/A100/H100/L40S), uses cp.async + WMMA via
+// launch_det_matmul_w8a8_tc_async (overlaps gmem load with int8 mma_sync).
+// On sm_75 (T4), uses the synchronous det_matmul_w8a8_tc.
+//
+// Bit-stability: cp.async and non-cp.async kernels produce different
+// bit patterns (different reduction-overlap order at int8 boundary
+// cases). Encoder + decoder must use the SAME variant. Since the
+// USE_SM80_PLUS gate is process-static, encoder and decoder on the
+// SAME GPU agree by construction. Cross-GPU compatibility (encoded
+// on sm_80+, decoded on sm_75 or vice versa) would break — same
+// limitation as the existing fp16 cp.async path.
 static at::Tensor gemm_w8a8(at::Tensor x_fp16, at::Tensor W_q, at::Tensor scale_w,
                               c10::optional<at::ScalarType> out_dtype = c10::nullopt) {
     auto xc = x_fp16.contiguous();
@@ -693,55 +715,35 @@ static at::Tensor gemm_w8a8(at::Tensor x_fp16, at::Tensor W_q, at::Tensor scale_
     const int M = (int)xc.size(0);
     const int K = (int)xc.size(1);
     const int N = (int)Wc.size(-1);
-    // Quantize activations.
     auto Xq = at::empty({M, K}, xc.options().dtype(at::kChar));
     auto sx = at::empty({M}, xc.options().dtype(at::kHalf));
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     launch_quantize_per_row_int8(
         xc.data_ptr(), Xq.data_ptr(), sx.data_ptr(), M, K, stream);
-    // W8A8 matmul.
     const auto dtype = out_dtype.has_value() ? out_dtype.value() : at::kHalf;
     auto out = at::empty({M, N}, sc.options().dtype(dtype));
     const int write_fp32 = (dtype == at::kFloat) ? 1 : 0;
-    launch_det_matmul_w8a8_tc(
-        Xq.data_ptr(), sx.data_ptr(), Wc.data_ptr(), sc.data_ptr(),
-        out.data_ptr(), write_fp32, M, K, N, stream);
+    // Route cp.async on sm_80+. KRUNCH_W8A8_ASYNC=0 forces non-async
+    // (for debugging / regression bisect).
+    static const bool USE_W8A8_ASYNC = USE_SM80_PLUS && []{
+        const char* e = std::getenv("KRUNCH_W8A8_ASYNC");
+        return e == nullptr || std::string(e) != "0";
+    }();
+    if (USE_W8A8_ASYNC) {
+        launch_det_matmul_w8a8_tc_async(
+            Xq.data_ptr(), sx.data_ptr(), Wc.data_ptr(), sc.data_ptr(),
+            out.data_ptr(), write_fp32, M, K, N, stream);
+    } else {
+        launch_det_matmul_w8a8_tc(
+            Xq.data_ptr(), sx.data_ptr(), Wc.data_ptr(), sc.data_ptr(),
+            out.data_ptr(), write_fp32, M, K, N, stream);
+    }
     return out;
 }
 
-// W8A8 KVR: quantize x ONCE, run 3 W8A8 matmuls (saves 2 quantizations).
-static std::tuple<at::Tensor, at::Tensor, at::Tensor>
-gemm_w8a8_kvr(at::Tensor x_fp16,
-              at::Tensor Kw_q, at::Tensor Kw_s,
-              at::Tensor Vw_q, at::Tensor Vw_s,
-              at::Tensor Rw_q, at::Tensor Rw_s) {
-    auto xc = x_fp16.contiguous();
-    TORCH_CHECK(xc.scalar_type() == at::kHalf, "x must be fp16");
-    const int M = (int)xc.size(0);
-    const int K = (int)xc.size(1);
-    const int Nk = (int)Kw_q.size(-1);
-    const int Nv = (int)Vw_q.size(-1);
-    const int Nr = (int)Rw_q.size(-1);
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    auto Xq = at::empty({M, K}, xc.options().dtype(at::kChar));
-    auto sx = at::empty({M}, xc.options().dtype(at::kHalf));
-    launch_quantize_per_row_int8(
-        xc.data_ptr(), Xq.data_ptr(), sx.data_ptr(), M, K, stream);
-    // K, V → fp32 (matches existing fp16-path which casts K, V to float for WKV)
-    auto k = at::empty({M, Nk}, xc.options().dtype(at::kFloat));
-    auto v = at::empty({M, Nv}, xc.options().dtype(at::kFloat));
-    auto r = at::empty({M, Nr}, xc.options().dtype(at::kHalf));  // r_pre stays fp16
-    launch_det_matmul_w8a8_tc(
-        Xq.data_ptr(), sx.data_ptr(), Kw_q.contiguous().data_ptr(),
-        Kw_s.contiguous().data_ptr(), k.data_ptr(), /*fp32=*/1, M, K, Nk, stream);
-    launch_det_matmul_w8a8_tc(
-        Xq.data_ptr(), sx.data_ptr(), Vw_q.contiguous().data_ptr(),
-        Vw_s.contiguous().data_ptr(), v.data_ptr(), /*fp32=*/1, M, K, Nv, stream);
-    launch_det_matmul_w8a8_tc(
-        Xq.data_ptr(), sx.data_ptr(), Rw_q.contiguous().data_ptr(),
-        Rw_s.contiguous().data_ptr(), r.data_ptr(), /*fp32=*/0, M, K, Nr, stream);
-    return std::make_tuple(k, v, r);
-}
+// (gemm_w8a8_kvr removed — premix produces 3 distinct activations
+// kx/vx/rx, so per-input quantization can't be shared. Use 3 separate
+// gemm_w8a8 calls in the layer step.)
 
 at::Tensor rwkv4_layer_step_cpp_w8a8(
     at::Tensor x,

@@ -798,6 +798,13 @@ def forward_stepped_batched(weights: dict, last_tokens, state):
 
     Bit-identical per-chunk to running forward_stepped sequentially
     on each chunk (verified via test_batched_stepped.py).
+
+    W8A8 dispatch (Phase 2A Step 3, 2026-05-06): when bundle has
+    `w8a8_int8` (set by init_weights when KRUNCH_INT8_W8A8=1), uses the
+    W8A8 layer step. Required for bit-exact AC roundtrip — encoder
+    uses W8A8 packed; decoder must use SAME quant scheme to produce
+    matching logits. Cost: W8A8 regresses at small M (microbench
+    0.49× at M=16); the regression is the price of bit-exact W8A8.
     """
     import torch
     import krunch_ac_cuda
@@ -814,12 +821,31 @@ def forward_stepped_batched(weights: dict, last_tokens, state):
                                        device=weights["device"])
     B = int(last_tokens.shape[0])
     x = emb_w[last_tokens].view(B, 1, n_embd).contiguous()
-    for i in range(N_LAYER):
-        x = krunch_ac_cuda.rwkv4_layer_step_cpp(
-            x.contiguous(),
-            state[0][i], state[1][i], state[2][i], state[3][i], state[4][i],
-            *layers[i],
-        )
+
+    use_w8a8 = ("w8a8_int8" in weights)
+    if use_w8a8:
+        w8a8_int8 = weights["w8a8_int8"]
+        w8a8_scale = weights["w8a8_scale"]
+        for i in range(N_LAYER):
+            L = layers[i]
+            ints = w8a8_int8[i]
+            scales = w8a8_scale[i]
+            x = krunch_ac_cuda.rwkv4_layer_step_cpp_w8a8(
+                x.contiguous(),
+                state[0][i], state[1][i], state[2][i], state[3][i], state[4][i],
+                L[0], L[1], L[2], L[3], L[4], L[5], L[6],
+                ints[0], scales[0], ints[1], scales[1],
+                ints[2], scales[2], ints[3], scales[3],
+                L[11], L[12], L[13], L[14],
+                ints[4], scales[4], ints[5], scales[5], ints[6], scales[6],
+            )
+    else:
+        for i in range(N_LAYER):
+            x = krunch_ac_cuda.rwkv4_layer_step_cpp(
+                x.contiguous(),
+                state[0][i], state[1][i], state[2][i], state[3][i], state[4][i],
+                *layers[i],
+            )
     xn = F.layer_norm(x.view(B, n_embd), (n_embd,),
                       weight=ln_out_w, bias=ln_out_b)
     logits = krunch_ac_cuda.det_matmul(xn.contiguous(), head_w.contiguous())

@@ -47,6 +47,11 @@ setup(
                 # int8 WMMA fragments). 2× compute throughput on Ampere
                 # (250 TOPS int8 vs 125 TFLOPS fp16 TC).
                 "det_matmul_w8a8_tc.cu",
+                # cp.async + WMMA W8A8 — sm_80+ variant. Hides global-mem
+                # latency behind int8 mma_sync; needed to beat A10G fp16
+                # cp.async kernel (which itself uses cp.async to hide
+                # latency).
+                "det_matmul_w8a8_tc_async.cu",
             ],
             extra_compile_args={
                 "cxx": ["-O3", "-std=c++17"],

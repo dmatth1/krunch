@@ -473,6 +473,10 @@ class InferenceEngine:
         krunch_ac_cuda.decode_init_batched(input_buf, base_byte_offsets, ac_states)
 
         weights = cpp_path.init_weights(self._model, self._device)
+        # W8A8 mode (Phase 2A): decoder must use same path as encoder for
+        # bit-exact AC roundtrip. Force eager (graph captures aren't yet
+        # threaded through the W8A8 layer step).
+        w8a8_active = ("w8a8_int8" in weights)
         # CUDA-graph dispatch: three modes via KRUNCH_DECOMPRESS_GRAPH.
         #   "full"      (default if KRUNCH_OWN_WKV=1): emb → 12 layers →
         #               ln_out → head → softmax+CDF → AC decode all in one
@@ -485,6 +489,9 @@ class InferenceEngine:
         own_wkv = os.environ.get("KRUNCH_OWN_WKV") == "1"
         graph_mode = os.environ.get(
             "KRUNCH_DECOMPRESS_GRAPH", "full" if own_wkv else "eager")
+        # W8A8 layer step has no graph capture support yet — force eager.
+        if w8a8_active:
+            graph_mode = "eager"
         # Back-compat: prior env was "0"/"1" → map "1" to legacy per_layer.
         if graph_mode == "1":
             graph_mode = "per_layer"
