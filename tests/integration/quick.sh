@@ -7,7 +7,7 @@
 #   4. krunch plan --target aws-batch --dry-run (validates the rendered job spec)
 
 set -euo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 
 PASS=0
 FAIL=0
@@ -23,7 +23,7 @@ echo "=== Krunch quick checks ==="
 # 1. Unit tests
 echo "[1/4] Unit tests"
 if [[ -x /tmp/krunch-venv/bin/python ]]; then
-  /tmp/krunch-venv/bin/python tests/test_blob.py >/dev/null
+  /tmp/krunch-venv/bin/python tests/unit/test_blob.py >/dev/null
   report $? "unit tests (5/5)"
 else
   report 99 "smoke test — /tmp/krunch-venv missing (run: python3 -m venv /tmp/krunch-venv && /tmp/krunch-venv/bin/pip install constriction tokenizers zstandard numpy httpx boto3)"

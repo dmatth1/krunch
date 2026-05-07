@@ -14,7 +14,7 @@
 # (useful before ghcr.io publish exists, or to test a local diff).
 
 set -euo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 
 # ---------------------------------------------------------------------------
 # Config

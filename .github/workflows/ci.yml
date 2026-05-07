@@ -33,7 +33,7 @@ jobs:
           mkdir -p models
           curl -sL https://github.com/BlinkDL/RWKV-LM/raw/main/RWKV-v4/20B_tokenizer.json \
             -o models/20B_tokenizer.json
-          python tests/test_blob.py
+          python tests/unit/test_blob.py
 
       - name: Set up Node for CDK
         uses: actions/setup-node@v4
@@ -55,7 +55,7 @@ jobs:
           # 1. Render + schema-validate every plan target directly against
           #    the krunch package. Catches template syntax errors, missing
           #    placeholders, malformed JSON/YAML before they reach ghcr.io.
-          PYTHONPATH=. pytest tests/test_plan.py -v
+          PYTHONPATH=. pytest tests/unit/ -v
           # 2. Exercise the in-image plan_cli argparse path end-to-end
           #    against the source tree (same module that runs inside the
           #    Docker image). Emits the rendered plan to the CI log for

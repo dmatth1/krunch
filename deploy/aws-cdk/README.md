@@ -78,7 +78,7 @@ compute environment caps total parallelism via `maxWorkers` (default 4 —
 matches the fresh-account 16 vCPU On-Demand G+VT quota in us-east-1;
 override higher only if your AWS quota allows).
 
-See `tests/batch.sh` at the repo root for a full working end-to-end
+See `tests/integration/batch.sh` at the repo root for a full working end-to-end
 example that compresses + decompresses + verifies byte-exact roundtrip
 on a 100 MB WildChat sample.
 

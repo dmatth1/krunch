@@ -241,7 +241,7 @@ export class KrunchStack extends cdk.Stack {
 
     // ---------------------------------------------------------------------------
     // Outputs — consumed by `krunch plan --target aws-batch` (--queue
-    // and --job-definition flags) and by tests/batch.sh.
+    // and --job-definition flags) and by tests/integration/batch.sh.
     // ---------------------------------------------------------------------------
     new cdk.CfnOutput(this, "JobQueueArn", {
       value: jobQueue.ref,

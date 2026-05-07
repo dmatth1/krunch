@@ -1,7 +1,7 @@
 #!/bin/bash
 # Tier 4 — end-to-end AWS Batch fan-out roundtrip.
 #
-# Validates the distributed path that single-instance tests/gpu.sh can't
+# Validates the distributed path that single-instance tests/integration/gpu.sh can't
 # reach: `krunch plan --target aws-batch` rendering, GPU array job
 # execution, finalize-stitch dependency, and byte-exact decompress
 # roundtrip. Same exact CLI path a real user runs.
@@ -36,7 +36,7 @@
 # errors. Cost: $0 (only AWS calls are describe-stacks).
 
 set -euo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 
 # ---------------------------------------------------------------------------
 # Config
@@ -367,7 +367,7 @@ if [[ $DRY_RUN == 1 ]]; then
   Both compress + decompress plans rendered via 'krunch plan'.
   Submit-job calls printed; no AWS spend incurred (only describe-stacks).
 
-To run for real:  unset KRUNCH_BATCH_DRY_RUN  &&  tests/batch.sh
+To run for real:  unset KRUNCH_BATCH_DRY_RUN  &&  tests/integration/batch.sh
 EOF
   exit 0
 fi

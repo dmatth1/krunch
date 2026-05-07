@@ -12,7 +12,7 @@
 #   git clone --depth 1 https://github.com/BlinkDL/RWKV-LM.git /tmp/RWKV-LM
 
 set -euo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 
 VENV_PY=/tmp/krunch-venv/bin/python
 RWKV_LM_PATH=/tmp/RWKV-LM/RWKV-v4/src
