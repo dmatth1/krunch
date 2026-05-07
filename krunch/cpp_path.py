@@ -39,6 +39,39 @@ N_LAYER = 12
 _WEIGHTS_CACHE: dict[int, dict] = {}
 
 
+def _quantize_dequant_int8_per_output_channel(w):
+    """Per-output-channel SYMMETRIC int8 quantization SPIKE for the
+    W8A8 path (Phase 2A, 2026-05-06). Validates quality before
+    investing in the int8 WMMA kernel.
+
+    For [K, N] matrix, quantizes per-column (per-output-channel):
+        scale[j] = max(|W[:, j]|) / 127
+        W_q[k, j] = round(W[k, j] / scale[j])  ∈ [-127, 127]
+        W_dequant[k, j] = W_q[k, j] * scale[j]
+
+    Per-OUTPUT-channel (vs Phase 1 spike's per-INPUT-channel) because
+    in the W8A8 int8-WMMA path, the scale must be applied AFTER WMMA
+    accumulates along K → scale must be constant across K, i.e. per-N.
+
+    SYMMETRIC (no offset) because it's the standard W8A8 recipe — the
+    inner WMMA is pure int8 × int8 → int32; output is multiplied by
+    (scale_act[m] * scale_weight[n]) to recover fp16. With offsets,
+    the math has an extra correction term.
+
+    Same encoder/decoder application → same dequantized weights →
+    bit-exact AC roundtrip per model_id.
+    """
+    import torch
+    if w.dim() != 2:
+        return w
+    w_f = w.to(torch.float32)
+    max_abs = w_f.abs().max(dim=0, keepdim=True).values  # [1, N]
+    scale = (max_abs / 127).clamp(min=1e-8)              # [1, N]
+    w_q = (w_f / scale).round().clamp(-127, 127)
+    w_d = (w_q * scale).to(w.dtype)
+    return w_d
+
+
 def _quantize_dequant_uint8_per_input_channel(w):
     """Per-input-channel uint8 quantization SPIKE: quantizes a [K, N]
     fp16 matrix to uint8 then dequantizes back to fp16, simulating the
@@ -86,26 +119,37 @@ def init_weights(model, device: str = "cuda") -> dict:
     R/K/V) + emb + head to per-input-channel uint8, then dequantizes
     back to fp16 in-place. Bytes diverge from the fp16 codec → v2
     model_id (set 2 in the blob header, encoder + decoder must agree).
-    Spike phase: validates ratio quality before committing to a real
-    int8 kernel.
+    Phase 1 spike: validated ratio quality (+0.15% on WildChat T4).
+
+    KRUNCH_INT8_W8A8=1 uses per-OUTPUT-channel SYMMETRIC int8 quant
+    (matches the W8A8 int8-WMMA kernel recipe). Phase 2A spike
+    validates ratio for the W8A8 path before building the kernel.
+    Mutually exclusive with KRUNCH_INT8_WEIGHTS=1.
     """
     import torch
     key = (id(model),
            os.environ.get("KRUNCH_BF16", "0"),
-           os.environ.get("KRUNCH_INT8_WEIGHTS", "0"))
+           os.environ.get("KRUNCH_INT8_WEIGHTS", "0"),
+           os.environ.get("KRUNCH_INT8_W8A8", "0"))
     if key in _WEIGHTS_CACHE:
         return _WEIGHTS_CACHE[key]
 
     w = model.w
     use_bf16 = os.environ.get("KRUNCH_BF16") == "1"
     use_int8 = os.environ.get("KRUNCH_INT8_WEIGHTS") == "1"
+    use_w8a8 = os.environ.get("KRUNCH_INT8_W8A8") == "1"
+    if use_int8 and use_w8a8:
+        raise ValueError("Set at most one of KRUNCH_INT8_WEIGHTS / KRUNCH_INT8_W8A8")
 
     def fix(t, dt=None, quantize=False):
         t = t.to(device).contiguous()
         if dt is not None and t.dtype != dt:
             t = t.to(dtype=dt).contiguous()
-        if use_int8 and quantize:
-            t = _quantize_dequant_uint8_per_input_channel(t).contiguous()
+        if quantize:
+            if use_int8:
+                t = _quantize_dequant_uint8_per_input_channel(t).contiguous()
+            elif use_w8a8:
+                t = _quantize_dequant_int8_per_output_channel(t).contiguous()
         return t
 
     def matmul_dtype():
