@@ -108,3 +108,48 @@ def test_plan_cli_missing_required_mode_rejected(monkeypatch):
     with pytest.raises(SystemExit) as exc:
         plan_cli.main()
     assert exc.value.code == 2
+
+
+def test_plan_cli_input_len_zero_triggers_url_io_size(monkeypatch, capsys):
+    """--input-len 0 means 'go ask the source URL'. Mock url_io.size so
+    we don't hit the network."""
+    monkeypatch.setattr(sys, "argv", _plan_args("--input-len", "0"))
+    from krunch import plan_cli, url_io
+    monkeypatch.setattr(url_io, "size", lambda url: 12345)
+    rc = plan_cli.main()
+    assert rc == 0
+    # Rendered spec should contain the resolved size as KRUNCH_INPUT_LEN.
+    assert '"12345"' in capsys.readouterr().out
+
+
+def test_plan_cli_input_len_zero_warns_on_size_failure(monkeypatch, capsys):
+    """If url_io.size() raises (e.g. private bucket, no creds), emit a
+    warn-and-continue rather than crashing — caller can supply --input-len."""
+    monkeypatch.setattr(sys, "argv", _plan_args("--input-len", "0"))
+    from krunch import plan_cli, url_io
+
+    def boom(_):
+        raise RuntimeError("creds missing")
+    monkeypatch.setattr(url_io, "size", boom)
+
+    rc = plan_cli.main()
+    assert rc == 0  # rendered with input_len=0 + warning on stderr
+    err = capsys.readouterr().err
+    assert "couldn't stat" in err
+    assert "creds missing" in err
+
+
+def test_plan_cli_render_failure_returns_one(monkeypatch, capsys):
+    """When render() raises ValueError (e.g. broken template), main()
+    should print the error to stderr and return 1, not crash."""
+    monkeypatch.setattr(sys, "argv", _plan_args())
+    from krunch import plan_cli, plan_cli as _pc
+    from krunch import plan as krunch_plan
+
+    def boom(*_a, **_kw):
+        raise ValueError("bad template")
+    monkeypatch.setattr(krunch_plan, "render", boom)
+
+    rc = plan_cli.main()
+    assert rc == 1
+    assert "bad template" in capsys.readouterr().err

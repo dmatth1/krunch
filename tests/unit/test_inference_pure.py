@@ -117,3 +117,54 @@ def test_softmax_stable_for_extreme_logits():
     probs = _softmax_clip_normalize(logits)
     assert np.isfinite(probs).all()
     assert pytest.approx(probs.sum(), abs=1e-5) == 1.0
+
+
+# ---- ac_encode / ac_decode round-trip --------------------------------------
+
+from krunch.inference import ac_encode, ac_decode
+
+
+def test_ac_roundtrip_recovers_tokens():
+    """The arithmetic coder must be lossless: feed in tokens + their
+    distributions, encode, then decode with the same per-step
+    distributions, recover the same tokens. This is the core invariant
+    the whole codec depends on."""
+    rng = np.random.default_rng(0)
+    n_tokens, vocab = 64, 256
+    logits_seq = rng.standard_normal((n_tokens, vocab)).astype(np.float32)
+    # Sample tokens from the distributions (simulating what a real model
+    # would have predicted) so the bitstream stays compact.
+    tokens = []
+    for i in range(n_tokens):
+        p = _softmax_clip_normalize(logits_seq[i])
+        tokens.append(int(rng.choice(vocab, p=p)))
+
+    bitstream = ac_encode(tokens, logits_seq)
+    assert isinstance(bitstream, bytes)
+
+    # Decode using the same per-step logits.
+    cursor = {"i": 0}
+
+    def logits_fn(_state, _last_input):
+        i = cursor["i"]
+        cursor["i"] += 1
+        return logits_seq[i], None
+
+    decoded = ac_decode(bitstream, n_tokens, logits_fn)
+    assert decoded == tokens
+
+
+def test_ac_encode_rejects_length_mismatch():
+    rng = np.random.default_rng(1)
+    logits = rng.standard_normal((10, 256)).astype(np.float32)
+    with pytest.raises(AssertionError, match="length mismatch"):
+        ac_encode([1, 2, 3], logits)  # 3 tokens vs 10 logits
+
+
+def test_ac_encode_handles_empty_input():
+    """Zero-token edge case — produces an empty (or near-empty) bitstream
+    that decode round-trips back to []."""
+    logits = np.empty((0, 256), dtype=np.float32)
+    bitstream = ac_encode([], logits)
+    decoded = ac_decode(bitstream, 0, lambda *_: (None, None))
+    assert decoded == []
