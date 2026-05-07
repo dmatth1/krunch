@@ -18,11 +18,20 @@ bytes across the 100 MB corpus.
 """
 from pathlib import Path
 
+import pytest
 from tokenizers import Tokenizer
 
 # Same path the production code uses (krunch/inference.py:TOKENIZER_PATH).
+# The tokenizer JSON is gitignored (downloaded into models/ at setup time
+# alongside the .pth weights), so tests skip cleanly if it's not present
+# — e.g. in CI without model artifacts.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _TOKENIZER_PATH = _REPO_ROOT / "models" / "20B_tokenizer.json"
+
+_skip_if_missing = pytest.mark.skipif(
+    not _TOKENIZER_PATH.exists(),
+    reason=f"{_TOKENIZER_PATH} not present (gitignored model artifact)",
+)
 
 
 # Bytes containing several compatibility-equivalent codepoints that would
@@ -37,6 +46,7 @@ _NORMALIZATION_TRAPS = (
 )
 
 
+@_skip_if_missing
 def test_tokenizer_config_has_nfc_normalizer():
     """Sanity check: confirm the on-disk tokenizer DOES have NFC. If
     this ever changes, the disable line in inference.py becomes
@@ -48,6 +58,7 @@ def test_tokenizer_config_has_nfc_normalizer():
         f"tokenizer normalizer changed: {cfg.get('normalizer')!r}"
 
 
+@_skip_if_missing
 def test_default_tokenizer_breaks_byte_exact_on_traps():
     """Negative control — without disabling the normalizer, the
     tokenizer roundtrip is lossy on compatibility-equivalent Unicode."""
@@ -59,6 +70,7 @@ def test_default_tokenizer_breaks_byte_exact_on_traps():
     assert orig.encode("utf-8") != back.encode("utf-8")
 
 
+@_skip_if_missing
 def test_disabling_normalizer_gives_byte_exact_roundtrip():
     """Setting `tokenizer.normalizer = None` after load (what
     `InferenceEngine.load()` does) recovers byte-exact roundtrip on
