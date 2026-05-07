@@ -12,6 +12,43 @@
 #   KRUNCH_RATIO=0.114 scripts/bench_ratio.sh INPUT
 #
 # Requires: zstd (apt install zstd / brew install zstd).
+#
+# Corpora used in the README ratio table — fetch into data/<name>/
+# (gitignored) before running. README says ~100 MB per corpus where
+# the upstream supports it.
+#
+#   data/wildchat-en/wildchat_en_content.content.bin
+#       — Allen AI WildChat-1M (English subset). Repo-internal at
+#         data/spike6/wildchat_en_content.content.bin.
+#
+#   data/enwik8/enwik8.bin    (100 MB exactly)
+#       curl -L https://mattmahoney.net/dc/enwik8.zip -o /tmp/enwik8.zip
+#       unzip /tmp/enwik8.zip -d data/enwik8/
+#       mv data/enwik8/enwik8 data/enwik8/enwik8.bin
+#
+#   data/http_logs/nasa_apache_100mb.bin    (NASA Apache logs, 1995)
+#       curl -L https://ita.ee.lbl.gov/traces/NASA_access_log_Jul95.gz -o /tmp/jul.gz
+#       curl -L https://ita.ee.lbl.gov/traces/NASA_access_log_Aug95.gz -o /tmp/aug.gz
+#       gunzip /tmp/jul.gz /tmp/aug.gz
+#       cat /tmp/NASA_access_log_Jul95 /tmp/NASA_access_log_Aug95 \
+#           | head -c 104857600 > data/http_logs/nasa_apache_100mb.bin
+#
+#   data/support_tickets/bitext_support_tickets.csv    (~19 MB)
+#       python -c "from huggingface_hub import hf_hub_download; \
+#         hf_hub_download(repo_id='bitext/Bitext-customer-support-llm-chatbot-training-dataset', \
+#           filename='Bitext_Sample_Customer_Support_Training_Dataset_27K_responses-v11.csv', \
+#           repo_type='dataset', local_dir='data/support_tickets/')"
+#
+#   data/code_python/python_code_100mb.bin    (CodeParrot Python, 100 MB)
+#       python -c "from huggingface_hub import hf_hub_download; \
+#         hf_hub_download(repo_id='codeparrot/codeparrot-clean', \
+#           filename='file-000000000001.json.gz', \
+#           repo_type='dataset', local_dir='/tmp/')"
+#       python -c "import gzip,json; \
+#         out=open('data/code_python/python_code_100mb.bin','wb'); t=0; \
+#         f=gzip.open('/tmp/file-000000000001.json.gz','rt'); \
+#         [out.write((r['content']+chr(10)).encode('utf-8')) for r in (json.loads(L) for L in f) \
+#          for _ in [0] if (t := t + len(r['content'])+1) <= 100_000_000]"
 
 set -euo pipefail
 
