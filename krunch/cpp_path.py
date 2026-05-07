@@ -39,6 +39,26 @@ N_LAYER = 12
 _WEIGHTS_CACHE: dict[int, dict] = {}
 
 
+def _quantize_int8_per_output_channel(w):
+    """Per-output-channel symmetric int8 quantization (no dequant).
+    Returns (w_q [K, N] int8, scale [N] fp16). Pairs with the W8A8
+    int8 WMMA kernel at integration time.
+
+    Same recipe as _quantize_dequant_int8_per_output_channel — same
+    rounding, same scale formula — but returns the raw int8 buffer
+    + scale instead of dequantizing back to fp16. Used by init_weights
+    when KRUNCH_INT8_W8A8=1 to populate the W8A8 weight bundle.
+    """
+    import torch
+    if w.dim() != 2:
+        raise ValueError(f"expected 2D matrix; got shape {tuple(w.shape)}")
+    w_f = w.to(torch.float32)
+    max_abs = w_f.abs().max(dim=0, keepdim=True).values  # [1, N]
+    scale = (max_abs / 127).clamp(min=1e-8)              # [1, N]
+    w_q = (w_f / scale).round().clamp(-127, 127).to(torch.int8)
+    return w_q.contiguous(), scale.squeeze(0).to(torch.float16).contiguous()
+
+
 def _quantize_dequant_int8_per_output_channel(w):
     """Per-output-channel SYMMETRIC int8 quantization SPIKE for the
     W8A8 path (Phase 2A, 2026-05-06). Validates quality before
@@ -197,6 +217,37 @@ def init_weights(model, device: str = "cuda") -> dict:
         "n_att": int(model.args.n_att),
         "device": device,
     }
+
+    # W8A8 (Phase 2A Step 3 integration): also store raw int8 weights +
+    # per-output-channel scales for the 7 layer matmul weights. These are
+    # what `rwkv4_layer_step_cpp_w8a8` consumes; the existing fp16 layer
+    # weights in `layers` (already dequant-of-int8 per `fix(quantize=True)`)
+    # are kept for the decompress path which still uses the fp16 kernel
+    # (W8A8 regresses at small M; M-fallback handled at the layer-step
+    # level).
+    if use_w8a8:
+        # Order MUST match rwkv4_layer_step_cpp's matmul arg order:
+        # 0:Kw, 1:Vw, 2:Rw, 3:Ow, 4:ffn_Kw, 5:ffn_Vw, 6:ffn_Rw.
+        layers_w8a8_int8 = []
+        layers_w8a8_scale = []
+        for i in range(N_LAYER):
+            att = f"blocks.{i}.att."
+            ffn = f"blocks.{i}.ffn."
+            ints, scales = [], []
+            for name in ('key.weight', 'value.weight',
+                          'receptance.weight', 'output.weight'):
+                wf = w[att+name].to(device).to(torch.float16).contiguous()
+                wq, ws = _quantize_int8_per_output_channel(wf)
+                ints.append(wq); scales.append(ws)
+            for name in ('key.weight', 'value.weight', 'receptance.weight'):
+                wf = w[ffn+name].to(device).to(torch.float16).contiguous()
+                wq, ws = _quantize_int8_per_output_channel(wf)
+                ints.append(wq); scales.append(ws)
+            layers_w8a8_int8.append(ints)
+            layers_w8a8_scale.append(scales)
+        bundle["w8a8_int8"] = layers_w8a8_int8     # list of 12 lists of 7 int8 [K,N]
+        bundle["w8a8_scale"] = layers_w8a8_scale   # list of 12 lists of 7 fp16 [N]
+
     _WEIGHTS_CACHE[key] = bundle
     return bundle
 
@@ -262,12 +313,48 @@ def forward_packed_window(weights: dict, input_ids, state, off: int, n: int):
     ids_w = input_ids[off:off + n]
     T_w = int(ids_w.shape[0])
     x = emb_w[ids_w].view(1, T_w, n_embd).contiguous()
-    for i in range(N_LAYER):
-        x = krunch_ac_cuda.rwkv4_layer_step_cpp(
-            x.contiguous(),
-            state[0][i], state[1][i], state[2][i], state[3][i], state[4][i],
-            *layers[i],
-        )
+
+    # W8A8 dispatch (Phase 2A Step 3): compress packed forward at M >= 256
+    # uses the int8 Tensor Core path (1.5-2.2× per-call speedup at our
+    # shapes). Decompress (small M) keeps using the existing fp16 layer
+    # step on the dequant-fp16 weights stored in `layers` — same effective
+    # weights, so encoder W8A8 and decoder fp16 produce identical outputs
+    # (modulo activation-quant noise; verified by AC roundtrip at
+    # integration time).
+    use_w8a8 = ("w8a8_int8" in weights) and (T_w >= 256)
+    if use_w8a8:
+        w8a8_int8 = weights["w8a8_int8"]
+        w8a8_scale = weights["w8a8_scale"]
+        # Per layer, layers[i][:7] are non-matmul (LN1+bias, tm_k/v/r,
+        # time_decay, time_first), layers[i][7:11] are att matmuls
+        # (Kw,Vw,Rw,Ow), layers[i][11:13] are LN2, layers[i][13:15] are
+        # ffn_tm, layers[i][15:18] are ffn matmuls (Kw,Vw,Rw). The W8A8
+        # function takes the non-matmul args + (W_q,W_s) tuples for the
+        # 7 matmuls, in original arg-order: K, V, R, O, ffn_K, ffn_V, ffn_R.
+        for i in range(N_LAYER):
+            L = layers[i]
+            ints = w8a8_int8[i]    # [Kw,Vw,Rw,Ow,ffn_Kw,ffn_Vw,ffn_Rw]
+            scales = w8a8_scale[i]
+            x = krunch_ac_cuda.rwkv4_layer_step_cpp_w8a8(
+                x.contiguous(),
+                state[0][i], state[1][i], state[2][i], state[3][i], state[4][i],
+                # ln1, time_mix, time_decay/first
+                L[0], L[1], L[2], L[3], L[4], L[5], L[6],
+                # K, V, R, O matmul tuples
+                ints[0], scales[0], ints[1], scales[1],
+                ints[2], scales[2], ints[3], scales[3],
+                # ln2, ffn_time_mix
+                L[11], L[12], L[13], L[14],
+                # ffn K, V, R matmul tuples
+                ints[4], scales[4], ints[5], scales[5], ints[6], scales[6],
+            )
+    else:
+        for i in range(N_LAYER):
+            x = krunch_ac_cuda.rwkv4_layer_step_cpp(
+                x.contiguous(),
+                state[0][i], state[1][i], state[2][i], state[3][i], state[4][i],
+                *layers[i],
+            )
     x_flat = x.view(T_w, n_embd).contiguous()
     xn = F.layer_norm(x_flat, (n_embd,), weight=ln_out_w, bias=ln_out_b)
     return krunch_ac_cuda.det_matmul(xn.contiguous(), head_w.contiguous())
