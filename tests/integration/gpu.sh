@@ -20,7 +20,10 @@ cd "$(dirname "$0")/../.."
 # Config
 # ---------------------------------------------------------------------------
 REGION="${AWS_REGION:-us-east-1}"
-INSTANCE_TYPE="g5.xlarge"
+# Override via KRUNCH_INSTANCE_TYPE (e.g. g4dn.xlarge for T4, g6e.xlarge
+# for L40S). Note: tier-3 throughput gates are calibrated to A10G; smaller
+# GPUs will fail them (correctness still validates).
+INSTANCE_TYPE="${KRUNCH_INSTANCE_TYPE:-g5.xlarge}"
 
 # These are author-specific by default — override via env to point at your
 # own AWS resources. Required: an SSH key pair, a security group, an S3
