@@ -102,7 +102,25 @@ TEST_TAG="__TEST_TAG__"
 REGION="__REGION__"
 LOCAL_BUILD="__LOCAL_BUILD__"
 KRUNCH_IMAGE_TAG="__KRUNCH_IMAGE_TAG__"
-INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+
+# Ship logs to S3 on ANY exit path (success, set -e abort, crash). Without
+# this, a mid-script failure leaves the only log on the soon-terminated
+# instance — see CLAUDE.md "AWS account access" debug note. Also writes a
+# minimal result.json on failure so the host poller can surface it.
+trap 'rc=$?
+  aws s3 cp /var/log/krunch-tier3.log "${S3_BASE}/setup.log" \
+    --region "${REGION}" 2>/dev/null || true
+  if [[ $rc -ne 0 ]]; then
+    python3 -c "import json; json.dump({\"all_gates_pass\": False, \"error\": \"user-data exited rc=$rc — see setup.log\"}, open(\"/tmp/result.json\",\"w\"))" 2>/dev/null \
+      && aws s3 cp /tmp/result.json "${S3_BASE}/result.json" --region "${REGION}" 2>/dev/null || true
+  fi' EXIT
+# IMDSv2-aware metadata fetch — DLAMI-style images require a token, and
+# IMDSv1-only curl returns 401 silently. Empty INSTANCE_ID then breaks
+# the self-terminate at the end of this script.
+IMDS_TOKEN=$(curl -sS -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 21600' \
+  http://169.254.169.254/latest/api/token 2>/dev/null || true)
+INSTANCE_ID=$(curl -sS -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" \
+  http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || true)
 
 cd /tmp
 echo "FETCH_START $(date -u +%Y-%m-%dT%H:%M:%SZ)"

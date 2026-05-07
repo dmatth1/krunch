@@ -187,7 +187,10 @@ class InferenceEngine:
         # GREEK CAPITAL OMEGA, 3 bytes → 2 bytes), breaking byte-exact
         # roundtrip on text with such characters. BPE byte-level
         # tokenization handles the originals fine without the pass.
-        self._tokenizer.normalizer = None
+        # The tokenizers package rejects `None` as a normalizer value;
+        # use an empty Sequence as a no-op replacement.
+        from tokenizers.normalizers import Sequence as _NormSeq
+        self._tokenizer.normalizer = _NormSeq([])
 
         logger.info("Loading RWKV-4-Pile-169M from %s (device=%s)",
                     MODEL_PATH, self._device)
