@@ -51,8 +51,7 @@ krunch plan --target slurm  --mode compress --source … --dest … --workers 16
 > Only the AWS Batch path is end-to-end validated today. Templates for
 > k8s / Modal / Ray / Slurm / GCP Batch render + schema-validate in CI
 > but haven't been launched against a real orchestrator. See
-> [CONTRIBUTING.md](CONTRIBUTING.md#batch-target-validation-matrix) —
-> contributions welcome here.
+> [CONTRIBUTING.md](CONTRIBUTING.md) — contributions welcome here.
 
 Then run it with your own tooling and credentials:
 `aws batch submit-job --cli-input-json file://compress.json`,
@@ -121,10 +120,7 @@ a different compressor.
 
 ## Contributing
 
-Bug reports, real-orchestrator validation runs (k8s / Modal / Ray /
-Slurm / GCP Batch), corpus benchmarks, and fixes welcome — see
-[CONTRIBUTING.md](CONTRIBUTING.md). What's planned ahead is in
-[ROADMAP.md](ROADMAP.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
