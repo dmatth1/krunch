@@ -110,7 +110,14 @@ KRUNCH_IMAGE_TAG="__KRUNCH_IMAGE_TAG__"
 trap 'rc=$?
   aws s3 cp /var/log/krunch-tier3.log "${S3_BASE}/setup.log" \
     --region "${REGION}" 2>/dev/null || true
-  if [[ $rc -ne 0 ]]; then
+  # Only write the failure stub if the test body did not already
+  # upload a real result.json. Without this guard, a non-zero rc from
+  # something AFTER result.json was uploaded (e.g., a blocked
+  # terminate-instances when termination protection is on) would
+  # overwrite the real measurements with "rc=$rc — see setup.log",
+  # making a successful run look like a failure to the host poller.
+  if [[ $rc -ne 0 ]] && \
+     ! aws s3 ls "${S3_BASE}/result.json" --region "${REGION}" >/dev/null 2>&1; then
     python3 -c "import json; json.dump({\"all_gates_pass\": False, \"error\": \"user-data exited rc=$rc — see setup.log\"}, open(\"/tmp/result.json\",\"w\"))" 2>/dev/null \
       && aws s3 cp /tmp/result.json "${S3_BASE}/result.json" --region "${REGION}" 2>/dev/null || true
   fi' EXIT

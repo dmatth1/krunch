@@ -1,16 +1,23 @@
-"""GPU test collection guards + global env defaults.
+"""GPU test collection guards + cross-test isolation.
 
-Two things this conftest does:
+Three things this conftest does:
 
-1. Skip the whole tests/unit/gpu/ tree when pytest is run without a GPU
-   (collect_ignore_glob, evaluated at collection time before module
-   imports — needed because the test modules import torch + krunch_ac
-   at top level and would crash the collector otherwise).
+1. Skip the whole tests/unit/gpu/ tree when pytest is run without a
+   GPU (collect_ignore_glob, evaluated at collection time before
+   module imports — the test modules import torch + krunch_ac at top
+   level and would crash the collector otherwise).
 
-2. Default `KRUNCH_INT8_W8A8=0` for every test in this directory.
-   Reason: docs/Bugs.md #1 — small-chunk codec break on sm_75 with W8A8=1.
-   Tests that explicitly want to exercise W8A8 dispatch toggle the
-   var inside the test (and clear the init_weights cache).
+2. Provide session-scoped engine / weights / model fixtures so all
+   tests that need the model share ONE RWKV load. Per-module fixtures
+   would leak `cpp_path._WEIGHTS_CACHE` / `_BATCHED_STATE_CACHE` etc.
+   entries keyed on id(weights); when an old weights dict is GC'd,
+   Python can reuse the address and stale captured CUDA graphs replay
+   against unrelated memory.
+
+3. Reset every piece of process-global state between tests (autouse
+   fixture). Keeping captured CUDA graphs across tests was the cause
+   of docs/Bugs.md #2 — tests that passed in isolation failed in the
+   full suite.
 """
 import os
 
@@ -23,24 +30,6 @@ except Exception:
 if not _HAS_CUDA:
     collect_ignore_glob = ["test_*.py", "bench_*.py"]
 
-
-# Set BEFORE any test module imports cpp_path / krunch.inference; pytest
-# imports conftest.py before collecting test modules, so this is the
-# earliest hook available for env-var defaults.
-os.environ["KRUNCH_INT8_W8A8"] = "0"
-
-
-# ---------------------------------------------------------------------------
-# Session-scoped engine + weights fixtures.
-#
-# Tests that need the model share ONE engine for the whole pytest session.
-# Per-module engine fixtures load multiple RWKV models into GPU memory and,
-# more importantly, leak `cpp_path._WEIGHTS_CACHE` / `_BATCHED_STATE_CACHE` /
-# `_FULL_STEP_GRAPH_CACHE` entries that key on `id(weights)`. When an old
-# model gets garbage-collected, Python can reuse the address; stale CUDA-
-# graph captures then replay against unrelated memory and tests start
-# silently corrupting each other's output.
-# ---------------------------------------------------------------------------
 
 if _HAS_CUDA:
     import pytest
@@ -61,22 +50,50 @@ if _HAS_CUDA:
     def model(engine):
         return engine._model
 
+    # cpp_path graph + pointer-bound state caches. CUDA graphs are
+    # tied to specific tensor data pointers; replaying a captured
+    # graph against a different tensor (e.g., from a previous test)
+    # silently corrupts output.
+    #
+    # Crucially: do NOT clear `_WEIGHTS_CACHE`. The session-scoped
+    # `weights` fixture holds a reference to the cached weights dict.
+    # Clearing the cache forces init_weights to rebuild fresh weights
+    # the next time engine.compress_chunk is called → tests using
+    # `weights` (fixture) get the OLD dict; tests using `engine` get
+    # the NEW dict; the two dicts have different tensor pointers, and
+    # any graph captured against one fails against the other.
+    _CPP_CACHES = (
+        "_STEPPED_BUFS_CACHE",
+        "_GRAPH_CACHE",
+        "_STEPPED_BATCHED_BUFS_CACHE",
+        "_GRAPH_BATCHED_CACHE",
+        "_FULL_STEP_BUFS_CACHE",
+        "_FULL_STEP_GRAPH_CACHE",
+        "_BATCHED_STATE_CACHE",
+    )
+
+    # Codec env vars that some tests toggle (test_w8a8_dispatch,
+    # test_init_weights_*). Pop them between tests so the next test
+    # sees the production default (W8A8=1, BF16=0, INT8_WEIGHTS=0).
+    _CODEC_ENV_VARS = (
+        "KRUNCH_INT8_W8A8",
+        "KRUNCH_INT8_WEIGHTS",
+        "KRUNCH_BF16",
+    )
+
     @pytest.fixture(autouse=True)
     def _reset_state_between_tests():
-        """Reset everything that could carry across tests:
-
-        1. Env vars some tests toggle (W8A8, INT8_WEIGHTS, BF16). Keeps
-           the conftest's W8A8=0 default from getting clobbered.
-        2. cpp_path graph + state caches. CUDA graphs captured by
-           `decompress_chunks_batched` (B>=2) contaminate subsequent
-           `decompress_chunk` (B=1) calls in the same process. Production
-           cli.py never mixes the two; pytest does.
-        """
         yield
-        os.environ["KRUNCH_INT8_W8A8"] = "0"
-        os.environ.pop("KRUNCH_INT8_WEIGHTS", None)
-        os.environ.pop("KRUNCH_BF16", None)
+        for k in _CODEC_ENV_VARS:
+            os.environ.pop(k, None)
         from krunch import cpp_path
-        cpp_path._BATCHED_STATE_CACHE.clear()
-        cpp_path._FULL_STEP_BUFS_CACHE.clear()
-        cpp_path._FULL_STEP_GRAPH_CACHE.clear()
+        for name in _CPP_CACHES:
+            getattr(cpp_path, name).clear()
+        # cuBLAS pinned algo is global C++ state — set to default
+        # (-1 = CUBLAS_GEMM_DEFAULT). Without this, test_cublas_pinned's
+        # algo 99 leaks into every subsequent test.
+        try:
+            import krunch_ac_cuda
+            krunch_ac_cuda.set_cublas_pinned_algo(-1)
+        except Exception:
+            pass

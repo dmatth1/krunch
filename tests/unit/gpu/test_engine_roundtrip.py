@@ -6,13 +6,8 @@ decompress() at all surfaces here in ~30s on T4.
 
 Three samples (~360-1100 bytes) covering English prose, code-y text,
 and ASCII-only repetitive text. Each round-trips byte-exact.
-
-Note: forces `KRUNCH_INT8_W8A8=0` to dodge the small-chunk + sm_75
-W8A8 break filed under docs/Bugs.md #1. Once the bug is fixed, drop the
-override.
 """
 import os
-os.environ["KRUNCH_INT8_W8A8"] = "0"
 os.environ.setdefault("KRUNCH_DETERMINISTIC_MATMUL", "1")
 os.environ.setdefault("RWKV_CUDA_ON", "1")
 
