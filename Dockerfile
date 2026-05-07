@@ -35,8 +35,8 @@ m.forward([0], None); print('kernel warm-up ok') \
 " || echo "kernel warm-up skipped (no GPU at build time — will compile on first request)"
 
 # Application code
-COPY krunch/ /app/krunch/
-COPY krunch_ac/ /app/krunch_ac/
+COPY src/krunch/ /app/krunch/
+COPY src/krunch_ac/ /app/krunch_ac/
 
 # Build the GPU AC kernel (nvcc + ninja). Devel base has nvcc; ninja
 # is already installed above. No GPU needed at build time — nvcc only

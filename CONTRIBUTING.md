@@ -6,7 +6,7 @@ Two areas where contributions are most useful right now.
 
 AWS Batch is the only orchestrator shipped today. We'd like to support
 the rest. Each row below means: writing a Jinja template under
-`krunch/plan/templates/`, registering it in `krunch/plan/__init__.py`,
+`src/krunch/plan/templates/`, registering it in `src/krunch/plan/__init__.py`,
 and validating it end-to-end against the real orchestrator.
 
 | Target | Status |
@@ -20,7 +20,7 @@ and validating it end-to-end against the real orchestrator.
 | Local (single host) | ❌ wanted |
 
 The worker contract is documented in `README.md` ("Adding a new batch
-target") — `krunch/job.py` reads a small set of env vars
+target") — `src/krunch/job.py` reads a small set of env vars
 (`KRUNCH_INPUT_URL`, `KRUNCH_PART_INDEX`, `KRUNCH_PART_COUNT`, …) that
 any framework can inject.
 
