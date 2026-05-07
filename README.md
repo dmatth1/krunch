@@ -33,20 +33,28 @@ whatever batch system you already use. `krunch plan` emits a
 ready-to-run artifact for the target you pick.
 
 ```bash
-# Compress
+# Compress (AWS Batch — only target shipped today)
 krunch plan --target aws-batch --mode compress \
     --source s3://… --dest s3://… --workers 16 > compress.json
 
 # Decompress
 krunch plan --target aws-batch --mode decompress \
     --source s3://… --dest s3://… --workers 16 > decompress.json
+
+# Planned targets — same flag shape, not yet implemented
+krunch plan --target k8s       --mode compress --source … --dest … --workers 16 > job.yaml
+krunch plan --target modal     --mode compress --source … --dest … --workers 16 > run.py
+krunch plan --target ray       --mode compress --source … --dest … --workers 16 > run.py
+krunch plan --target slurm     --mode compress --source … --dest … --workers 16 > run.sbatch
+krunch plan --target gcp-batch --mode compress --source … --dest … --workers 16 > job.json
 ```
 
 Then submit with your own tooling and credentials:
-`aws batch submit-job --cli-input-json file://compress.json`.
+`aws batch submit-job --cli-input-json file://compress.json`,
+`kubectl apply -f job.yaml`, `modal run run.py`, etc.
 
-> AWS Batch is the only target shipped today. k8s / Modal / Ray /
-> Slurm / GCP Batch / local are planned — see
+> Only `--target aws-batch` works today; the rest are illustrative of
+> the intended UX. Contributions welcome — see
 > [CONTRIBUTING.md](CONTRIBUTING.md).
 
 See [`deploy/aws-cdk/`](deploy/aws-cdk/) for a working AWS Batch
