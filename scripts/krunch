@@ -171,38 +171,24 @@ def cmd_plan(args):
     renderer. Templates live in the Docker image so we never have to
     keep host-side and image-side copies in sync.
 
-    For --target aws-batch, auto-resolve --queue / --job-definition /
-    --finalize-job-definition from CloudFormation stack outputs when
-    not explicitly passed. Means a typical user invocation reduces to:
-        krunch plan --target aws-batch --mode compress \
-          --source s3://… --dest s3://… --workers 16 > job.json
-    """
-    queue = args.queue
-    job_def = args.job_definition
-    finalize_jd = args.finalize_job_definition
-    if args.target == "aws-batch" and (
-        queue is None or job_def is None or finalize_jd is None
-    ):
-        outputs = _resolve_aws_batch_outputs(args.stack_name)
-        if queue is None:
-            queue = outputs.get("JobQueueArn")
-        if job_def is None:
-            key = ("CompressJobDefOutput" if args.mode == "compress"
-                   else "DecompressJobDefOutput")
-            job_def = outputs.get(key)
-        if finalize_jd is None:
-            finalize_jd = outputs.get("FinalizeJobDefOutput")
-    if queue is None or job_def is None:
-        print(f"Error: --queue and --job-definition required for "
-              f"target={args.target!r} (auto-resolution failed; pass "
-              f"explicitly or check that stack {args.stack_name!r} is "
-              f"deployed)", file=sys.stderr)
-        return 1
-    if finalize_jd is None:
-        # Non-AWS-Batch targets that don't have a separate finalize JD
-        # fall back to the worker JD (template will still render).
-        finalize_jd = job_def
+    The output contains only the krunch-specific portion of the spec
+    (env vars, command, resource requirements, array size, timeout).
+    Orchestrator-specific fields (queue, job-definition, dependsOn,
+    namespace, service-account, ...) are intentionally absent — the
+    user supplies them via the orchestrator's CLI at submit time:
 
+        ARRAY_ID=$(jq .main job.json | aws batch submit-job \\
+                       --cli-input-json file:///dev/stdin \\
+                       --job-queue $Q --job-definition $JD \\
+                       --query jobId --output text)
+        jq .finalize job.json | aws batch submit-job \\
+            --cli-input-json file:///dev/stdin \\
+            --job-queue $Q --job-definition $FINALIZE_JD \\
+            --depends-on jobId=$ARRAY_ID,type=SEQUENTIAL
+
+    Adding a new target = drop in a new template. No resolver, no
+    target-specific flags here.
+    """
     docker_args = [
         "docker", "run", "--rm",
         "--entrypoint", "python",
@@ -213,9 +199,6 @@ def cmd_plan(args):
         "--dest", args.output_url,
         "--workers", str(args.workers),
         "--image", args.image,
-        "--queue", queue,
-        "--job-definition", job_def,
-        "--finalize-job-definition", finalize_jd,
         "--cpus", str(args.cpus),
         "--gpus", str(args.gpus),
         "--memory-mb", str(args.memory_mb),
@@ -227,29 +210,6 @@ def cmd_plan(args):
     if args.dry_run:
         docker_args += ["--dry-run"]
     return subprocess.call(docker_args)
-
-
-def _resolve_aws_batch_outputs(stack_name: str) -> dict:
-    """Read CFN stack outputs into a {OutputKey: OutputValue} dict.
-    Returns an empty dict on any failure (missing aws CLI, no
-    credentials, stack not deployed). The caller emits a clear error
-    if a required key is missing — this just lets us soft-fail when
-    auto-resolution isn't possible."""
-    try:
-        out = subprocess.check_output(
-            ["aws", "cloudformation", "describe-stacks",
-             "--stack-name", stack_name,
-             "--query", "Stacks[0].Outputs",
-             "--output", "json"],
-            stderr=subprocess.DEVNULL,
-        )
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        return {}
-    try:
-        items = json.loads(out)
-    except json.JSONDecodeError:
-        return {}
-    return {o["OutputKey"]: o["OutputValue"] for o in (items or [])}
 
 
 
@@ -303,23 +263,6 @@ def main():
                              "cost target. Each worker = 1 GPU container.")
     p_plan.add_argument("--image", default=DEFAULT_IMAGE,
                         help=f"Docker image (default: {DEFAULT_IMAGE})")
-    p_plan.add_argument("--queue", default=None,
-                        help="Orchestrator queue / job-queue ARN. "
-                             "For --target aws-batch, auto-resolved from "
-                             "the deployed CDK stack outputs (--stack-name) "
-                             "if not provided.")
-    p_plan.add_argument("--job-definition", default=None,
-                        help="Worker job definition ARN. For --target "
-                             "aws-batch, auto-resolved from "
-                             "Compress/DecompressJobDefOutput in the CFN "
-                             "stack based on --mode if not provided.")
-    p_plan.add_argument("--finalize-job-definition", default=None,
-                        help="Finalize-task job definition ARN. For "
-                             "--target aws-batch, auto-resolved from "
-                             "FinalizeJobDefOutput if not provided.")
-    p_plan.add_argument("--stack-name", default="KrunchStack",
-                        help="CFN stack to read outputs from for "
-                             "auto-resolution (default: KrunchStack).")
     p_plan.add_argument("--cpus", type=int, default=4)
     p_plan.add_argument("--gpus", type=int, default=1)
     p_plan.add_argument("--memory-mb", type=int, default=14336,

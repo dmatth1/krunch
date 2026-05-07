@@ -1,9 +1,7 @@
 {
-  "_about": "krunch plan --target aws-batch — emit two AWS Batch submit-job specs (worker array + finalize). Submit in order: worker first, then finalize with dependsOn=[{jobId:<workerJobId>, type:SEQUENTIAL}].",
+  "_about": "krunch plan --target aws-batch — emits two krunch-specific halves of an AWS Batch submit-job spec. The orchestrator-specific fields (jobQueue, jobDefinition, dependsOn) are intentionally absent — caller supplies them via `aws batch submit-job --job-queue ... --job-definition ... --depends-on ...` flags, which the AWS CLI merges into the spec at submit time. Submit `.main` first; submit `.finalize` second with --depends-on jobId=<arrayJobId>,type=SEQUENTIAL.",
   "main": {
     "jobName": "krunch-{{ mode }}-{{ run_id }}",
-    "jobQueue": "{{ queue }}",
-    "jobDefinition": "{{ job_definition }}",
     "arrayProperties": {"size": {{ n_workers }}},
     "containerOverrides": {
       "command": ["job"],
@@ -25,8 +23,6 @@
   },
   "finalize": {
     "jobName": "krunch-finalize-{{ run_id }}",
-    "jobQueue": "{{ queue }}",
-    "jobDefinition": "{{ finalize_job_definition }}",
     "containerOverrides": {
       "command": ["job"],
       "environment": [

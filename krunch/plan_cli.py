@@ -28,13 +28,6 @@ def main(argv=None):
     p.add_argument("--dest", "--output", dest="output_url", required=True)
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--image", required=True)
-    p.add_argument("--queue", default="krunch-queue")
-    p.add_argument("--job-definition", default="krunch-job")
-    p.add_argument("--finalize-job-definition", default=None,
-                   help="Job definition for the finalize stitcher. "
-                        "Defaults to --job-definition if not set; for "
-                        "AWS Batch the finalize task is CPU-only so "
-                        "callers should supply a separate CPU JobDef.")
     p.add_argument("--cpus", type=int, default=4)
     p.add_argument("--gpus", type=int, default=1)
     p.add_argument("--memory-mb", type=int, default=16384)
@@ -63,9 +56,6 @@ def main(argv=None):
         "n_workers":         args.workers,
         "n_workers_minus_1": max(0, args.workers - 1),
         "image":             args.image,
-        "queue":             args.queue,
-        "job_definition":    args.job_definition,
-        "finalize_job_definition": args.finalize_job_definition or args.job_definition,
         "cpus":              args.cpus,
         "gpus":              args.gpus,
         "memory_mb":         args.memory_mb,

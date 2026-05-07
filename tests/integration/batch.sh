@@ -225,9 +225,15 @@ submit_pair() {
   fi
   jq -c '.finalize' "$plan_json" > "$finalize_spec"
 
+  # Orchestrator-specific args (queue + JD) come from CFN outputs and
+  # are passed via aws-CLI flags — the rendered JSON stays
+  # orchestrator-agnostic. AWS CLI merges --job-queue / --job-definition
+  # / --depends-on into the spec at submit time.
   local main_id finalize_id
   main_id=$(aws batch submit-job --region "$REGION" \
-              --cli-input-json "file://${main_spec}" --query jobId --output text)
+              --cli-input-json "file://${main_spec}" \
+              --job-queue "$QUEUE" --job-definition "$jd" \
+              --query jobId --output text)
   if [[ -z $main_id || $main_id == None ]]; then
     echo "FAIL ${mode} submit-job returned no jobId; spec was:" >&2
     cat "$main_spec" >&2
@@ -238,6 +244,7 @@ submit_pair() {
 
   finalize_id=$(aws batch submit-job --region "$REGION" \
                   --cli-input-json "file://${finalize_spec}" \
+                  --job-queue "$QUEUE" --job-definition "$FINALIZE_JD" \
                   --depends-on "jobId=${main_id},type=SEQUENTIAL" \
                   --query jobId --output text)
   if [[ -z $finalize_id || $finalize_id == None ]]; then

@@ -42,41 +42,49 @@ Stack outputs (read by `krunch plan --target aws-batch`):
 
 ## Submit a compression job
 
-After deploy, render a job spec with `krunch plan` and submit via the
-AWS CLI. `krunch plan` produces two specs (`main` for the array job,
-`finalize` for the stitcher) — submit `main` first, then `finalize`
-with `dependsOn` on the array job.
+`krunch plan` emits an orchestrator-agnostic spec — env vars, command,
+container overrides, array size, timeout. The orchestrator-specific
+fields (job-queue, job-definition, dependsOn) you supply via the AWS
+CLI's own flags at submit time. `aws batch submit-job` merges the
+flags into the spec, so the rendered JSON stays portable.
 
-`krunch plan --target aws-batch` auto-resolves the `--queue`,
-`--job-definition`, and `--finalize-job-definition` ARNs from the
-deployed stack's CloudFormation outputs (default stack name:
-`KrunchStack`; override with `--stack-name`). `--input-len` auto-
-resolves from `--source` when it's an S3 URL.
+`--input-len` auto-resolves from `--source` when it's an S3 URL.
 
 ```bash
+# Render. krunch plan knows nothing about your queue or job defs.
 krunch plan --target aws-batch --mode compress \
   --source s3://<your-bucket>/logs/data.jsonl \
   --dest   s3://<your-bucket>/logs/data.krunch \
   --workers 4 > job.json
 
-ARRAY_ID=$(jq .main job.json | aws batch submit-job \
-    --cli-input-json file:///dev/stdin --query jobId --output text)
+# Look up the orchestrator-specific ARNs from the CDK stack outputs.
+QUEUE=$(aws cloudformation describe-stacks --stack-name KrunchStack \
+  --query 'Stacks[0].Outputs[?OutputKey==`JobQueueArn`].OutputValue' --output text)
+COMPRESS_JD=$(aws cloudformation describe-stacks --stack-name KrunchStack \
+  --query 'Stacks[0].Outputs[?OutputKey==`CompressJobDefOutput`].OutputValue' --output text)
+FINALIZE_JD=$(aws cloudformation describe-stacks --stack-name KrunchStack \
+  --query 'Stacks[0].Outputs[?OutputKey==`FinalizeJobDefOutput`].OutputValue' --output text)
 
+# Submit the array job (compress workers).
+ARRAY_ID=$(jq .main job.json | aws batch submit-job \
+    --cli-input-json file:///dev/stdin \
+    --job-queue "$QUEUE" --job-definition "$COMPRESS_JD" \
+    --query jobId --output text)
+
+# Submit the finalize job (CPU stitcher), waiting on the array.
 jq .finalize job.json | aws batch submit-job \
     --cli-input-json file:///dev/stdin \
-    --depends-on jobId=$ARRAY_ID,type=SEQUENTIAL
+    --job-queue "$QUEUE" --job-definition "$FINALIZE_JD" \
+    --depends-on jobId="$ARRAY_ID",type=SEQUENTIAL
 ```
 
-For decompress, swap `--mode decompress`. `--workers` controls the
-array size (parallel GPU instances). The compute environment caps
-total parallelism via `maxWorkers` (default 4 — matches the fresh-
-account 16 vCPU On-Demand G+VT quota in us-east-1; override higher
-only if your AWS quota allows).
+For decompress, swap `--mode decompress` and use `DecompressJobDefOutput`.
+`--workers` controls the array size (parallel GPU instances). The
+compute environment caps total parallelism via `maxWorkers` (default 4
+— matches the fresh-account 16 vCPU On-Demand G+VT quota in us-east-1;
+override higher only if your AWS quota allows).
 
-If your stack has a non-default name, pass `--stack-name <name>`. To
-override individual ARNs (e.g. point at a different queue), pass
-`--queue <arn>` / `--job-definition <arn>` / `--finalize-job-definition
-<arn>` explicitly — those skip auto-resolution.
+For a working end-to-end example, see `tests/integration/batch.sh`.
 
 See `tests/integration/batch.sh` at the repo root for a full working end-to-end
 example that compresses + decompresses + verifies byte-exact roundtrip

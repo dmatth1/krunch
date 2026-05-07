@@ -16,14 +16,17 @@ CTX_BASE = {
     "n_workers":         4,
     "n_workers_minus_1": 3,
     "image":             "ghcr.io/dmatth1/krunch:latest",
-    "queue":             "krunch-queue",
-    "job_definition":    "krunch-job",
-    "finalize_job_definition": "krunch-job-finalize",
     "cpus":              4,
     "gpus":              1,
     "memory_mb":         16384,
     "timeout_s":         3600,
     "run_id":            "test-run",
+    # Note: orchestrator-specific fields like queue / job_definition /
+    # namespace / service_account are intentionally NOT in the
+    # rendered spec. The user supplies them via the orchestrator's
+    # native CLI at submit time (e.g. `aws batch submit-job
+    # --job-queue ... --job-definition ...`). Keeps the templates
+    # truly portable: adding a new target = drop in a new template.
 }
 
 
@@ -42,7 +45,10 @@ def test_unknown_target_raises():
 
 
 def test_missing_var_raises():
-    ctx = {k: v for k, v in CTX_BASE.items() if k != "queue"}
+    # Drop a still-required template var (input_url) and confirm the
+    # render surfaces the unfilled placeholder rather than emitting a
+    # broken artifact.
+    ctx = {k: v for k, v in CTX_BASE.items() if k != "input_url"}
     ctx["target"] = "aws-batch"
     with pytest.raises(ValueError, match="unfilled placeholders"):
         krunch_plan.render("aws-batch", ctx)
