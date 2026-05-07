@@ -6,8 +6,7 @@
     "jobDefinition": "{{ job_definition }}",
     "arrayProperties": {"size": {{ n_workers }}},
     "containerOverrides": {
-      "image": "{{ image }}",
-      "command": ["python", "-m", "krunch.job"],
+      "command": ["job"],
       "environment": [
         {"name": "KRUNCH_MODE",       "value": "{{ mode }}"},
         {"name": "KRUNCH_INPUT_URL",  "value": "{{ input_url }}"},
@@ -29,8 +28,7 @@
     "jobQueue": "{{ queue }}",
     "jobDefinition": "{{ job_definition }}",
     "containerOverrides": {
-      "image": "{{ image }}",
-      "command": ["python", "-m", "krunch.job"],
+      "command": ["job"],
       "environment": [
         {"name": "KRUNCH_MODE",        "value": "finalize"},
         {"name": "KRUNCH_FINALIZE_OF", "value": "{{ mode }}"},

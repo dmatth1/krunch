@@ -29,20 +29,19 @@ export interface KrunchStackProps extends cdk.StackProps {
  * Krunch v1 — AWS Batch deployment.
  *
  * Architecture:
- *   krunch submit --source s3://... --dest s3://...
- *     → Batch array job  (N compress tasks, each reads one byte range)
- *     → Batch single job (1 assemble task, stitches parts → final blob)
+ *   krunch plan --target aws-batch ... > job.json
+ *   jq .main job.json     | aws batch submit-job ...   (N-task array, GPU)
+ *   jq .finalize job.json | aws batch submit-job ...   (1-task CPU, dependsOn array)
+ *
+ * Same flow for --mode compress and --mode decompress; the rendered
+ * spec sets KRUNCH_MODE per submission via containerOverrides.
  *
  * No always-on orchestrator. Batch handles scheduling, spot retry,
  * and scaling to maxWorkers in parallel.
  *
  * Quickstart:
  *   npm install && npx cdk bootstrap && npx cdk deploy
- *
- *   krunch submit \
- *     --source s3://my-bucket/logs/data.jsonl \
- *     --dest   s3://my-bucket/logs/data.krunch \
- *     --workers 4
+ *   # Then: krunch plan --target aws-batch ...  (see deploy/aws-cdk/README.md)
  *
  * Cold-start note:
  *   First job on a fresh compute environment takes ~15 min (EC2 launch +
@@ -118,7 +117,7 @@ export class KrunchStack extends cdk.Stack {
     // ---------------------------------------------------------------------------
     const sg = new ec2.SecurityGroup(this, "BatchSg", {
       vpc,
-      description: "krunch Batch workers — outbound only",
+      description: "krunch Batch workers - outbound only",
       allowAllOutbound: true,
     });
 
@@ -187,7 +186,9 @@ export class KrunchStack extends cdk.Stack {
       jobRoleArn: jobRole.roleArn,
       resourceRequirements: [
         { type: "VCPU",   value: "4" },
-        { type: "MEMORY", value: "16384" },
+        // 14336 (14 GB) fits g5.xlarge after ECS+OS overhead. Setting
+        // 16384 on a 16 GB instance trips MISCONFIGURATION:JOB_RESOURCE_REQUIREMENT.
+        { type: "MEMORY", value: "14336" },
         { type: "GPU",    value: "1" },
       ],
       environment: [
@@ -198,15 +199,30 @@ export class KrunchStack extends cdk.Stack {
       volumes: [],
     };
 
+    // GPU job definitions — same container shape for both compress and
+    // decompress. KRUNCH_MODE / KRUNCH_INPUT_URL / KRUNCH_OUTPUT_URL /
+    // KRUNCH_INPUT_LEN / KRUNCH_PART_INDEX / KRUNCH_PART_COUNT are
+    // injected per-submission via containerOverrides by `krunch plan`.
     const compressJobDef = new batch.CfnJobDefinition(this, "CompressJobDef", {
       type: "container",
       containerProperties: containerProps,
       retryStrategy: { attempts: 2 },  // retry once on spot interruption
       timeout: { attemptDurationSeconds: 3600 },
+      tags: { rev: "v2-mem14336" },
     });
 
-    // Assemble job: CPU only, no GPU needed
-    const assembleJobDef = new batch.CfnJobDefinition(this, "AssembleJobDef", {
+    const decompressJobDef = new batch.CfnJobDefinition(this, "DecompressJobDef", {
+      type: "container",
+      containerProperties: containerProps,
+      retryStrategy: { attempts: 2 },
+      timeout: { attemptDurationSeconds: 3600 },
+      tags: { rev: "v2-mem14336" },
+    });
+
+    // Finalize job: CPU only — stitches partial blobs into the final
+    // output. Same image, no GPU. Used by both compress and decompress
+    // flows (KRUNCH_FINALIZE_OF=compress|decompress set at submit time).
+    const finalizeJobDef = new batch.CfnJobDefinition(this, "FinalizeJobDef", {
       type: "container",
       containerProperties: {
         ...containerProps,
@@ -221,21 +237,27 @@ export class KrunchStack extends cdk.Stack {
     });
 
     // ---------------------------------------------------------------------------
-    // Outputs (read by `krunch submit` to resolve job queue + definitions)
+    // Outputs — consumed by `krunch plan --target aws-batch` (--queue
+    // and --job-definition flags) and by tests/batch.sh.
     // ---------------------------------------------------------------------------
     new cdk.CfnOutput(this, "JobQueueArn", {
       value: jobQueue.ref,
-      description: "Batch job queue — pass to krunch submit --job-queue",
+      description: "Batch job queue — pass to krunch plan --queue",
     });
 
     new cdk.CfnOutput(this, "CompressJobDefOutput", {
       value: compressJobDef.ref,
-      description: "Batch job definition for compress array tasks",
+      description: "GPU job definition for compress array tasks",
     });
 
-    new cdk.CfnOutput(this, "AssembleJobDefOutput", {
-      value: assembleJobDef.ref,
-      description: "Batch job definition for assemble task",
+    new cdk.CfnOutput(this, "DecompressJobDefOutput", {
+      value: decompressJobDef.ref,
+      description: "GPU job definition for decompress array tasks",
+    });
+
+    new cdk.CfnOutput(this, "FinalizeJobDefOutput", {
+      value: finalizeJobDef.ref,
+      description: "CPU job definition for the finalize stitcher (compress + decompress)",
     });
 
     new cdk.CfnOutput(this, "BucketName", {
@@ -243,14 +265,16 @@ export class KrunchStack extends cdk.Stack {
       description: "S3 bucket for compressed output and temp parts",
     });
 
-    new cdk.CfnOutput(this, "SubmitExample", {
+    new cdk.CfnOutput(this, "PlanExample", {
       value: [
-        "krunch submit",
+        "krunch plan --target aws-batch --mode compress",
         `  --source s3://${bucket.bucketName}/input/data.jsonl`,
         `  --dest   s3://${bucket.bucketName}/output/data.krunch`,
-        "  --workers 4",
+        "  --workers 4 --input-len $(stat -c%s data.jsonl)",
+        "  --queue <JobQueueArn> --job-definition <CompressJobDefOutput>",
+        "  > job.json",
       ].join(" \\\n"),
-      description: "Example krunch submit command",
+      description: "Example krunch plan invocation; submit job.main then job.finalize via aws batch submit-job",
     });
   }
 }

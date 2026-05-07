@@ -17,8 +17,8 @@ CI runs this on every push.
 
 ## `quick.sh` — local fast checks (free, seconds)
 
-What CI runs. `test_blob.py` + CDK type-check + `krunch submit --dry-run`
-plumbing.
+What CI runs. `test_blob.py` + CDK type-check + `krunch plan
+--target aws-batch --dry-run` schema validation.
 
 ```bash
 tests/quick.sh

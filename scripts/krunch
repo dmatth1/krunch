@@ -3,15 +3,21 @@
 krunch — neural compression CLI.
 
 Commands:
-  krunch compress    < input  > output      Single-shot compress on local GPU
-  krunch decompress  < input  > output      Single-shot decompress on local GPU
-  krunch submit      --source URL --dest URL [--workers N]   Distributed via AWS Batch
-  krunch status      --job-id ID                             Check Batch job status
+  krunch compress    < input  > output             Single-shot compress on local GPU
+  krunch decompress  < input  > output             Single-shot decompress on local GPU
+  krunch warmup                                    Prime the local cache volume
+  krunch plan        --target TARGET --source URL --dest URL --workers N
+                                                   Render a runnable artifact for any
+                                                   batch system (aws-batch, k8s, modal,
+                                                   ray, slurm, gcp-batch, local)
 
 `compress` / `decompress` shell out to Docker. Default image is
 ghcr.io/dmatth1/krunch:latest; override with KRUNCH_IMAGE env var.
 
-`submit` requires boto3 + AWS credentials with Batch + S3 permissions.
+For distributed runs, `krunch plan --target aws-batch ... > job.json`
+emits a Batch submit-job spec; submit it with `aws batch submit-job
+--cli-input-json file://job.json` (and a finalize task with
+`dependsOn=[{jobId:<arrayJobId>, type:SEQUENTIAL}]`).
 """
 
 import argparse
@@ -189,219 +195,6 @@ def cmd_plan(args):
     return subprocess.call(docker_args)
 
 
-# ---------------------------------------------------------------------------
-# submit
-# ---------------------------------------------------------------------------
-
-def cmd_submit(args):
-    from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).parent.parent))
-    from server import url_io
-
-    # Build the two job-submission payloads
-    job_tag = f"job-{int(time.time())}"
-    parts_prefix = f"{args.dest}.parts/{job_tag}"
-
-    compress_env = [
-        {"name": "KRUNCH_JOB_TYPE",    "value": "compress"},
-        {"name": "KRUNCH_SOURCE",      "value": args.source},
-        {"name": "KRUNCH_TOTAL_TASKS", "value": str(args.workers)},
-        {"name": "KRUNCH_PARTS_PREFIX","value": parts_prefix},
-    ]
-    assemble_env = [
-        {"name": "KRUNCH_JOB_TYPE",     "value": "assemble"},
-        {"name": "KRUNCH_PARTS_PREFIX", "value": parts_prefix},
-        {"name": "KRUNCH_N_PARTS",      "value": str(args.workers)},
-        {"name": "KRUNCH_DEST",         "value": args.dest},
-    ]
-    if args.chunk_size:
-        # Override the default 1 MB chunk size on both jobs (assemble must
-        # see the same value to stitch entries correctly).
-        cs = {"name": "KRUNCH_CHUNK_SIZE", "value": str(args.chunk_size)}
-        compress_env.append(cs)
-        assemble_env.append(cs)
-
-    compress_payload = {
-        "jobName": f"krunch-compress-{job_tag}",
-        "arrayProperties": {"size": args.workers},
-        "containerOverrides": {"environment": compress_env},
-    }
-    assemble_payload = {
-        "jobName": f"krunch-assemble-{job_tag}",
-        "containerOverrides": {"environment": assemble_env},
-    }
-
-    if args.dry_run:
-        print(json.dumps({
-            "stack": args.stack,
-            "source": args.source,
-            "dest": args.dest,
-            "workers": args.workers,
-            "spot": args.spot,
-            "compress_job": compress_payload,
-            "assemble_job": assemble_payload,
-        }, indent=2))
-        return 0
-
-    import boto3
-    job_queue, compress_jd, assemble_jd = _resolve_resources(
-        args.stack, args.job_queue, args.compress_job_def, args.assemble_job_def
-    )
-
-    print(f"Source:      {args.source}")
-    print(f"Dest:        {args.dest}")
-    print(f"Workers:     {args.workers}")
-    print(f"Job queue:   {job_queue}")
-
-    print("Getting file size...", end=" ", flush=True)
-    total_size = url_io.size(args.source)
-    print(f"{total_size:,} bytes ({total_size / 1024**3:.2f} GB)")
-
-    batch = boto3.client("batch")
-
-    # Add the resolved size + queue/def references to the payloads
-    compress_payload["containerOverrides"]["environment"].append(
-        {"name": "KRUNCH_TOTAL_SIZE", "value": str(total_size)}
-    )
-    assemble_payload["containerOverrides"]["environment"].append(
-        {"name": "KRUNCH_ORIGINAL_LEN", "value": str(total_size)}
-    )
-
-    print(f"\nSubmitting compress array job ({args.workers} tasks)...")
-    compress_resp = batch.submit_job(
-        jobQueue=job_queue,
-        jobDefinition=compress_jd,
-        **compress_payload,
-    )
-    compress_job_id = compress_resp["jobId"]
-    print(f"Compress job ID: {compress_job_id}")
-
-    # ---------------------------------------------------------------------------
-    # Poll compress job
-    # ---------------------------------------------------------------------------
-    print("Waiting for compress tasks to complete...")
-    t0 = time.time()
-    _poll_job(batch, compress_job_id, total_tasks=args.workers)
-    compress_elapsed = time.time() - t0
-    throughput = total_size / 1024 / compress_elapsed
-    print(f"Compress done in {compress_elapsed:.0f}s ({throughput:.0f} KB/s aggregate)")
-
-    # ---------------------------------------------------------------------------
-    # Submit assemble job
-    # ---------------------------------------------------------------------------
-    print("\nSubmitting assemble job...")
-    assemble_resp = batch.submit_job(
-        jobQueue=job_queue,
-        jobDefinition=assemble_jd,
-        dependsOn=[{"jobId": compress_job_id, "type": "SEQUENTIAL"}],
-        **assemble_payload,
-    )
-    assemble_job_id = assemble_resp["jobId"]
-    print(f"Assemble job ID: {assemble_job_id}")
-
-    _poll_job(batch, assemble_job_id, total_tasks=1)
-    total_elapsed = time.time() - t0
-
-    # ---------------------------------------------------------------------------
-    # Report
-    # ---------------------------------------------------------------------------
-    try:
-        dest_size = url_io.size(args.dest)
-        ratio = dest_size / total_size
-        print(f"\n{'='*50}")
-        print(f"Done in {total_elapsed:.0f}s")
-        print(f"  Original:   {total_size:,} bytes")
-        print(f"  Compressed: {dest_size:,} bytes")
-        print(f"  Ratio:      {ratio:.4f} ({ratio*100:.1f}% of original)")
-        print(f"  Output:     {args.dest}")
-    except Exception:
-        print(f"\nDone in {total_elapsed:.0f}s → {args.dest}")
-
-
-# ---------------------------------------------------------------------------
-# status
-# ---------------------------------------------------------------------------
-
-def cmd_status(args):
-    import boto3
-    batch = boto3.client("batch")
-    resp = batch.describe_jobs(jobs=[args.job_id])
-    if not resp["jobs"]:
-        print(f"Job {args.job_id} not found")
-        sys.exit(1)
-    job = resp["jobs"][0]
-    print(json.dumps({
-        "jobId": job["jobId"],
-        "jobName": job["jobName"],
-        "status": job["status"],
-        "statusReason": job.get("statusReason", ""),
-        "createdAt": job.get("createdAt"),
-        "startedAt": job.get("startedAt"),
-        "stoppedAt": job.get("stoppedAt"),
-    }, indent=2, default=str))
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _poll_job(batch, job_id: str, total_tasks: int,
-              poll_interval: int = 15):
-    terminal = {"SUCCEEDED", "FAILED"}
-    last_status = None
-    while True:
-        resp = batch.describe_jobs(jobs=[job_id])
-        job = resp["jobs"][0]
-        status = job["status"]
-
-        if total_tasks > 1:
-            arr = job.get("arrayProperties", {}).get("statusSummary", {})
-            pending = arr.get("PENDING", 0) + arr.get("RUNNABLE", 0) + arr.get("STARTING", 0)
-            running = arr.get("RUNNING", 0)
-            succeeded = arr.get("SUCCEEDED", 0)
-            failed = arr.get("FAILED", 0)
-            line = (f"  {status}: pending={pending} running={running} "
-                    f"succeeded={succeeded} failed={failed}")
-        else:
-            line = f"  {status}"
-            if "statusReason" in job:
-                line += f" — {job['statusReason']}"
-
-        if line != last_status:
-            print(line)
-            last_status = line
-
-        if status in terminal:
-            if status == "FAILED":
-                print(f"Job {job_id} FAILED", file=sys.stderr)
-                sys.exit(1)
-            return
-
-        time.sleep(poll_interval)
-
-
-def _resolve_resources(stack_name, job_queue, compress_jd, assemble_jd):
-    """Look up resource names from CloudFormation stack outputs if not provided."""
-    if job_queue and compress_jd and assemble_jd:
-        return job_queue, compress_jd, assemble_jd
-
-    import boto3
-    cf = boto3.client("cloudformation")
-    resp = cf.describe_stacks(StackName=stack_name)
-    outputs = {o["OutputKey"]: o["OutputValue"]
-               for o in resp["Stacks"][0].get("Outputs", [])}
-
-    return (
-        job_queue   or outputs.get("JobQueueArn")          or _fail("--job-queue or --stack required"),
-        compress_jd or outputs.get("CompressJobDefOutput") or _fail("--compress-job-def or --stack required"),
-        assemble_jd or outputs.get("AssembleJobDefOutput") or _fail("--assemble-job-def or --stack required"),
-    )
-
-
-def _fail(msg):
-    print(f"Error: {msg}", file=sys.stderr)
-    sys.exit(1)
-
 
 # ---------------------------------------------------------------------------
 # Argument parsing
@@ -425,33 +218,6 @@ def main():
         p.add_argument("--dry-run", action="store_true",
                        help="Print the docker command instead of running it")
 
-    # submit
-    p_submit = sub.add_parser("submit", help="Submit a compression job")
-    p_submit.add_argument("--source", required=True,
-                          help="Source URL (s3://, http://, file://)")
-    p_submit.add_argument("--dest", required=True,
-                          help="Destination URL for compressed output")
-    p_submit.add_argument("--workers", type=int, default=1,
-                          help="Number of parallel compress tasks (default: 1)")
-    p_submit.add_argument("--chunk-size", type=int, default=None,
-                          metavar="BYTES",
-                          help="Chunk size in bytes (default: 1 MB / 1048576). "
-                               "Larger chunks → better ratio + amortized model "
-                               "load, but worse parallelism and higher VRAM.")
-    p_submit.add_argument("--spot", action=argparse.BooleanOptionalAction,
-                          default=True,
-                          help="Use spot instances (default: --spot)")
-    p_submit.add_argument("--stack", default="KrunchStack",
-                          help="CloudFormation stack name (default: KrunchStack)")
-    p_submit.add_argument("--job-queue",
-                          help="Batch job queue ARN or name (overrides --stack lookup)")
-    p_submit.add_argument("--compress-job-def",
-                          help="Batch job definition for compress tasks")
-    p_submit.add_argument("--assemble-job-def",
-                          help="Batch job definition for assemble task")
-    p_submit.add_argument("--dry-run", action="store_true",
-                          help="Print job submission payloads as JSON; don't call AWS")
-
     # warmup
     p_warmup = sub.add_parser(
         "warmup",
@@ -459,10 +225,6 @@ def main():
              "Removes ~60s of cold-container costs from later compress/decompress runs.")
     p_warmup.add_argument("--dry-run", action="store_true",
                           help="Print the docker command instead of running it")
-
-    # status
-    p_status = sub.add_parser("status", help="Check job status")
-    p_status.add_argument("--job-id", required=True)
 
     # plan — emit a runnable artifact for the user's batch system
     p_plan = sub.add_parser(
@@ -491,7 +253,11 @@ def main():
                         help="AWS Batch job definition (default: krunch-job)")
     p_plan.add_argument("--cpus", type=int, default=4)
     p_plan.add_argument("--gpus", type=int, default=1)
-    p_plan.add_argument("--memory-mb", type=int, default=16384)
+    p_plan.add_argument("--memory-mb", type=int, default=14336,
+                        help="Container memory in MB. Default 14336 (14 GB) "
+                             "fits g5.xlarge after ECS+OS overhead. "
+                             "Setting 16384 on a 16 GB instance gets "
+                             "MISCONFIGURATION:JOB_RESOURCE_REQUIREMENT from Batch.")
     p_plan.add_argument("--timeout-s", type=int, default=3600)
     p_plan.add_argument("--input-len", type=int, default=0,
                         help="Input byte size; auto-detected if --source is "
@@ -507,8 +273,6 @@ def main():
         "compress":   cmd_compress,
         "decompress": cmd_decompress,
         "warmup":     cmd_warmup,
-        "submit":     cmd_submit,
-        "status":     cmd_status,
         "plan":       cmd_plan,
     }
     rc = handlers[args.command](args)

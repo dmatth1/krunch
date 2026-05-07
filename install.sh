@@ -67,4 +67,4 @@ echo
 echo "  krunch compress   < input  > output"
 echo "  krunch decompress < input  > output"
 echo
-echo "For distributed jobs (AWS Batch): krunch submit --help"
+echo "For distributed jobs (AWS Batch / k8s / Modal / Ray / Slurm / GCP Batch): krunch plan --help"

@@ -79,7 +79,7 @@ def _run_compress_worker():
     dst = os.environ["KRUNCH_OUTPUT_URL"]
     total_size = int(os.environ["KRUNCH_INPUT_LEN"])
     part_count = int(os.environ["KRUNCH_PART_COUNT"])
-    part_index = int(os.environ["KRUNCH_PART_INDEX"])
+    part_index = _resolve_part_index()
     parts_prefix = _parts_prefix(dst)
     part_url = f"{parts_prefix}/part-{part_index:06d}"
 
@@ -129,7 +129,7 @@ def _run_decompress_worker():
     src = os.environ["KRUNCH_INPUT_URL"]
     dst = os.environ["KRUNCH_OUTPUT_URL"]
     part_count = int(os.environ["KRUNCH_PART_COUNT"])
-    part_index = int(os.environ["KRUNCH_PART_INDEX"])
+    part_index = _resolve_part_index()
     parts_prefix = _parts_prefix(dst)
     part_url = f"{parts_prefix}/part-{part_index:06d}"
 
@@ -238,6 +238,33 @@ def _run_finalize():
 def _parts_prefix(output_url: str) -> str:
     """parts/<i> live alongside the final output URL."""
     return output_url.rstrip("/") + ".parts"
+
+
+def _resolve_part_index() -> int:
+    """Read KRUNCH_PART_INDEX, or fall back to orchestrator-native env vars
+    if the wrapper template's Ref:: substitution didn't apply.
+
+    AWS Batch's `Ref::AWS_BATCH_JOB_ARRAY_INDEX` substitution only works
+    for command-line parameters, NOT for env values — so on Batch array
+    jobs the literal string "Ref::AWS_BATCH_JOB_ARRAY_INDEX" reaches the
+    container in KRUNCH_PART_INDEX. Fall back to the auto-injected
+    AWS_BATCH_JOB_ARRAY_INDEX. Same idea for k8s/Slurm/Modal."""
+    raw = os.environ.get("KRUNCH_PART_INDEX", "")
+    if raw and not raw.startswith("Ref::"):
+        try:
+            return int(raw)
+        except ValueError:
+            pass
+    for fallback in ("AWS_BATCH_JOB_ARRAY_INDEX", "JOB_COMPLETION_INDEX",
+                     "SLURM_ARRAY_TASK_ID", "BATCH_TASK_INDEX",
+                     "MODAL_TASK_ID"):
+        v = os.environ.get(fallback)
+        if v is not None:
+            return int(v)
+    raise KeyError("KRUNCH_PART_INDEX missing and no orchestrator-native "
+                   "fallback (AWS_BATCH_JOB_ARRAY_INDEX, JOB_COMPLETION_INDEX, "
+                   "SLURM_ARRAY_TASK_ID, BATCH_TASK_INDEX, MODAL_TASK_ID) "
+                   "found in environment")
 
 
 def _byte_range(part_index: int, part_count: int,

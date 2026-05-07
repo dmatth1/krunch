@@ -4,7 +4,7 @@
 #   1. unit tests (header, AC codec, chunking, CRC, tokenizer)
 #   2. CDK TypeScript type-check
 #   3. CDK CloudFormation synth (proves the stack generates valid templates)
-#   4. krunch submit --dry-run (proves the CLI builds correct Batch payloads)
+#   4. krunch plan --target aws-batch --dry-run (validates the rendered job spec)
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -45,14 +45,17 @@ if [[ $synth_rc -ne 0 ]]; then
 fi
 report $synth_rc "cdk synth"
 
-# 4. krunch submit --dry-run
-echo "[4/4] krunch submit --dry-run"
-output=$(scripts/krunch submit --source s3://test/in --dest s3://test/out --workers 4 --dry-run 2>&1)
-if [[ $? -eq 0 ]] && echo "$output" | grep -q '"workers": 4' && echo "$output" | grep -q "compress_job"; then
-  report 0 "dry-run prints valid Batch payloads"
+# 4. krunch plan --target aws-batch --dry-run
+echo "[4/4] krunch plan --target aws-batch --dry-run"
+output=$(scripts/krunch plan --target aws-batch \
+  --source s3://test/in --dest s3://test/out \
+  --workers 4 --input-len 1048576 --dry-run 2>&1)
+rc=$?
+if [[ $rc -eq 0 ]]; then
+  report 0 "plan artifact validates against schema"
 else
   echo "$output" | head -10
-  report 1 "dry-run output malformed"
+  report 1 "plan artifact failed schema validation"
 fi
 
 echo

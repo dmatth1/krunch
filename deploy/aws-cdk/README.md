@@ -8,8 +8,8 @@ What gets created:
 - Two Batch compute environments (spot + on-demand fallback) using
   g5.xlarge instances, scale-to-zero when idle
 - A job queue routed to whichever environment the `--spot` prop selects
-- Two job definitions: `compress` (GPU array task) and `assemble`
-  (CPU stitcher)
+- Three job definitions: `compress` (GPU array task), `decompress`
+  (GPU array task), and `finalize` (CPU stitcher used by both modes)
 - An S3 bucket for compressed output and temporary parts (3-day
   lifecycle on `*.parts/` to clean orphans)
 
@@ -30,29 +30,55 @@ npx cdk bootstrap          # one-time per account/region
 npx cdk deploy
 ```
 
-Stack outputs (used by `krunch submit`):
+Stack outputs (read by `krunch plan --target aws-batch`):
 
 | Output | Purpose |
 |---|---|
 | `JobQueueArn` | Batch job queue to submit to |
-| `CompressJobDefOutput` | Job definition for compress array tasks |
-| `AssembleJobDefOutput` | Job definition for the assemble task |
+| `CompressJobDefOutput` | GPU job definition for compress array tasks |
+| `DecompressJobDefOutput` | GPU job definition for decompress array tasks |
+| `FinalizeJobDefOutput` | CPU job definition for the finalize stitcher |
 | `BucketName` | S3 bucket for output + temp parts |
 
 ## Submit a compression job
 
-After deploy, `krunch submit` reads the outputs from CloudFormation and
-fans out an array job + assemble:
+After deploy, render a job spec with `krunch plan` and submit it via
+the AWS CLI. `krunch plan` produces two specs (`main` for the array
+job, `finalize` for the stitcher) — submit `main` first, then
+`finalize` with `dependsOn` on the array job.
 
 ```bash
-krunch submit \
+INPUT_LEN=$(aws s3api head-object \
+    --bucket <your-bucket> --key logs/data.jsonl --query ContentLength --output text)
+
+krunch plan --target aws-batch \
+  --mode compress \
   --source s3://<your-bucket>/logs/data.jsonl \
   --dest   s3://<your-bucket>/logs/data.krunch \
-  --workers 8
+  --workers 8 \
+  --input-len $INPUT_LEN \
+  --queue $(aws cloudformation describe-stacks --stack-name KrunchStack \
+              --query 'Stacks[0].Outputs[?OutputKey==`JobQueueArn`].OutputValue' --output text) \
+  --job-definition $(aws cloudformation describe-stacks --stack-name KrunchStack \
+              --query 'Stacks[0].Outputs[?OutputKey==`CompressJobDefOutput`].OutputValue' --output text) \
+  > job.json
+
+ARRAY_ID=$(jq .main job.json | aws batch submit-job --cli-input-json file:///dev/stdin \
+            --query jobId --output text)
+
+jq .finalize job.json | aws batch submit-job --cli-input-json file:///dev/stdin \
+  --depends-on jobId=$ARRAY_ID,type=SEQUENTIAL \
+  --job-definition $(aws cloudformation describe-stacks --stack-name KrunchStack \
+              --query 'Stacks[0].Outputs[?OutputKey==`FinalizeJobDefOutput`].OutputValue' --output text)
 ```
 
+For decompress, swap `--mode decompress` and use `DecompressJobDefOutput`.
 `--workers` controls the array size (parallel GPU instances). The
 compute environment caps total parallelism via `maxWorkers` (default 10).
+
+See `tests/batch.sh` at the repo root for a full working end-to-end
+example that compresses + decompresses + verifies byte-exact roundtrip
+on a 100 MB WildChat sample.
 
 ## Customize
 
