@@ -150,14 +150,14 @@ def init_weights(model, device: str = "cuda") -> dict:
     key = (id(model),
            os.environ.get("KRUNCH_BF16", "0"),
            os.environ.get("KRUNCH_INT8_WEIGHTS", "0"),
-           os.environ.get("KRUNCH_INT8_W8A8", "0"))
+           os.environ.get("KRUNCH_INT8_W8A8", "1"))
     if key in _WEIGHTS_CACHE:
         return _WEIGHTS_CACHE[key]
 
     w = model.w
     use_bf16 = os.environ.get("KRUNCH_BF16") == "1"
     use_int8 = os.environ.get("KRUNCH_INT8_WEIGHTS") == "1"
-    use_w8a8 = os.environ.get("KRUNCH_INT8_W8A8") == "1"
+    use_w8a8 = os.environ.get("KRUNCH_INT8_W8A8", "1") == "1"
     if use_int8 and use_w8a8:
         raise ValueError("Set at most one of KRUNCH_INT8_WEIGHTS / KRUNCH_INT8_W8A8")
 
