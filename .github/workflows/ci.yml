@@ -22,18 +22,21 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install Python deps for smoke test
+      - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
-          pip install constriction tokenizers zstandard numpy
+          pip install constriction tokenizers zstandard numpy \
+                      pytest jsonschema jinja2 pyyaml
 
-      - name: Unit tests (blob format, AC codec, chunking, CRC, tokenizer)
+      - name: Fetch tokenizer (for normalizer + blob tests)
         run: |
-          # The blob test loads the GPT-NeoX BPE tokenizer from models/.
           mkdir -p models
           curl -sL https://github.com/BlinkDL/RWKV-LM/raw/main/RWKV-v4/20B_tokenizer.json \
             -o models/20B_tokenizer.json
-          python tests/unit/test_blob.py
+
+      - name: Unit tests
+        run: |
+          PYTHONPATH=. pytest tests/unit/ -v
 
       - name: Set up Node for CDK
         uses: actions/setup-node@v4
@@ -49,17 +52,11 @@ jobs:
           npm install --silent
           npx tsc --noEmit
 
-      - name: krunch plan --dry-run (renderer + CLI)
+      - name: krunch plan --dry-run end-to-end
         run: |
-          pip install pytest jsonschema jinja2 pyyaml
-          # 1. Render + schema-validate every plan target directly against
-          #    the krunch package. Catches template syntax errors, missing
-          #    placeholders, malformed JSON/YAML before they reach ghcr.io.
-          PYTHONPATH=. pytest tests/unit/ -v
-          # 2. Exercise the in-image plan_cli argparse path end-to-end
-          #    against the source tree (same module that runs inside the
-          #    Docker image). Emits the rendered plan to the CI log for
-          #    quick visual diff when templates change.
+          # Exercises the in-image plan_cli argparse path against the
+          # source tree. Emits the rendered plan to the CI log for quick
+          # visual diff when templates change.
           PYTHONPATH=. python -m krunch.plan_cli \
             --target aws-batch --mode compress \
             --source s3://test/in --dest s3://test/out \
