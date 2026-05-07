@@ -10,11 +10,8 @@ Workers use this to read their byte range from source and write results to dest.
 The orchestrator uses it to read file size, assemble final blob, clean up parts.
 """
 
-import io
-import os
 import urllib.request
 from pathlib import Path
-from typing import Optional
 
 
 # ---------------------------------------------------------------------------

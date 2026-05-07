@@ -73,3 +73,8 @@ krunch-rust/checkpoints/krunch_1l96h.bin
 bench/corpora/eval_suite/
 corpus_build/
 cdk/outputs*.json
+
+# Coverage runs (used in CI/local but per-run artifacts)
+.coverage
+.coverage.*
+htmlcov/

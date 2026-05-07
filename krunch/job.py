@@ -215,8 +215,8 @@ def _run_finalize():
             hdr = decode_header(blob)
             all_entries.append(blob[HEADER_SIZE:])
             total_chunks += hdr["n_chunks"]
-            logger.info("  part %d: %d chunks, %d bytes",
-                        i, hdr["n_chunks"], len(blob))
+            logger.debug("  part %d: %d chunks, %d bytes",
+                         i, hdr["n_chunks"], len(blob))
         master = (encode_header(original_len, total_chunks, crc32=0, flags=0x01)
                   + b"".join(all_entries))
         url_io.write(dst, master)
@@ -228,7 +228,7 @@ def _run_finalize():
         for i in range(part_count):
             blob = url_io.read_all(f"{parts_prefix}/part-{i:06d}")
             out.extend(blob)
-            logger.info("  part %d: %d bytes", i, len(blob))
+            logger.debug("  part %d: %d bytes", i, len(blob))
         url_io.write(dst, bytes(out))
         logger.info("assembled %d raw bytes → %s", len(out), dst)
     else:

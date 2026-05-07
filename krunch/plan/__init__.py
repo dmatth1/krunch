@@ -90,6 +90,12 @@ def _validate_json(text: str) -> None:
     json.loads(text)
 
 
+# The yaml / py / text validators below are reserved for the planned
+# targets (k8s, Modal, Ray, Slurm, GCP Batch, local) — see
+# CONTRIBUTING.md. Tests in tests/unit/test_plan_validators.py keep
+# them exercised so they don't bit-rot before a contributor wires up
+# the corresponding template.
+
 def _validate_yaml(text: str) -> None:
     # YAML lib isn't a runtime dep; do a light text check that the
     # file is non-empty and starts with `apiVersion:` (k8s-shape).
