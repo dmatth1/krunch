@@ -29,6 +29,9 @@ server/kernel_cache/
 # Internal planning + working notes (not for public repo)
 CLAUDE.md
 docs/
+
+# Local Claude Code agent state (scheduled tasks, transcripts, etc.)
+.claude/
 !bench/corpora/.gitkeep
 !bench/corpora/README.md
 
