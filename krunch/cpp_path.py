@@ -537,7 +537,7 @@ def forward_step_full_graphed_v3(weights: dict, ac_state, input_buf,
 
     REQUIRES: `KRUNCH_OWN_WKV=1` (graph-safe WKV is prerequisite — the pip
     rwkv WKV op uses a c10 dispatcher lookup that doesn't replay
-    deterministically; verified by tests/unit/gpu/test_t31_graph_diagnostic.py).
+    deterministically).
 
     First call captures (snapshots state, runs 2 warmup passes, captures on
     a side stream, restores state). Subsequent calls replay the captured
