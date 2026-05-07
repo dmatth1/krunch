@@ -170,9 +170,7 @@ def decompress_all(entries_bytes: bytes, n_chunks: int,
         pos += comp_len
 
     # neural_batch_fn signature: list[encoded_bytes] -> list[decoded_bytes].
-    # Two implementations:
-    #   - DecompressWorkerPool.decompress_chunks (multi-process, recommended)
-    #   - InferenceEngine.decompress_chunks_batched (single-process lockstep)
+    # Production path: InferenceEngine.decompress_chunks_batched.
     if neural_batch_fn is not None and len(chunks) > 1:
         encs = [enc for _, enc in chunks]
         decoded_full = neural_batch_fn(encs)

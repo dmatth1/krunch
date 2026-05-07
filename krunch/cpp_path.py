@@ -2,12 +2,8 @@
 
 Wraps `krunch_ac_cuda.rwkv4_layer_step_cpp{,_t1}` + the deterministic
 matmul kernel + per-row softmax/CDF so encoder (packed T) and decoder
-(stepped T=1) produce byte-identical AC bitstreams.
-
-`KRUNCH_DETERMINISTIC_MATMUL=1` and `KRUNCH_CPP_PATH=1` default ON as
-of 2026-04-30 — bit-exact GPU AC roundtrip is the only correct path
-on GPU. Set either to 0 to fall back to the legacy BlinkDL forward
-(will FAIL roundtrip; kept for bench comparisons only).
+(stepped T=1) produce byte-identical AC bitstreams. This is the only
+GPU AC path; `KRUNCH_DETERMINISTIC_MATMUL=1` is forced on at import.
 """
 from __future__ import annotations
 
@@ -909,13 +905,6 @@ def softmax_cdf_one_row(logits_V):
     return counts[0].contiguous()
 
 
-def cpp_path_enabled() -> bool:
-    """Default ON as of 2026-04-30 — bit-exact GPU AC roundtrip is the
-    only correct path. Set KRUNCH_CPP_PATH=0 to fall back to the
-    legacy BlinkDL path (will FAIL roundtrip on GPU AC; kept for
-    bench comparisons only)."""
-    val = os.environ.get("KRUNCH_CPP_PATH", "1")
-    return val == "1"
 
 
 # Memory cost per cross-chunk batch slot (rough): RWKV-4-Pile-169M state
