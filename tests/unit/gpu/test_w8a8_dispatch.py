@@ -15,15 +15,9 @@ os.environ.setdefault("RWKV_CUDA_ON", "1")
 
 import pytest
 import torch
-from krunch.inference import _load_rwkv, MODEL_PATH
 from krunch import cpp_path
 
-
-@pytest.fixture(scope="module")
-def model():
-    RWKV = _load_rwkv()
-    return RWKV(model=str(MODEL_PATH).removesuffix(".pth"),
-                strategy="cuda fp16", verbose=False)
+# `model` fixture (session-scoped) is provided by conftest.py.
 
 
 def _init_with_env(model, **env):

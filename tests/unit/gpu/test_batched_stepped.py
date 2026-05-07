@@ -17,7 +17,7 @@ os.environ.setdefault("RWKV_CUDA_ON", "1")
 import pytest
 import torch
 import krunch_ac_cuda
-from krunch.inference import _load_rwkv, MODEL_PATH, BOS_TOKEN
+from krunch.inference import BOS_TOKEN
 from krunch import cpp_path
 
 N_LAYER = 12
@@ -28,12 +28,10 @@ def _max_abs(a, b):
     return (a.float() - b.float()).abs().max().item()
 
 
+# `weights` fixture (session-scoped) is provided by conftest.py.
 @pytest.fixture(scope="module")
-def model_weights():
-    RWKV = _load_rwkv()
-    model = RWKV(model=str(MODEL_PATH).removesuffix(".pth"),
-                 strategy="cuda fp16", verbose=False)
-    return cpp_path.init_weights(model, "cuda")
+def model_weights(weights):
+    return weights
 
 
 def _run_sequential(weights, seqs):

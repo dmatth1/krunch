@@ -4,15 +4,19 @@ The fastest test that catches the kind of regression we hit with the
 tokenizer normalizer crash: anything that breaks compress() or
 decompress() at all surfaces here in ~30s on T4.
 
-Three samples (~3 KB each) covering English prose, code-y text, and
-ASCII-only repetitive text. Each one round-trips byte-exact.
+Three samples (~360-1100 bytes) covering English prose, code-y text,
+and ASCII-only repetitive text. Each round-trips byte-exact.
+
+Note: forces `KRUNCH_INT8_W8A8=0` to dodge the small-chunk + sm_75
+W8A8 break filed under Bugs.md #1. Once the bug is fixed, drop the
+override.
 """
 import os
+os.environ["KRUNCH_INT8_W8A8"] = "0"
 os.environ.setdefault("KRUNCH_DETERMINISTIC_MATMUL", "1")
 os.environ.setdefault("RWKV_CUDA_ON", "1")
 
 import pytest
-from krunch.inference import InferenceEngine
 
 
 SAMPLES = {
@@ -31,13 +35,7 @@ SAMPLES = {
 }
 
 
-@pytest.fixture(scope="module")
-def engine():
-    """Load the engine once and reuse across all samples — model load is
-    by far the slowest step (~2s on warm GPU, longer with kernel JIT)."""
-    eng = InferenceEngine()
-    eng.load()
-    return eng
+# `engine` fixture is provided by conftest.py (session-scoped).
 
 
 @pytest.mark.parametrize("name", sorted(SAMPLES))

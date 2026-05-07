@@ -3,8 +3,13 @@
 Without algo pinning, cuBLAS picks different kernels at different M
 values, producing bit-distinct outputs that break AC roundtrip.
 `set_cublas_pinned_algo(99)` (CUBLAS_GEMM_ALGO0_TENSOR_OP) is what
-production uses; this test pins that the chosen algo is bit-stable on
-every RWKV-4-Pile-169M matmul shape.
+production uses on sm_80+; this test pins that the chosen algo is
+bit-stable on every RWKV-4-Pile-169M matmul shape.
+
+Skipped on sm<8 — algo 99 is a Tensor Core algo that's neither
+guaranteed bit-stable on Turing (sm_75) nor on the production T4
+path (which goes through different kernels per cpp_path.py auto-
+disable logic).
 """
 import os
 os.environ.setdefault("KRUNCH_CUBLAS_PINNED", "1")
@@ -14,6 +19,11 @@ os.environ.setdefault("RWKV_CUDA_ON", "1")
 import pytest
 import torch
 import krunch_ac_cuda as M
+
+pytestmark = pytest.mark.skipif(
+    torch.cuda.get_device_properties(0).major < 8,
+    reason="cuBLAS pinned algo path is sm_80+ only (production)",
+)
 
 
 def _max_abs(a, b):
