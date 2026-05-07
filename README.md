@@ -50,8 +50,8 @@ Then run it with your own tooling and credentials:
 `aws batch submit-job --cli-input-json file://compress.json`,
 `kubectl apply -f job.yaml`, `modal run run.py`, etc.
 
-See `examples/` for full reference deployments (including an AWS
-Batch CDK stack you can deploy as-is).
+See [`deploy/aws-cdk/`](deploy/aws-cdk/) for a working AWS Batch
+reference stack you can `cdk deploy` as-is.
 
 ## Throughput
 
