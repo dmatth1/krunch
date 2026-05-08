@@ -87,13 +87,6 @@ void launch_krunch_wkv_forward(
     const float* k, const float* v, float* y,
     float* aa, float* bb, float* pp,
     cudaStream_t stream);
-// int8 weight × fp16 act WMMA matmul with inline per-input-channel
-// dequant. K∈{768,3072}; bit-stable across M; same scheduling as
-// det_matmul_tc_mw. See det_matmul_int8_tc.cu.
-void launch_det_matmul_int8_tc(
-    const void* A, const void* B_q,
-    const void* scale, const void* offset,
-    void* C, int write_fp32, int M, int K, int N, cudaStream_t stream);
 // W8A8 int8 Tensor Core matmul: int8 X * int8 W → int32 acc → fp16 out
 // scaled by per-row act scale and per-col weight scale.
 // K∈{768,3072}; M-bit-stable. See det_matmul_w8a8_tc.cu.
@@ -962,42 +955,6 @@ void register_layer_cpp(pybind11::module& m) {
           "Deterministic shape-invariant matmul: y = x @ W.",
           pybind11::arg("x"), pybind11::arg("W"),
           pybind11::arg("out_dtype") = c10::nullopt);
-    m.def("det_matmul_int8", [](at::Tensor x, at::Tensor W_q,
-                                 at::Tensor scale, at::Tensor offset,
-                                 c10::optional<at::ScalarType> out_dtype) {
-        // int8 weight × fp16 act WMMA matmul with inline per-input-channel
-        // dequant. y = x @ (W_q * scale[:,None] + offset[:,None]).
-        // x: fp16 [M, K]; W_q: uint8 [K, N]; scale, offset: fp16 [K].
-        // K∈{768, 3072} (caller must pre-check).
-        auto xc = x.contiguous();
-        auto Wc = W_q.contiguous();
-        auto sc = scale.contiguous();
-        auto oc = offset.contiguous();
-        TORCH_CHECK(xc.scalar_type() == at::kHalf, "x must be fp16");
-        TORCH_CHECK(Wc.scalar_type() == at::kByte, "W_q must be uint8");
-        TORCH_CHECK(sc.scalar_type() == at::kHalf, "scale must be fp16");
-        TORCH_CHECK(oc.scalar_type() == at::kHalf, "offset must be fp16");
-        const int M = (int)xc.size(0);
-        const int K = (int)xc.size(1);
-        const int N = (int)Wc.size(-1);
-        TORCH_CHECK(Wc.size(0) == K, "W_q shape mismatch");
-        TORCH_CHECK(sc.size(0) == K, "scale shape mismatch");
-        TORCH_CHECK(oc.size(0) == K, "offset shape mismatch");
-        TORCH_CHECK(K == 768 || K == 3072,
-                    "det_matmul_int8 only supports K∈{768, 3072}");
-        const auto dtype = out_dtype.has_value() ? out_dtype.value() : xc.scalar_type();
-        auto out = at::empty({M, N}, xc.options().dtype(dtype));
-        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-        const int write_fp32 = (dtype == at::kFloat) ? 1 : 0;
-        launch_det_matmul_int8_tc(
-            xc.data_ptr(), Wc.data_ptr(),
-            sc.data_ptr(), oc.data_ptr(),
-            out.data_ptr(), write_fp32, M, K, N, stream);
-        return out;
-    }, "int8 weight × fp16 act WMMA matmul (per-input-channel dequant).",
-       pybind11::arg("x"), pybind11::arg("W_q"),
-       pybind11::arg("scale"), pybind11::arg("offset"),
-       pybind11::arg("out_dtype") = c10::nullopt);
     m.def("quantize_per_row_int8", [](at::Tensor x) {
         // Per-row symmetric int8 quantization of fp16 [M, K] activations.
         // Returns (X_q [M, K] int8, scale_x [M] fp16) where scale_x[m] =
