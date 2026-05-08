@@ -227,6 +227,15 @@ if [ "${KRUNCH_RUN_PROBE_FFN_V:-0}" = "1" ]; then
     /app/scripts/probe_ffn_v_sparsity.py /work/sample.bin \
     || echo "PROBE_FFN_V_FAILED"
   echo "PROBE_FFN_V_DONE $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  # Architecture-selection microbench: dense vs torch.sparse.mm vs gather.
+  # Output drives the A1 implementation kernel choice.
+  echo "PROBE_FFN_V_BENCH_START $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  docker run --rm --gpus all \
+    --entrypoint python3 \
+    "${KRUNCH_IMAGE_TAG}" \
+    /app/scripts/probe_ffn_v_sparse_bench.py \
+    || echo "PROBE_FFN_V_BENCH_FAILED"
+  echo "PROBE_FFN_V_BENCH_DONE $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 fi
 
 echo "COMPRESS_START $(date -u +%Y-%m-%dT%H:%M:%SZ)"
