@@ -128,6 +128,16 @@ ENV_FLAGS: list[EnvFlag] = [
         "Disabled implicitly on sm_75 via the kernel guard.",
     ),
     EnvFlag(
+        "KRUNCH_USE_INT_MM", "0", "yes", "tuning",
+        "Phase 2B: route W8A8 layer matmul through ATen's _int_mm "
+        "(cuBLAS int8 TC) instead of det_matmul_w8a8_tc_async. Doc "
+        "microbench projects 1.05-1.61× per-matmul. Bytes diverge from "
+        "the existing W8A8 codec — encoder + decoder must agree on the "
+        "flag; M-stability across production shapes (M=17..1024) is "
+        "the AC-roundtrip predicate. Composes with KRUNCH_INT8_W8A8=1; "
+        "no-op on sm_75. Same MODEL_ID 1 as long as flag is symmetric.",
+    ),
+    EnvFlag(
         "KRUNCH_NO_3WAY", "0", "no", "debug",
         "Disable KVR fusion entirely; run K, V, R as 3 separate "
         "matmuls. For ablation only.",

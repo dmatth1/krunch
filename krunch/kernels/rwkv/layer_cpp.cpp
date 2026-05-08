@@ -716,6 +716,37 @@ static at::Tensor gemm_w8a8(at::Tensor x_fp16, at::Tensor W_q, at::Tensor scale_
     const auto dtype = out_dtype.has_value() ? out_dtype.value() : at::kHalf;
     auto out = at::empty({M, N}, sc.options().dtype(dtype));
     const int write_fp32 = (dtype == at::kFloat) ? 1 : 0;
+    // KRUNCH_USE_INT_MM=1 routes int8×int8 GEMM through ATen's
+    // _int_mm (cuBLAS int8 TC under the hood, sm_80+) and does the
+    // per-row + per-col scaling as ATen ops in fp32. Phase 2B —
+    // doc's microbench suggests 1.05-1.61× over det_matmul_w8a8_tc_async.
+    // Bytes WILL DIFFER from det_matmul_w8a8_tc_async; encoder + decoder
+    // must both take this branch (achieved because the env flag is
+    // process-static, identical on encoder and decoder invocations).
+    // M-stability across {M=17..1024} is the AC-roundtrip predicate;
+    // verified by tests/integration/gpu.sh byte_exact roundtrip.
+    static const bool USE_INT_MM = USE_SM80_PLUS && []{
+        const char* e = std::getenv("KRUNCH_USE_INT_MM");
+        return e != nullptr && std::string(e) == "1";
+    }();
+    if (USE_INT_MM) {
+        // _int_mm: int8 [M, K] × int8 [K, N] → int32 [M, N].
+        // Wc is already [K, N] int8 from init_weights. Xq just produced.
+        auto int_acc = at::_int_mm(Xq, Wc);  // [M, N] int32
+        // Scale: out[m,n] = scale_x[m] * scale_w[n] * int_acc[m,n].
+        // Match the existing kernel's order of multiplication: x_scale
+        // outer, w_scale inner — keeping fp32 precision throughout the
+        // scaling so per-row + per-col scales don't lose bits.
+        auto sx_f32 = sx.to(at::kFloat).view({M, 1});
+        auto sw_f32 = sc.to(at::kFloat).view({1, N});
+        auto out_f32 = int_acc.to(at::kFloat) * sx_f32 * sw_f32;
+        if (write_fp32) {
+            out.copy_(out_f32);
+        } else {
+            out.copy_(out_f32.to(at::kHalf));
+        }
+        return out;
+    }
     // Route cp.async on sm_80+. KRUNCH_W8A8_ASYNC=0 forces non-async
     // (for debugging / regression bisect).
     static const bool USE_W8A8_ASYNC = USE_SM80_PLUS && []{
