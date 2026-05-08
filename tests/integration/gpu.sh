@@ -217,11 +217,14 @@ if [ "${KRUNCH_RUN_PROBE_FFN_V:-0}" = "1" ]; then
   krunch warmup >/dev/null 2>&1 || true
   # The CLI wrapper isn't useful for an arbitrary script call; invoke
   # python from inside the image via docker, mounting the sample.
+  # Image's ENTRYPOINT dispatches the krunch CLI; override to call
+  # python3 directly for the probe.
   docker run --rm --gpus all \
+    --entrypoint python3 \
     -v /tmp:/work \
     --env KRUNCH_INT8_W8A8 \
     "${KRUNCH_IMAGE_TAG}" \
-    python3 /app/scripts/probe_ffn_v_sparsity.py /work/sample.bin \
+    /app/scripts/probe_ffn_v_sparsity.py /work/sample.bin \
     || echo "PROBE_FFN_V_FAILED"
   echo "PROBE_FFN_V_DONE $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 fi
