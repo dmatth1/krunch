@@ -24,9 +24,9 @@ def probs_to_cdf_gpu(probs):
     GPU probs → int32 CDF. Mirrors krunch.codec.cdf.probs_to_cdf bit-for-bit
     (same MIN_PROB=1, same deficit-distribution rule).
 
-    Returns int32 (not uint16) because cdf[:, V] == T == 65536, which
-    doesn't fit uint16. 200 KB extra per row × 1024 rows = 200 MB GPU
-    memory — affordable, and avoids a needless dtype dance.
+    Returns int32 because cdf[:, V] == T == 2^24, which doesn't fit
+    uint16 (and barely fits int24, so int32 is the natural choice).
+    int32 CDFs at vocab=50K use ~200 KB/row.
     """
     assert torch is not None, "torch required"
     assert probs.is_cuda and probs.dim() == 2

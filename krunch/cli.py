@@ -12,13 +12,30 @@ If --in is omitted, reads from stdin. If --out is omitted, writes to stdout.
 
 import os
 import sys
+import json
 import zlib
+import time
 import argparse
 import contextlib
 import logging
 
-from .inference import engine, encode_header, decode_header, HEADER_SIZE
+from . import __version__
+from .inference import (
+    engine, encode_header, decode_header, HEADER_SIZE,
+    BLOB_VERSION, MODEL_ID, TOKENIZER_ID,
+)
 from .chunking import compress_all, decompress_all
+
+
+def _emit_event(event: str, **fields) -> None:
+    """One-line JSON event on stderr. Lets users `grep krunch_event`
+    in container logs and parse with `jq` for ratio / KB/s tracking
+    across runs without shelling out to /tmp/result.json."""
+    payload = {"krunch_event": event, "krunch_version": __version__,
+               "model_id": MODEL_ID, "tokenizer_id": TOKENIZER_ID,
+               "blob_version": BLOB_VERSION, **fields}
+    sys.stderr.write(json.dumps(payload, separators=(",", ":")) + "\n")
+    sys.stderr.flush()
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s",
@@ -50,13 +67,21 @@ def cmd_compress(args):
     raw = _read_input(args.input)
     with _stdout_to_stderr():
         engine.load()
+    t0 = time.time()
     chunk_entries, n_chunks = compress_all(raw, engine.compress_chunk)
     crc = zlib.crc32(raw) & 0xFFFFFFFF
     blob = encode_header(len(raw), n_chunks, crc) + b"".join(chunk_entries)
+    elapsed = time.time() - t0
     _write_output(args.output, blob)
     ratio = len(blob) / len(raw) if raw else 0
+    kb_s = (len(raw) / 1024 / elapsed) if elapsed > 0 else 0.0
     logger.info("compress %d → %d bytes (ratio=%.4f, %d chunks)",
                 len(raw), len(blob), ratio, n_chunks)
+    _emit_event("compress_done",
+                input_bytes=len(raw), output_bytes=len(blob),
+                ratio=round(ratio, 5), n_chunks=n_chunks,
+                seconds=round(elapsed, 3),
+                kb_s=round(kb_s, 1))
 
 
 def cmd_decompress(args):
@@ -64,6 +89,7 @@ def cmd_decompress(args):
     with _stdout_to_stderr():
         engine.load()
     hdr = decode_header(blob)
+    t0 = time.time()
     entries_bytes = blob[HEADER_SIZE:]
     if hdr["n_chunks"] > 1:
         # Cross-chunk batched stepped forward saturates the GPU by
@@ -82,16 +108,26 @@ def cmd_decompress(args):
     if not hdr["flags"] & 0x01:
         actual = zlib.crc32(raw) & 0xFFFFFFFF
         if actual != hdr["crc32"]:
+            from . import __version__ as _kver
             raise SystemExit(
-                f"CRC32 mismatch: got {actual:#010x}, expected {hdr['crc32']:#010x}"
+                f"CRC32 mismatch: got {actual:#010x}, expected {hdr['crc32']:#010x} "
+                f"(blob model_id={hdr['model_id']} tokenizer_id={hdr['tokenizer_id']} "
+                f"blob_version={hdr['blob_version']}; this image krunch={_kver})"
             )
     if len(raw) != hdr["original_len"]:
         raise SystemExit(
             f"length mismatch: got {len(raw)}, expected {hdr['original_len']}"
         )
 
+    elapsed = time.time() - t0
     _write_output(args.output, raw)
+    kb_s = (len(raw) / 1024 / elapsed) if elapsed > 0 else 0.0
     logger.info("decompress %d → %d bytes", len(blob), len(raw))
+    _emit_event("decompress_done",
+                input_bytes=len(blob), output_bytes=len(raw),
+                n_chunks=hdr["n_chunks"],
+                seconds=round(elapsed, 3),
+                kb_s=round(kb_s, 1))
 
 
 def _read_input(path: str | None) -> bytes:

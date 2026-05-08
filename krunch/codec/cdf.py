@@ -2,15 +2,19 @@
 Probability → integer CDF conversion.
 
 The range coder consumes integer CDFs, not floats, so encoder and
-decoder agree on exact bin boundaries. We quantize float probs to a
-uint16-sum of T = 2^16, with MIN_PROB = 1 to guarantee every symbol
-has non-zero width (otherwise encoding that symbol is impossible).
+decoder agree on exact bin boundaries. We quantize float probs to an
+int32 CDF that sums to T = 2^24, with MIN_PROB = 1 to guarantee every
+symbol has non-zero width (otherwise encoding that symbol is
+impossible).
 
-Why T = 2^16: with 32-bit range register the intermediate
-`range * cdf_value` fits in uint64 with room to spare (32 + 16 = 48
-bits), and uint16 CDF entries halve the GPU shared-memory footprint
-vs uint32. Ratio loss vs T = 2^24 is small (~0.001 bits/symbol on
-50K vocab from the residual quantization).
+Why T = 2^24: with 32-bit range register the intermediate
+`range * cdf_value` fits in uint64 (32 + 24 = 56 bits, still room).
+2^24 vs 2^16 buys ~0.001 bits/symbol on 50K vocab from finer
+quantization; the cost is int32 CDFs instead of uint16 (kernel-wise
+already int32 today, so no shared-memory savings to be claimed).
+
+Bitstream impact: changing CDF_PRECISION changes the bitstream and
+requires a MODEL_ID bump. See docs/TIER_3_CLEANUP.md §5.4.
 """
 
 import numpy as np

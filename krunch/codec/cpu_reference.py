@@ -9,13 +9,13 @@ decode() byte-identically.
 Naming/convention:
 - PRECISION = 32 (state bits)
 - TOP = 2**32, HALF = 2**31, QTR = 2**30
-- T = 2**CDF_PRECISION (sum of every CDF row), default 2**16
+- T = 2**CDF_PRECISION (sum of every CDF row), CDF_PRECISION = 24
 - range coder state: low (uint32), high (uint32), pending E3 bits
 
 The arithmetic is integer-exact. We use Python ints (arbitrary
 precision) to dodge overflow questions; the CUDA kernel uses
-uint64 for the range*cdf_value intermediate (32 + 16 = 48 bits,
-fits trivially).
+uint64 for the range*cdf_value intermediate (32 + 24 = 56 bits,
+fits in uint64 with room to spare).
 
 Bitstream serialization: bits are packed MSB-first into bytes.
 Final flush writes one tail bit + pending bits, then pads the

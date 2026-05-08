@@ -34,7 +34,6 @@ setup(
                 "range_coder/decode_kernel.cu",
                 "range_coder/det_softmax_cdf.cu",
                 # RWKV layer kernels
-                "rwkv/rwkv_step.cu",
                 "rwkv/wkv_kernel.cu",
                 "rwkv/premix_kernels.cu",
                 # Deterministic matmul variants — production routing in
@@ -55,8 +54,6 @@ setup(
                 "matmul/det_matmul_cublas.cu",
                 "matmul/det_matmul_tc_bf16.cu",
                 "matmul/layer_norm.cu",
-                # int8 weight × fp16 act WMMA
-                "matmul/det_matmul_int8_tc.cu",
                 # W8A8 (per-output-channel symmetric weight, per-row activation)
                 "matmul/det_matmul_w8a8_tc.cu",
                 "matmul/det_matmul_w8a8_tc_async.cu",

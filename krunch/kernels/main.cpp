@@ -55,21 +55,6 @@ void launch_encode_finalize_batched(
 // layer_cpp.cpp — C++ orchestration of one RWKV-4 layer at B=1, T=1.
 void register_layer_cpp(pybind11::module& m);
 
-// rwkv_step.cu — fused single-step RWKV-4 layer kernel.
-// Uses void* for __half to avoid pulling cuda_fp16.h into main.cpp; the
-// .cu side reinterpret_casts to __half*.
-void launch_rwkv4_layer_step(
-    const void* x_in, void* x_out,
-    void* att_xx, float* aa, float* bb, float* pp, void* ffn_xx,
-    const void* ln1_w, const void* ln1_b,
-    const void* tm_k, const void* tm_v, const void* tm_r,
-    const float* time_decay, const float* time_first,
-    const void* Kw, const void* Vw, const void* Rw, const void* Ow,
-    const void* ln2_w, const void* ln2_b,
-    const void* ffn_tm_k, const void* ffn_tm_r,
-    const void* ffn_Kw, const void* ffn_Vw, const void* ffn_Rw,
-    cudaStream_t stream);
-
 #define CHECK_CUDA(x) TORCH_CHECK((x).is_cuda(), #x " must be a CUDA tensor")
 #define CHECK_CONTIG(x) TORCH_CHECK((x).is_contiguous(), #x " must be contiguous")
 
@@ -264,55 +249,6 @@ void encode_finalize_batched(at::Tensor output_buf, at::Tensor base_byte_offsets
         B, stream);
 }
 
-// rwkv_step binding: takes torch tensors, dispatches to launch_rwkv4_layer_step.
-// All tensors must be CUDA + contiguous; weights fp16 except {aa,bb,pp,
-// time_decay, time_first} which are fp32.
-void rwkv4_layer_step(
-    at::Tensor x_in, at::Tensor x_out,
-    at::Tensor att_xx, at::Tensor aa, at::Tensor bb, at::Tensor pp,
-    at::Tensor ffn_xx,
-    at::Tensor ln1_w, at::Tensor ln1_b,
-    at::Tensor tm_k, at::Tensor tm_v, at::Tensor tm_r,
-    at::Tensor time_decay, at::Tensor time_first,
-    at::Tensor Kw, at::Tensor Vw, at::Tensor Rw, at::Tensor Ow,
-    at::Tensor ln2_w, at::Tensor ln2_b,
-    at::Tensor ffn_tm_k, at::Tensor ffn_tm_r,
-    at::Tensor ffn_Kw, at::Tensor ffn_Vw, at::Tensor ffn_Rw)
-{
-    auto check_fp16 = [](at::Tensor t, const char* name) {
-        TORCH_CHECK(t.is_cuda() && t.is_contiguous(), name, " must be CUDA contiguous");
-        TORCH_CHECK(t.dtype() == at::kHalf, name, " must be fp16");
-    };
-    auto check_fp32 = [](at::Tensor t, const char* name) {
-        TORCH_CHECK(t.is_cuda() && t.is_contiguous(), name, " must be CUDA contiguous");
-        TORCH_CHECK(t.dtype() == at::kFloat, name, " must be fp32");
-    };
-    check_fp16(x_in, "x_in"); check_fp16(x_out, "x_out");
-    check_fp16(att_xx, "att_xx"); check_fp16(ffn_xx, "ffn_xx");
-    check_fp32(aa, "aa"); check_fp32(bb, "bb"); check_fp32(pp, "pp");
-    check_fp32(time_decay, "time_decay"); check_fp32(time_first, "time_first");
-    check_fp16(ln1_w, "ln1_w"); check_fp16(ln1_b, "ln1_b");
-    check_fp16(tm_k, "tm_k"); check_fp16(tm_v, "tm_v"); check_fp16(tm_r, "tm_r");
-    check_fp16(Kw, "Kw"); check_fp16(Vw, "Vw"); check_fp16(Rw, "Rw"); check_fp16(Ow, "Ow");
-    check_fp16(ln2_w, "ln2_w"); check_fp16(ln2_b, "ln2_b");
-    check_fp16(ffn_tm_k, "ffn_tm_k"); check_fp16(ffn_tm_r, "ffn_tm_r");
-    check_fp16(ffn_Kw, "ffn_Kw"); check_fp16(ffn_Vw, "ffn_Vw"); check_fp16(ffn_Rw, "ffn_Rw");
-
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    launch_rwkv4_layer_step(
-        x_in.data_ptr(), x_out.data_ptr(),
-        att_xx.data_ptr(), aa.data_ptr<float>(), bb.data_ptr<float>(),
-        pp.data_ptr<float>(), ffn_xx.data_ptr(),
-        ln1_w.data_ptr(), ln1_b.data_ptr(),
-        tm_k.data_ptr(), tm_v.data_ptr(), tm_r.data_ptr(),
-        time_decay.data_ptr<float>(), time_first.data_ptr<float>(),
-        Kw.data_ptr(), Vw.data_ptr(), Rw.data_ptr(), Ow.data_ptr(),
-        ln2_w.data_ptr(), ln2_b.data_ptr(),
-        ffn_tm_k.data_ptr(), ffn_tm_r.data_ptr(),
-        ffn_Kw.data_ptr(), ffn_Vw.data_ptr(), ffn_Rw.data_ptr(),
-        stream);
-}
-
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("encode_step", &encode_step,
           "Range-encode a batch of symbols on GPU; mutates state in place.");
@@ -330,8 +266,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Encode one symbol per stream for B streams; one launch.");
     m.def("encode_finalize_batched", &encode_finalize_batched,
           "Final-flush B encoder states; one launch.");
-    m.def("rwkv4_layer_step", &rwkv4_layer_step,
-          "Fused RWKV-4 single-layer forward (B=1, T=1).");
 
     register_layer_cpp(m);
 }

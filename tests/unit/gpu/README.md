@@ -20,11 +20,10 @@ docker run --rm --gpus all \
 These are **not in CI** (CI runs on `ubuntu-latest`, no GPU). They are
 the regression-evidence for invariants cited inline in:
 
-- `krunch_ac/cuda/rwkv_step.cu` (numerical contract)
-- `krunch_ac/cuda/det_matmul_cublas.cu` (cuBLAS algo bit-stability)
+- `krunch/kernels/rwkv/layer_cpp.cpp` (layer-step routing, codec dispatch)
+- `krunch/kernels/matmul/det_matmul_cublas.cu` (cuBLAS algo bit-stability)
 - `krunch/cpp_path.py` (graph capture, batched-vs-stepped equivalence)
 - `krunch/inference.py` (batched compress chunk lockstep)
-- `krunch/batched_rwkv4.py` (forward drift measurement)
 
 If you're touching any of those code paths, run the corresponding
 script in this directory before merging.

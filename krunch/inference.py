@@ -52,7 +52,9 @@ TOKENIZER_ID = 1
 
 # Header: magic(4) + blob_version(1) + model_id(4) + tokenizer_id(4) +
 #         adapter_id(4) + adapter_version(2) + flags(2) +
-#         original_len(8) + n_chunks(4) + crc32(4) = 42 bytes
+#         original_len(8) + n_chunks(4) + crc32(4) = 37 bytes
+# Pinned by tests/unit/test_blob_format_versioning.py — any change here
+# requires a BLOB_VERSION bump and a CHANGELOG entry.
 HEADER_FMT = ">4sBIIIHHQII"  # big-endian
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
 
@@ -69,18 +71,47 @@ def encode_header(original_len: int, n_chunks: int, crc32: int,
     )
 
 
-def decode_header(data: bytes) -> dict:
+class IncompatibleBlobError(ValueError):
+    """Blob was produced by a krunch image with a model_id / tokenizer_id
+    / blob_version this image cannot read. Bump the local image to match,
+    or recompress the input with this image."""
+
+
+def decode_header(data: bytes, *, strict: bool = True) -> dict:
+    """Parse a blob header. With ``strict=True`` (default), raise
+    ``IncompatibleBlobError`` if the blob's model_id / tokenizer_id /
+    blob_version don't match what this image can read. With
+    ``strict=False``, return the parsed fields without compatibility
+    checks (test/inspection use).
+    """
     if len(data) < HEADER_SIZE:
         raise ValueError(f"blob too short: {len(data)} < {HEADER_SIZE}")
     fields = struct.unpack(HEADER_FMT, data[:HEADER_SIZE])
     magic, bv, mid, tid, aid, av, flags, orig_len, n_chunks, crc = fields
     if magic != BLOB_MAGIC:
         raise ValueError(f"bad magic: {magic!r}")
-    return {
+    parsed = {
         "blob_version": bv, "model_id": mid, "tokenizer_id": tid,
         "adapter_id": aid, "adapter_version": av, "flags": flags,
         "original_len": orig_len, "n_chunks": n_chunks, "crc32": crc,
     }
+    if strict:
+        if bv != BLOB_VERSION:
+            raise IncompatibleBlobError(
+                f"blob_version {bv} not supported by this image "
+                f"(expected {BLOB_VERSION})"
+            )
+        if mid != MODEL_ID:
+            raise IncompatibleBlobError(
+                f"model_id {mid} not supported by this image "
+                f"(expected {MODEL_ID}); recompress with a matching image"
+            )
+        if tid != TOKENIZER_ID:
+            raise IncompatibleBlobError(
+                f"tokenizer_id {tid} not supported by this image "
+                f"(expected {TOKENIZER_ID})"
+            )
+    return parsed
 
 
 # ---------------------------------------------------------------------------
