@@ -59,7 +59,10 @@ ENV_FLAGS: list[EnvFlag] = [
     EnvFlag(
         "KRUNCH_BF16", "0", "yes", "debug",
         "Bf16 layer matmul (v2 codec, WIP). Switches weight dtype; "
-        "encoder + decoder must use the same setting. NEXT-2 in "
+        "encoder + decoder must use the same setting. Mutually exclusive "
+        "with KRUNCH_INT8_W8A8 (must set =0) and KRUNCH_INT8_WEIGHTS "
+        "(quantization layer ignores bf16 weights). Bytes diverge from "
+        "fp16 codec → MODEL_ID bump on ship. NEXT-2 in "
         "TIER_3_OPTIMIZATION.md.",
     ),
     EnvFlag(

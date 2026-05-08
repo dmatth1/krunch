@@ -26,6 +26,18 @@ try:
         if _sm < 8:
             os.environ.setdefault("KRUNCH_HEAD_ASYNC", "0")
             os.environ.setdefault("KRUNCH_3WAY_ASYNC", "0")
+            # det_matmul_tc_async_bf16 also has #if __CUDA_ARCH__ >= 800;
+            # silently ignoring KRUNCH_BF16=1 on sm_75 would produce
+            # garbage output. Force off and warn.
+            if os.environ.get("KRUNCH_BF16") == "1":
+                import warnings as _warnings
+                _warnings.warn(
+                    "KRUNCH_BF16=1 is sm_80+ only (cp.async + WMMA bf16); "
+                    "running on sm_75 (T4) — disabling automatically. Use "
+                    "an A10G/A100/L40S/H100 for bf16.",
+                    RuntimeWarning,
+                )
+                os.environ["KRUNCH_BF16"] = "0"
     del _torch, _sm
 except Exception:
     pass
@@ -153,6 +165,17 @@ def init_weights(model, device: str = "cuda") -> dict:
     use_w8a8 = os.environ.get("KRUNCH_INT8_W8A8", "1") == "1"
     if use_int8 and use_w8a8:
         raise ValueError("Set at most one of KRUNCH_INT8_WEIGHTS / KRUNCH_INT8_W8A8")
+    if use_bf16 and use_w8a8:
+        raise ValueError(
+            "KRUNCH_BF16=1 and KRUNCH_INT8_W8A8=1 are mutually exclusive — "
+            "the W8A8 layer-step kernel ignores the bf16 weight bundle and "
+            "the speedups don't compose. Set KRUNCH_INT8_W8A8=0 when "
+            "running bf16."
+        )
+    if use_bf16 and use_int8:
+        raise ValueError(
+            "KRUNCH_BF16=1 and KRUNCH_INT8_WEIGHTS=1 are mutually exclusive."
+        )
 
     def fix(t, dt=None, quantize=False):
         t = t.to(device).contiguous()

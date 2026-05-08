@@ -77,8 +77,9 @@ def _flush_caches():
             cache.clear()
 
 
-# fp16 + W8A8 are the two flavors on the production path today.
-# Add ("bf16", {"KRUNCH_BF16": "1"}) once NEXT-2 lands.
+# fp16 + W8A8 are the production-path flavors. Bf16 is opt-in (NEXT-2);
+# encoder + decoder must both use it. Per `init_weights`, bf16 is
+# mutually exclusive with W8A8 (so explicitly set W8A8=0 here).
 _FLAVORS = [
     pytest.param(
         "fp16",
@@ -89,6 +90,11 @@ _FLAVORS = [
         "w8a8",
         {"KRUNCH_INT8_W8A8": "1", "KRUNCH_INT8_WEIGHTS": "0", "KRUNCH_BF16": "0"},
         id="w8a8",
+    ),
+    pytest.param(
+        "bf16",
+        {"KRUNCH_INT8_W8A8": "0", "KRUNCH_INT8_WEIGHTS": "0", "KRUNCH_BF16": "1"},
+        id="bf16",
     ),
 ]
 
@@ -110,6 +116,15 @@ def test_packed_window_matches_stepped_batched(engine, flavor, env_overrides,
     # validating a different path than the test name claims.
     if flavor == "w8a8" and "w8a8_int8" not in weights:
         pytest.skip("W8A8 weights not in bundle; init_weights produced fp16")
+    if flavor == "bf16":
+        import torch
+        # Pick any layer matmul weight (Kw at layers[i][7]) and check dtype.
+        layer_kw_dtype = weights["layers"][0][7].dtype
+        if layer_kw_dtype != torch.bfloat16:
+            pytest.skip(
+                f"Bf16 weights not in bundle (got {layer_kw_dtype}); "
+                f"init_weights ignored KRUNCH_BF16=1"
+            )
 
     packed = _packed_logits(weights, TOKENS).to(torch.float32)
     stepped = _stepped_batched_logits(weights, TOKENS).to(torch.float32)
