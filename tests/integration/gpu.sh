@@ -344,10 +344,22 @@ echo
 echo "[5/5] Cleanup..."
 aws ec2 terminate-instances --instance-ids "$INSTANCE_ID" --region "$REGION" \
   --query "TerminatingInstances[0].CurrentState.Name" --output text 2>&1 | head -1 || true
-aws s3 rm --quiet --recursive "${S3_BASE}" 2>&1 | tail -3 || true
 rm -f "$REPO_TAR" "$USER_DATA"
 
 ALL_PASS=$(/usr/bin/python3 -c "import json; print(json.load(open('$RESULT_LOCAL'))['all_gates_pass'])")
+# Only clean up S3 artifacts on success. On failure keep setup.log +
+# result.json + sample.bin around so the operator can post-mortem
+# without having to re-launch. Override with KRUNCH_KEEP_S3=0 to
+# always purge (tight-loop iteration), or KRUNCH_KEEP_S3=1 to keep
+# even on success (debug session).
+KEEP_S3="${KRUNCH_KEEP_S3:-auto}"
+if [[ "$KEEP_S3" == "1" ]] || \
+   ([[ "$KEEP_S3" == "auto" ]] && [[ "$ALL_PASS" != "True" ]]); then
+  echo "  S3 artifacts retained at ${S3_BASE} (override: KRUNCH_KEEP_S3=0)"
+else
+  aws s3 rm --quiet --recursive "${S3_BASE}" 2>&1 | tail -3 || true
+fi
+
 if [[ $ALL_PASS == "True" ]]; then
   echo
   echo "=== ALL GATES PASS ✓ ==="
