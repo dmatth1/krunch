@@ -48,6 +48,10 @@ ENV PYTHONPATH=/app
 
 WORKDIR /app
 
+# Diagnostic probes (e.g. scripts/probe_*.py) — small, occasionally
+# invoked via `docker run --rm ... python3 /app/scripts/probe_X.py`.
+COPY scripts/probe_*.py /app/scripts/
+
 COPY scripts/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 

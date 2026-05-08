@@ -207,6 +207,25 @@ echo "Input: ${INPUT_BYTES} bytes"
 # explicitly to keep the userdata diff readable; add new flags here.
 __FORWARD_ENV__
 
+# Optional: probe FFN-V relu² sparsity before the real compress.
+# Set KRUNCH_RUN_PROBE_FFN_V=1 to run scripts/probe_ffn_v_sparsity.py
+# (which the krunch image bakes into /app/scripts/) on the same sample
+# the integration test will use. Output lands in this script's stdout
+# (i.e. /var/log/krunch-tier3.log) so it ships to S3 with the rest.
+if [ "${KRUNCH_RUN_PROBE_FFN_V:-0}" = "1" ]; then
+  echo "PROBE_FFN_V_START $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  krunch warmup >/dev/null 2>&1 || true
+  # The CLI wrapper isn't useful for an arbitrary script call; invoke
+  # python from inside the image via docker, mounting the sample.
+  docker run --rm --gpus all \
+    -v /tmp:/work \
+    --env KRUNCH_INT8_W8A8 \
+    "${KRUNCH_IMAGE_TAG}" \
+    python3 /app/scripts/probe_ffn_v_sparsity.py /work/sample.bin \
+    || echo "PROBE_FFN_V_FAILED"
+  echo "PROBE_FFN_V_DONE $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+fi
+
 echo "COMPRESS_START $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 T0=$(date +%s.%N)
 krunch compress < /tmp/sample.bin > /tmp/sample.krunch
@@ -278,7 +297,7 @@ USERDATA_EOF
 # Empty file = no env forwarded (default).
 FORWARD_FILE=$(mktemp)
 : > "$FORWARD_FILE"
-for v in KRUNCH_BF16 KRUNCH_INT8_W8A8 KRUNCH_INT8_WEIGHTS KRUNCH_ADAPTIVE_HEAD KRUNCH_USE_INT_MM KRUNCH_OWN_WKV KRUNCH_DETERMINISTIC_MATMUL KRUNCH_DECOMPRESS_BATCH KRUNCH_CHUNK_SIZE KRUNCH_TARGET_B KRUNCH_CPP_GRAPH KRUNCH_PHASE_PROFILE KRUNCH_CPP_PROFILE; do
+for v in KRUNCH_BF16 KRUNCH_INT8_W8A8 KRUNCH_INT8_WEIGHTS KRUNCH_ADAPTIVE_HEAD KRUNCH_USE_INT_MM KRUNCH_OWN_WKV KRUNCH_DETERMINISTIC_MATMUL KRUNCH_DECOMPRESS_BATCH KRUNCH_CHUNK_SIZE KRUNCH_TARGET_B KRUNCH_CPP_GRAPH KRUNCH_PHASE_PROFILE KRUNCH_CPP_PROFILE KRUNCH_RUN_PROBE_FFN_V; do
   if [[ -n "${!v:-}" ]]; then
     echo "export ${v}='${!v}'" >> "$FORWARD_FILE"
     echo "  forward env: ${v}=${!v}"
