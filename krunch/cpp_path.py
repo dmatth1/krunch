@@ -151,6 +151,21 @@ def init_weights(model, device: str = "cuda") -> dict:
     use_bf16 = os.environ.get("KRUNCH_BF16") == "1"
     use_int8 = os.environ.get("KRUNCH_INT8_WEIGHTS") == "1"
     use_w8a8 = os.environ.get("KRUNCH_INT8_W8A8", "1") == "1"
+    # Hardware gate: the W8A8 int8 layer-step kernel is only correct on
+    # sm_80+ (Ampere). On Turing (sm_75 / T4) the kernel produces output
+    # that is not bit-identical between the encoder packed forward
+    # (M=1024 path) and the decoder stepped-batched forward (M=1 path),
+    # which breaks AC roundtrip — see docs/Bugs.md. Force off below sm_80
+    # so encoder + decoder both fall back to the fp16 layer step (one
+    # kernel, symmetric, byte-exact). Loses ~1.5-2.2× per-call perf on
+    # Turing only; Ampere+ unaffected.
+    if use_w8a8:
+        try:
+            major, _ = torch.cuda.get_device_capability(device)
+            if major < 8:
+                use_w8a8 = False
+        except Exception:
+            pass
     if use_int8 and use_w8a8:
         raise ValueError("Set at most one of KRUNCH_INT8_WEIGHTS / KRUNCH_INT8_W8A8")
 
