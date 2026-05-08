@@ -4,9 +4,9 @@ Reference AWS Batch deployment for distributed krunch jobs. Works on a
 fresh AWS account using the default VPC; no pre-existing infra needed.
 
 What gets created:
-- Two Batch compute environments — spot (cheap) + on-demand (reliable
-  fallback). Both scale to zero when idle.
-- A job queue routed primary→fallback per the `spot` prop.
+- A Batch compute environment (on-demand g5.xlarge), scale-to-zero
+  when idle.
+- A job queue routed at the compute environment.
 - Three job definitions: `compress` (GPU array), `decompress` (GPU
   array), and `finalize` (CPU stitcher used by both modes).
 - An S3 bucket for compressed output + temp parts, with a 3-day
@@ -101,9 +101,6 @@ new KrunchStack(app, "KrunchStack", {
   // Custom-AMI optimization to skip the 3.5 GB cold-pull every job.
   // imageId: "ami-0xxxxxxxxxxxxxxxx",
 
-  // On-demand only when spot is reliably unavailable in your region.
-  spot: false,
-
   // Reuse an existing bucket instead of letting the stack create one.
   s3BucketName: "my-existing-bucket",
 
@@ -120,16 +117,6 @@ First job on a fresh CE: ~13 min (T4 measurement) — EC2 launch + 3.5 GB
 image pull + model load + WKV-kernel JIT. Subsequent jobs on warm
 instances: ~30 s. Set `imageId` to a pre-baked AMI (image already in the
 docker cache) to drop the 3.5 GB pull.
-
-## Spot capacity caveat
-
-g5.xlarge spot is intermittent in some regions (us-east-1 has been dry
-during recent windows). If your jobs sit RUNNABLE forever with
-`instance-terminated-no-capacity` in the EC2 spot history, either set
-`spot: false` in `bin/app.ts` and `cdk deploy`, OR temporarily disable
-the spot CE: `aws batch update-compute-environment --compute-environment
-SpotEnv-... --state DISABLED`. The on-demand CE at priority 2 picks
-up automatically.
 
 ## Tear down
 

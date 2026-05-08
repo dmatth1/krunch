@@ -38,15 +38,6 @@ export interface KrunchStackProps extends cdk.StackProps {
    */
   s3BucketName?: string;
   /**
-   * Use spot instances. Default: true.
-   * Set to false for on-demand (higher cost, no interruption risk).
-   * Both compute environments are always created; this controls the
-   * default priority order in the queue. Disable a CE entirely via
-   * `aws batch update-compute-environment --state DISABLED` if spot
-   * capacity is reliably unavailable in your region.
-   */
-  spot?: boolean;
-  /**
    * CloudWatch retention for `/aws/batch/job` logs. Default: 30 days
    * (cuts indefinite log accumulation). Set to `INFINITE` only if
    * compliance/audit requires it.
@@ -65,8 +56,8 @@ export interface KrunchStackProps extends cdk.StackProps {
  * Same flow for --mode compress and --mode decompress; the rendered
  * spec sets KRUNCH_MODE per submission via containerOverrides.
  *
- * No always-on orchestrator. Batch handles scheduling, spot retry,
- * and scaling to maxWorkers in parallel.
+ * No always-on orchestrator. Batch handles scheduling and scaling
+ * to maxWorkers in parallel.
  *
  * Quickstart:
  *   npm install && npx cdk bootstrap && npx cdk deploy
@@ -88,7 +79,6 @@ export class KrunchStack extends cdk.Stack {
       ec2.InstanceType.of(ec2.InstanceClass.G5, ec2.InstanceSize.XLARGE);
     const vcpusPerInstance = props.vcpusPerInstance ?? 4;
     const image = props.image ?? "ghcr.io/dmatth1/krunch:latest";
-    const preferSpot = props.spot ?? true;
     const logRetention = props.logRetention ?? logs.RetentionDays.ONE_MONTH;
 
     // Stack-level tags propagate to all taggable resources for cost
@@ -172,20 +162,13 @@ export class KrunchStack extends cdk.Stack {
     };
 
     // ---------------------------------------------------------------------------
-    // Batch compute environments — spot (cheap) + on-demand (reliable)
-    // Both created; job queue prefers whichever `spot` prop selects.
+    // Batch compute environment — on-demand only. Spot was supported
+    // earlier but g5.xlarge spot capacity is intermittent (us-east-1
+    // recent windows have seen `instance-terminated-no-capacity`
+    // reclaims mid-job), and the spot savings don't justify the
+    // operational pain for the workloads krunch targets (one-shot
+    // compress/decompress jobs, not long-running services).
     // ---------------------------------------------------------------------------
-    const spotEnv = new batch.CfnComputeEnvironment(this, "SpotEnv", {
-      ...sharedComputeProps,
-      computeResources: {
-        ...sharedResources,
-        type: "SPOT",
-        allocationStrategy: "SPOT_CAPACITY_OPTIMIZED",
-        bidPercentage: 60,
-        tags: { Name: "krunch-spot-worker" },
-      },
-    });
-
     const onDemandEnv = new batch.CfnComputeEnvironment(this, "OnDemandEnv", {
       ...sharedComputeProps,
       computeResources: {
@@ -197,18 +180,13 @@ export class KrunchStack extends cdk.Stack {
     });
 
     // ---------------------------------------------------------------------------
-    // Job queue — preferred env first, fallback to the other
+    // Job queue
     // ---------------------------------------------------------------------------
-    const [primary, fallback] = preferSpot
-      ? [spotEnv, onDemandEnv]
-      : [onDemandEnv, spotEnv];
-
     const jobQueue = new batch.CfnJobQueue(this, "JobQueue", {
       state: "ENABLED",
       priority: 10,
       computeEnvironmentOrder: [
-        { order: 1, computeEnvironment: primary.ref },
-        { order: 2, computeEnvironment: fallback.ref },
+        { order: 1, computeEnvironment: onDemandEnv.ref },
       ],
     });
 
@@ -256,7 +234,7 @@ export class KrunchStack extends cdk.Stack {
     const compressJobDef = new batch.CfnJobDefinition(this, "CompressJobDef", {
       type: "container",
       containerProperties: containerProps,
-      retryStrategy: { attempts: 2 },  // retry once on spot interruption
+      retryStrategy: { attempts: 2 },  // retry once on transient ECS / image-pull failure
       timeout: { attemptDurationSeconds: 3600 },
     });
 

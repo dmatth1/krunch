@@ -12,8 +12,8 @@ new KrunchStack(app, "KrunchStack", {
   },
   description: "Krunch v1 — distributed neural compression on AWS Batch",
 
-  // Defaults: g5.xlarge spot, ghcr.io/dmatth1/krunch:latest, 4 workers
-  // max, 30-day CloudWatch retention. See KrunchStackProps in
-  // ../lib/krunch-stack.ts for all overrides (maxWorkers, instanceType,
-  // image, imageId, s3BucketName, spot, logRetention).
+  // Defaults: g5.xlarge on-demand, ghcr.io/dmatth1/krunch:latest,
+  // 4 workers max, 30-day CloudWatch retention. See KrunchStackProps
+  // in ../lib/krunch-stack.ts for all overrides (maxWorkers,
+  // instanceType, image, imageId, s3BucketName, logRetention).
 });

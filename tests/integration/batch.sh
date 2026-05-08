@@ -22,7 +22,8 @@
 # to be readable by your local AWS credentials, not the Batch role.
 #
 # Cost: ~$0.30/hr × 4 g5.xlarge × ~5 min = ~$0.10 plus a few cents of S3.
-# Spot interruption: jobs retry once via JobDefinition retryStrategy.
+# Transient ECS / image-pull failures: JobDefinition retryStrategy
+# (attempts: 2) covers a single retry.
 #
 # Gates: byte-exact roundtrip, ratio matches single-instance gpu.sh,
 # finalize task succeeds, parts cleaned up by finalize.
