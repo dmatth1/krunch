@@ -57,6 +57,14 @@ ENV_FLAGS: list[EnvFlag] = [
         "Bytes differ between modes; both round-trip.",
     ),
     EnvFlag(
+        "KRUNCH_ADAPTIVE_HEAD", "0", "yes", "tuning",
+        "Per-document online bias correction in log-prob space "
+        "(NEXT-3, Nacrith pattern). Encoder and decoder run identical "
+        "adjust+update at every token; bytes diverge from baseline "
+        "fp16/W8A8 codec — different MODEL_ID. Targets the ratio gate. "
+        "Independent of W8A8/bf16 (operates post-softmax, pre-CDF).",
+    ),
+    EnvFlag(
         "KRUNCH_BF16", "0", "yes", "debug",
         "Bf16 layer matmul (v2 codec, WIP). Switches weight dtype; "
         "encoder + decoder must use the same setting. Mutually exclusive "

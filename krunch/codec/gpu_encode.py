@@ -48,3 +48,37 @@ def probs_to_cdf_gpu(probs):
     return cdf
 
 
+def probs_to_cdf_gpu_fp64(probs):
+    """Fp64 GPU probs → int32 CDF. Bit-exact mirror of the CPU
+    `krunch.codec.cdf.probs_to_cdf` for fp64 inputs (the dtype the
+    adaptive-head path uses for encoder/decoder symmetry).
+
+    Same algorithm as `probs_to_cdf_gpu` but stays fp64 through the
+    floor() step so encoder + decoder round identically. Required for
+    AC roundtrip with the adaptive head; the fp32 path's nondeterministic
+    last-bit rounding would diverge between the encoder's
+    forward_packed_window (M=T) and the decoder's batched stepped
+    forward (M=B).
+    """
+    assert torch is not None, "torch required"
+    assert probs.is_cuda and probs.dim() == 2, \
+        f"probs must be 2-D CUDA, got {tuple(probs.shape)}"
+    assert probs.dtype == torch.float64, \
+        f"probs must be fp64, got {probs.dtype}"
+
+    N, V = probs.shape
+    assert V < CDF_T, f"vocab {V} must be < T={CDF_T}"
+
+    p = probs / probs.sum(dim=1, keepdim=True).clamp_min(1e-30)
+
+    counts_f = (p * float(CDF_T - V)).floor()
+    counts = counts_f.to(torch.int64) + 1  # MIN_PROB
+    deficit = (CDF_T - counts.sum(dim=1)).to(torch.int64)  # (N,) >= 0
+
+    argmax = p.argmax(dim=1)
+    counts.scatter_add_(1, argmax.unsqueeze(1), deficit.unsqueeze(1))
+
+    cdf = torch.zeros((N, V + 1), dtype=torch.int32, device=probs.device)
+    cdf[:, 1:] = torch.cumsum(counts, dim=1).to(torch.int32)
+    return cdf
+

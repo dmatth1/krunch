@@ -47,8 +47,21 @@ def _load_rwkv():
 BLOB_MAGIC = b"KRNC"
 BLOB_VERSION = 1
 # Model + tokenizer IDs for RWKV-4-Pile-169M + GPT-NeoX BPE
+#   1 = baseline (fp16, with or without W8A8 — W8A8 is a kernel-level
+#                 dtype swap that produces identical bytes)
+#   2 = adaptive bias head (NEXT-3, KRUNCH_ADAPTIVE_HEAD=1)
 MODEL_ID = 1
+MODEL_ID_ADAPTIVE = 2
 TOKENIZER_ID = 1
+SUPPORTED_MODEL_IDS = (MODEL_ID, MODEL_ID_ADAPTIVE)
+
+
+def _model_id_for_run() -> int:
+    """Pick the MODEL_ID this image will write into the blob header,
+    based on the active codec env settings."""
+    if os.environ.get("KRUNCH_ADAPTIVE_HEAD") == "1":
+        return MODEL_ID_ADAPTIVE
+    return MODEL_ID
 
 # Header: magic(4) + blob_version(1) + model_id(4) + tokenizer_id(4) +
 #         adapter_id(4) + adapter_version(2) + flags(2) +
@@ -61,11 +74,16 @@ HEADER_SIZE = struct.calcsize(HEADER_FMT)
 
 def encode_header(original_len: int, n_chunks: int, crc32: int,
                   adapter_id: int = 0, adapter_version: int = 0,
-                  flags: int = 0) -> bytes:
+                  flags: int = 0, model_id: int | None = None) -> bytes:
+    """Encode the blob header. ``model_id`` defaults to whatever this
+    runtime currently writes (per env settings), so callers don't have
+    to thread the codec choice through every call site."""
+    if model_id is None:
+        model_id = _model_id_for_run()
     return struct.pack(
         HEADER_FMT,
         BLOB_MAGIC, BLOB_VERSION,
-        MODEL_ID, TOKENIZER_ID,
+        model_id, TOKENIZER_ID,
         adapter_id, adapter_version, flags,
         original_len, n_chunks, crc32
     )
@@ -101,10 +119,11 @@ def decode_header(data: bytes, *, strict: bool = True) -> dict:
                 f"blob_version {bv} not supported by this image "
                 f"(expected {BLOB_VERSION})"
             )
-        if mid != MODEL_ID:
+        if mid not in SUPPORTED_MODEL_IDS:
             raise IncompatibleBlobError(
                 f"model_id {mid} not supported by this image "
-                f"(expected {MODEL_ID}); recompress with a matching image"
+                f"(supported: {SUPPORTED_MODEL_IDS}); recompress with a "
+                f"matching image"
             )
         if tid != TOKENIZER_ID:
             raise IncompatibleBlobError(
@@ -339,14 +358,49 @@ class InferenceEngine:
         ac_state = self._compress_ac_state
         symbols = torch.as_tensor(tokens, dtype=torch.int32, device=self._device).contiguous()
 
+        # Adaptive head (KRUNCH_ADAPTIVE_HEAD=1) intercepts post-softmax,
+        # pre-CDF. Encoder + decoder both maintain a per-chunk bias state
+        # and apply identical adjust+update at every token. Bytes diverge
+        # from the baseline codec — a different MODEL_ID is written to
+        # the blob header.
+        adaptive_on = os.environ.get("KRUNCH_ADAPTIVE_HEAD") == "1"
+        adaptive_head = None
+        if adaptive_on:
+            from krunch.codec.adaptive_head_gpu import AdaptiveHeadGPU
+            from krunch.codec.gpu_encode import probs_to_cdf_gpu_fp64
+            n_vocab = int(self._tokenizer.get_vocab_size())
+            adaptive_head = AdaptiveHeadGPU(
+                vocab_size=n_vocab, batch_size=1, device=self._device,
+            )
+
         with torch.no_grad():
             for off in range(0, T, SEQ_BATCH):
                 n_w = min(SEQ_BATCH, T - off)
                 logits_w = cpp_path.forward_packed_window(
                     weights, full_input_t, state, off, n_w)
-                cdfs_w = cpp_path.softmax_cdfs_per_row(logits_w)
                 sym_w = symbols[off:off + n_w].contiguous()
-                krunch_ac_cuda.encode_step(cdfs_w, sym_w, output_buf, ac_state)
+                if adaptive_on:
+                    # Probs in fp64 for symmetric encoder/decoder rounding.
+                    probs_w = torch.softmax(
+                        logits_w.to(torch.float64), dim=-1
+                    )
+                    # Sequential per-token: bias[t+1] depends on
+                    # adjusted[t] and tokens[t]. CUDA-graph-able later;
+                    # for v1 just live with the loop.
+                    for t in range(n_w):
+                        adj = adaptive_head.adjust(probs_w[t])  # [V]
+                        cdf_one = probs_to_cdf_gpu_fp64(
+                            adj.unsqueeze(0)
+                        )  # [1, V+1] int32
+                        krunch_ac_cuda.encode_step(
+                            cdf_one, sym_w[t:t+1].contiguous(),
+                            output_buf, ac_state,
+                        )
+                        adaptive_head.update(sym_w[t:t+1].long(), adj)
+                else:
+                    cdfs_w = cpp_path.softmax_cdfs_per_row(logits_w)
+                    krunch_ac_cuda.encode_step(
+                        cdfs_w, sym_w, output_buf, ac_state)
         if prof:
             torch.cuda.synchronize(); t3 = t4 = _time.time()
         krunch_ac_cuda.encode_finalize(output_buf, ac_state)
@@ -446,6 +500,11 @@ class InferenceEngine:
         # W8A8 layer step has no graph capture support yet — force eager.
         if w8a8_active:
             graph_mode = "eager"
+        # Adaptive head mutates per-token bias state between cdf/decode →
+        # graph capture would freeze a stale bias. Force eager.
+        adaptive_on = os.environ.get("KRUNCH_ADAPTIVE_HEAD") == "1"
+        if adaptive_on:
+            graph_mode = "eager"
         use_graph = graph_mode in ("full", "per_layer")
         # Graphs are pointer-bound; reuse same state tensors across calls
         # (in-place reset). Eager path uses fresh allocations as before.
@@ -476,14 +535,36 @@ class InferenceEngine:
                 fwd = (cpp_path.forward_stepped_batched_graphed_v2
                        if graph_mode == "per_layer"
                        else cpp_path.forward_stepped_batched)
-                for t in range(max_T):
-                    logits = fwd(weights, last_input, state)
-                    cdfs = cpp_path.softmax_cdfs_per_row(logits)
-                    krunch_ac_cuda.decode_step_batched(
-                        cdfs, input_buf, base_byte_offsets,
-                        ac_states, out_syms)
-                    decoded_tokens[:, t] = out_syms
-                    last_input = out_syms.long()
+                if adaptive_on:
+                    from krunch.codec.adaptive_head_gpu import AdaptiveHeadGPU
+                    from krunch.codec.gpu_encode import probs_to_cdf_gpu_fp64
+                    n_vocab = int(self._tokenizer.get_vocab_size())
+                    head = AdaptiveHeadGPU(
+                        vocab_size=n_vocab, batch_size=B, device=device,
+                    )
+                    for t in range(max_T):
+                        logits = fwd(weights, last_input, state)
+                        probs = torch.softmax(
+                            logits.to(torch.float64), dim=-1
+                        )  # [B, V]
+                        adj = head.adjust(probs)  # [B, V] fp64
+                        cdfs = probs_to_cdf_gpu_fp64(adj)  # [B, V+1] int32
+                        krunch_ac_cuda.decode_step_batched(
+                            cdfs, input_buf, base_byte_offsets,
+                            ac_states, out_syms,
+                        )
+                        decoded_tokens[:, t] = out_syms
+                        head.update(out_syms.long(), adj)
+                        last_input = out_syms.long()
+                else:
+                    for t in range(max_T):
+                        logits = fwd(weights, last_input, state)
+                        cdfs = cpp_path.softmax_cdfs_per_row(logits)
+                        krunch_ac_cuda.decode_step_batched(
+                            cdfs, input_buf, base_byte_offsets,
+                            ac_states, out_syms)
+                        decoded_tokens[:, t] = out_syms
+                        last_input = out_syms.long()
 
         # Single sync at the end.
         decoded_cpu = decoded_tokens.cpu().numpy()
@@ -517,16 +598,39 @@ class InferenceEngine:
         # forward. First call per layer captures, subsequent calls
         # replay one graph (saves ~12× ATen launch overhead).
         use_graph = os.environ.get("KRUNCH_CPP_GRAPH", "0") == "1"
+        adaptive_on = os.environ.get("KRUNCH_ADAPTIVE_HEAD") == "1"
+        if adaptive_on:
+            # Graph capture would freeze a stale bias state.
+            use_graph = False
         # v2 = snapshot/restore-around-capture variant; v1 is broken.
         fwd = (cpp_path.forward_stepped_graphed_v2 if use_graph
                else cpp_path.forward_stepped)
+        head = None
+        if adaptive_on:
+            from krunch.codec.adaptive_head_gpu import AdaptiveHeadGPU
+            from krunch.codec.gpu_encode import probs_to_cdf_gpu_fp64
+            n_vocab = int(self._tokenizer.get_vocab_size())
+            head = AdaptiveHeadGPU(
+                vocab_size=n_vocab, batch_size=1, device=self._device,
+            )
         with torch.no_grad():
             for _ in range(n_tokens):
                 logits = fwd(weights, last, state)
-                cdf_row = cpp_path.softmax_cdf_one_row(logits)
+                if adaptive_on:
+                    probs = torch.softmax(
+                        logits.view(-1).to(torch.float64), dim=-1
+                    )
+                    adj = head.adjust(probs)  # [V] fp64
+                    cdf_row = probs_to_cdf_gpu_fp64(
+                        adj.unsqueeze(0)
+                    ).squeeze(0)  # [V+1] int32
+                else:
+                    cdf_row = cpp_path.softmax_cdf_one_row(logits)
                 krunch_ac_cuda.decode_step(cdf_row, input_buf, ac_state, out_sym)
                 tok = int(out_sym.item())
                 tokens.append(tok)
+                if adaptive_on:
+                    head.update(tok, adj)
                 last = tok
 
         text = self._tokenizer.decode(tokens)

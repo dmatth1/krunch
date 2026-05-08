@@ -16,7 +16,8 @@ import pytest
 
 from krunch.inference import (
     encode_header, decode_header, HEADER_FMT, HEADER_SIZE,
-    BLOB_MAGIC, BLOB_VERSION, MODEL_ID, TOKENIZER_ID,
+    BLOB_MAGIC, BLOB_VERSION, MODEL_ID, MODEL_ID_ADAPTIVE,
+    SUPPORTED_MODEL_IDS, TOKENIZER_ID,
     IncompatibleBlobError,
 )
 
@@ -63,9 +64,19 @@ def test_reject_unknown_model_id():
     """A future image using a different model must not silently produce
     garbage when fed an old blob — and vice versa. model_id mismatch is
     a hard error."""
-    bad = _hand_pack(model_id=MODEL_ID + 1)
+    unknown_id = max(SUPPORTED_MODEL_IDS) + 1
+    bad = _hand_pack(model_id=unknown_id)
     with pytest.raises(IncompatibleBlobError, match="model_id"):
         decode_header(bad)
+
+
+def test_accepts_adaptive_head_model_id():
+    """MODEL_ID_ADAPTIVE (NEXT-3) is also supported by this image. A
+    blob produced with KRUNCH_ADAPTIVE_HEAD=1 must round-trip through
+    decode_header without IncompatibleBlobError."""
+    hdr = _hand_pack(model_id=MODEL_ID_ADAPTIVE)
+    parsed = decode_header(hdr)
+    assert parsed["model_id"] == MODEL_ID_ADAPTIVE
 
 
 def test_reject_unknown_tokenizer_id():
