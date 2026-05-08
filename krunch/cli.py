@@ -50,21 +50,7 @@ def cmd_compress(args):
     raw = _read_input(args.input)
     with _stdout_to_stderr():
         engine.load()
-    # Multi-chunk encode MUST go through compress_chunks_batched
-    # (forward_stepped_batched, M=1 lockstep) to stay symmetric with
-    # the decoder, which uses decompress_chunks_batched. The
-    # per-chunk compress_chunk path uses forward_packed_window at
-    # M=1024, and the W8A8 layer-step kernel produces 1-LSB-different
-    # fp16 output at M=1024 vs M=1; softmax+CDF rounds those to
-    # different CDFs and AC roundtrip breaks (CRC32 mismatch on
-    # A10G 10MB / 161 chunks). Single-chunk inputs keep the packed
-    # path — compress_chunk is symmetric with decompress_chunk
-    # (forward_stepped, B=1) for AC purposes when there's no batched
-    # decoder lockstep.
-    chunk_entries, n_chunks = compress_all(
-        raw, engine.compress_chunk,
-        neural_batch_fn=engine.compress_chunks_batched,
-    )
+    chunk_entries, n_chunks = compress_all(raw, engine.compress_chunk)
     crc = zlib.crc32(raw) & 0xFFFFFFFF
     blob = encode_header(len(raw), n_chunks, crc) + b"".join(chunk_entries)
     _write_output(args.output, blob)
