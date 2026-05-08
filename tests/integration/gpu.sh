@@ -39,6 +39,13 @@ SAMPLE_LOCAL="data/spike6/wildchat_en_content.content.bin"
 SAMPLE_LIMIT_MB="${KRUNCH_SAMPLE_MB:-10}"
 LOCAL_BUILD="${KRUNCH_LOCAL_BUILD:-0}"
 KRUNCH_IMAGE_TAG="${KRUNCH_IMAGE:-ghcr.io/dmatth1/krunch:latest}"
+# Optional version pin. When set (e.g. KRUNCH_VERSION=v0.1.0), the
+# in-image install.sh is curled from that exact tag's tree AND
+# install.sh's own KRUNCH_VERSION env var is set so the wrapper +
+# image both pin to the tag. When unset, install.sh comes from main
+# and resolves to "latest published release" (or "main" if no
+# releases exist). Empty string = unset.
+KRUNCH_VERSION_PIN="${KRUNCH_VERSION:-}"
 TEST_TAG="$(date +%Y%m%d-%H%M%S)"
 S3_BASE="s3://${S3_BUCKET}/${S3_PREFIX}/${TEST_TAG}"
 RESULT_LOCAL="/tmp/krunch-tier3-result-${TEST_TAG}.json"
@@ -48,6 +55,7 @@ echo "  region:       ${REGION}"
 echo "  instance:     ${INSTANCE_TYPE} spot"
 echo "  S3 base:      ${S3_BASE}"
 echo "  image:        ${KRUNCH_IMAGE_TAG}  (build locally: ${LOCAL_BUILD})"
+echo "  version pin:  ${KRUNCH_VERSION_PIN:-<none — install.sh resolves latest release / main>}"
 echo "  sample limit: ${SAMPLE_LIMIT_MB} MB"
 
 # ---------------------------------------------------------------------------
@@ -102,6 +110,7 @@ TEST_TAG="__TEST_TAG__"
 REGION="__REGION__"
 LOCAL_BUILD="__LOCAL_BUILD__"
 KRUNCH_IMAGE_TAG="__KRUNCH_IMAGE_TAG__"
+KRUNCH_VERSION_PIN="__KRUNCH_VERSION_PIN__"
 
 # Ship logs to S3 on ANY exit path (success, set -e abort, crash). Without
 # this, a mid-script failure leaves the only log on the soon-terminated
@@ -163,11 +172,23 @@ if [[ "$LOCAL_BUILD" == "1" ]]; then
   echo "BUILD_DONE $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   KRUNCH_WRAPPER_SRC="${KRUNCH_DIR}/scripts/krunch"
 else
-  # Pull path — exactly the user UX: curl install.sh from the public repo
-  # and pipe to bash. install.sh handles the docker pull + wrapper install.
+  # Pull path — exactly the user UX: curl install.sh from the public
+  # repo and pipe to bash. install.sh handles the docker pull + wrapper
+  # install. If KRUNCH_VERSION_PIN is set we curl install.sh from that
+  # exact tag's tree AND set KRUNCH_VERSION on bash so install.sh's
+  # version-resolution path is exercised. Otherwise we curl from main
+  # and let install.sh resolve "latest published release" itself.
   echo "INSTALL_START $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  KRUNCH_IMAGE="${KRUNCH_IMAGE_TAG}" \
-    bash -c "curl -fsSL https://raw.githubusercontent.com/dmatth1/krunch/main/install.sh | bash"
+  if [[ -n "$KRUNCH_VERSION_PIN" ]]; then
+    INSTALL_REF="$KRUNCH_VERSION_PIN"
+    INSTALL_ENV="KRUNCH_VERSION=$KRUNCH_VERSION_PIN"
+  else
+    INSTALL_REF="main"
+    # Pass-through KRUNCH_IMAGE override only when no pin (otherwise
+    # install.sh derives the image from KRUNCH_VERSION naturally).
+    INSTALL_ENV="KRUNCH_IMAGE=${KRUNCH_IMAGE_TAG}"
+  fi
+  bash -c "curl -fsSL https://raw.githubusercontent.com/dmatth1/krunch/${INSTALL_REF}/install.sh | $INSTALL_ENV bash"
   echo "INSTALL_DONE $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 fi
 
@@ -270,6 +291,7 @@ sed -i.bak \
   -e "s|__REGION__|${REGION}|g" \
   -e "s|__LOCAL_BUILD__|${LOCAL_BUILD}|g" \
   -e "s|__KRUNCH_IMAGE_TAG__|${KRUNCH_IMAGE_TAG}|g" \
+  -e "s|__KRUNCH_VERSION_PIN__|${KRUNCH_VERSION_PIN}|g" \
   "$USER_DATA"
 # Splice in the forward-env block (multiline) at the __FORWARD_ENV__ marker.
 python3 -c "
