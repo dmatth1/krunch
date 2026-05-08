@@ -11,7 +11,19 @@ If this invariant breaks, the AC encoder writes bits against one CDF
 and the decoder reads against a different CDF — output bytes still
 look plausible but don't recover the input. That's exactly the
 failure mode in Bugs.md #1 and #4.
+
+Force W8A8 OFF here: forward_packed_window with W8A8 calls
+rwkv4_layer_step_cpp_w8a8, while forward_stepped calls
+rwkv4_layer_step_cpp_t1 (fp16 T=1 specialized) — different kernels by
+design, not bit-equal. Production AC roundtrip holds because cli.py's
+single-chunk decode uses forward_stepped (fp16) and the chunks-batched
+decode uses forward_stepped_batched (W8A8) — each path is internally
+symmetric. This test pins the fp16 invariant of forward_packed_window
+itself, not cross-kernel equality.
 """
+import os
+os.environ["KRUNCH_INT8_W8A8"] = "0"
+
 import pytest
 import torch
 

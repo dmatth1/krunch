@@ -320,18 +320,18 @@ def forward_packed_window(weights: dict, input_ids, state, off: int, n: int):
     T_w = int(ids_w.shape[0])
     x = emb_w[ids_w].view(1, T_w, n_embd).contiguous()
 
-    # W8A8 dispatch: compress packed forward at M >= 256 uses the int8
-    # Tensor Core path (1.5-2.2× per-call speedup at our shapes).
-    # Below that, fall back to the fp16 layer step on the dequant-fp16
-    # weights stored in `layers` — same code path the decoder uses
-    # (`forward_stepped` / `forward_stepped_batched` always M=1), so
-    # encoder and decoder produce bit-identical logits and AC roundtrip
-    # holds. Without this gate, encoder W8A8 + decoder fp16 produce
-    # slightly-different logits whose softmax+CDF can disagree by 1 LSB
-    # → AC bitstream un-recoverable. (On Turing, the W8A8 int8-WMMA
-    # kernel produces garbage output entirely — see docs/Bugs.md.)
-    M = T_w
-    use_w8a8 = ("w8a8_int8" in weights) and M >= 256
+    # W8A8 dispatch: encoder MUST mirror decoder unconditionally. Decoder
+    # (forward_stepped_batched) calls rwkv4_layer_step_cpp_w8a8 whenever
+    # the bundle has W8A8 weights — so encoder must too, at every M.
+    # Adding an M-based gate (e.g., M >= 256 → W8A8, smaller → fp16) means
+    # the LAST window of the LAST chunk in a multi-chunk input falls to
+    # fp16 while the decoder stays on W8A8, breaking AC roundtrip on
+    # exactly that tail (CRC32 mismatch on A10G 10MB / 161 chunks). The
+    # original asymmetry was fixed by removing the gate (krunch 67766c1,
+    # docs/TIER_3_OPTIMIZATION.md §Phase 2A T-stability bug fix); don't
+    # re-introduce it. The W8A8 layer-step kernel is M-bit-stable across
+    # the shapes we use (verified, see kernels/rwkv/layer_cpp.cpp:99).
+    use_w8a8 = "w8a8_int8" in weights
     if use_w8a8:
         w8a8_int8 = weights["w8a8_int8"]
         w8a8_scale = weights["w8a8_scale"]
