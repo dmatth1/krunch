@@ -732,11 +732,27 @@ static at::Tensor gemm_w8a8(at::Tensor x_fp16, at::Tensor W_q, at::Tensor scale_
     if (USE_INT_MM) {
         // _int_mm: int8 [M, K] × int8 [K, N] → int32 [M, N].
         // Wc is already [K, N] int8 from init_weights. Xq just produced.
-        auto int_acc = at::_int_mm(Xq, Wc);  // [M, N] int32
-        // Scale: out[m,n] = scale_x[m] * scale_w[n] * int_acc[m,n].
-        // Match the existing kernel's order of multiplication: x_scale
-        // outer, w_scale inner — keeping fp32 precision throughout the
-        // scaling so per-row + per-col scales don't lose bits.
+        //
+        // PyTorch 2.4's at::_int_mm requires M ≥ 17 (8×8 wmma fragment
+        // alignment + one row). Encoder's last partial window can be
+        // M < 17; decoder single-stream stepped path is M=1. Pad M up
+        // to max(M, 17) with zeros, run, slice back. Padding rows have
+        // no cross-row coupling in matmul, so output rows [0..M) are
+        // identical to a hypothetical native M-call.
+        constexpr int M_MIN = 17;
+        at::Tensor Xq_eff = Xq;
+        at::Tensor sx_eff = sx;
+        const int M_pad = (M < M_MIN) ? M_MIN : M;
+        if (M_pad != M) {
+            Xq_eff = at::zeros({M_pad, K}, Xq.options());
+            Xq_eff.narrow(0, 0, M).copy_(Xq);
+            sx_eff = at::zeros({M_pad}, sx.options());
+            sx_eff.narrow(0, 0, M).copy_(sx);
+        }
+        auto int_acc = at::_int_mm(Xq_eff, Wc);  // [M_pad, N] int32
+        if (M_pad != M) {
+            int_acc = int_acc.narrow(0, 0, M).contiguous();
+        }
         auto sx_f32 = sx.to(at::kFloat).view({M, 1});
         auto sw_f32 = sc.to(at::kFloat).view({1, N});
         auto out_f32 = int_acc.to(at::kFloat) * sx_f32 * sw_f32;
