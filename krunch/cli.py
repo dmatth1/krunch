@@ -22,7 +22,7 @@ import logging
 from . import __version__
 from .inference import (
     engine, encode_header, decode_header, HEADER_SIZE,
-    BLOB_VERSION, MODEL_ID, TOKENIZER_ID,
+    BLOB_VERSION, MODEL_ID, TOKENIZER_ID, _model_id_for_run,
 )
 from .chunking import compress_all, decompress_all
 
@@ -30,9 +30,12 @@ from .chunking import compress_all, decompress_all
 def _emit_event(event: str, **fields) -> None:
     """One-line JSON event on stderr. Lets users `grep krunch_event`
     in container logs and parse with `jq` for ratio / KB/s tracking
-    across runs without shelling out to /tmp/result.json."""
+    across runs without shelling out to /tmp/result.json. The model_id
+    reflects the codec env settings active for this invocation (1 =
+    baseline fp16/W8A8, 2 = adaptive head)."""
     payload = {"krunch_event": event, "krunch_version": __version__,
-               "model_id": MODEL_ID, "tokenizer_id": TOKENIZER_ID,
+               "model_id": _model_id_for_run(),
+               "tokenizer_id": TOKENIZER_ID,
                "blob_version": BLOB_VERSION, **fields}
     sys.stderr.write(json.dumps(payload, separators=(",", ":")) + "\n")
     sys.stderr.flush()
