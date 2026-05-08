@@ -202,16 +202,6 @@ export KRUNCH_IMAGE="${KRUNCH_IMAGE_TAG}"
 INPUT_BYTES=$(wc -c < /tmp/sample.bin)
 echo "Input: ${INPUT_BYTES} bytes"
 
-# Prime the WKV-kernel `.so` and torch.compile cache via a tiny synthetic
-# compress. Without this, COMPRESS_START's timing folds in ~30-90 s of
-# one-time setup (ninja build + JIT trace), inflating the wall-clock by
-# 50-100% on small inputs and producing a misleading throughput number.
-# `krunch warmup` writes into the krunch-cache docker volume so the
-# subsequent compress/decompress runs come up warm.
-echo "WARMUP_START $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-krunch warmup
-echo "WARMUP_DONE $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-
 # Forward KRUNCH_* flags from the caller's shell (so the operator can
 # toggle e.g. KRUNCH_BF16=1 without modifying this script). Listed
 # explicitly to keep the userdata diff readable; add new flags here.
