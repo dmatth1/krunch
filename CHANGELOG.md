@@ -19,7 +19,7 @@ release? If no, bump `MODEL_ID` and document migration here.
 
 ---
 
-## [Unreleased]
+## [0.1.1] — 2026-05-11
 
 ### Fixed
 - **Bug #3 — Codec is lossy on non-UTF-8 input** (correctness bug).
