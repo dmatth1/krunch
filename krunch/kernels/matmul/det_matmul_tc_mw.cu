@@ -160,6 +160,6 @@ extern "C" void launch_det_matmul_tc_mw(
         // routing layer fails loud rather than producing garbage.
         fprintf(stderr, "FATAL: launch_det_matmul_tc_mw requires "
                 "K in {768, 3072}, got K=%d\n", K);
-        std::abort();
+        abort();
     }
 }

@@ -34,8 +34,8 @@
 #include <cuda_fp16.h>
 #include <mma.h>
 #include <stdint.h>
-#include <cstdio>
-#include <cstdlib>
+#include <stdio.h>
+#include <stdlib.h>
 
 using namespace nvcuda;
 
@@ -180,7 +180,7 @@ extern "C" void launch_det_matmul_w8a8_tc(
     } else {
         fprintf(stderr, "FATAL: launch_det_matmul_w8a8_tc requires "
                 "K in {768, 3072}, got K=%d\n", K);
-        std::abort();
+        abort();
     }
 }
 
@@ -279,6 +279,6 @@ extern "C" void launch_quantize_per_row_int8(
     } else {
         fprintf(stderr, "FATAL: launch_quantize_per_row_int8 requires "
                 "K in {768, 3072}, got K=%d\n", K);
-        std::abort();
+        abort();
     }
 }

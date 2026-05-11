@@ -35,7 +35,7 @@ S3_BUCKET="${KRUNCH_S3_BUCKET:?KRUNCH_S3_BUCKET env var required (bucket the tes
 INSTANCE_PROFILE="${KRUNCH_INSTANCE_PROFILE:?KRUNCH_INSTANCE_PROFILE env var required (IAM profile with S3 access to KRUNCH_S3_BUCKET)}"
 
 S3_PREFIX="krunch-tier3"
-SAMPLE_LOCAL="data/spike6/wildchat_en_content.content.bin"
+SAMPLE_LOCAL="${KRUNCH_SAMPLE_PATH:-data/spike6/wildchat_en_content.content.bin}"
 SAMPLE_LIMIT_MB="${KRUNCH_SAMPLE_MB:-10}"
 LOCAL_BUILD="${KRUNCH_LOCAL_BUILD:-0}"
 KRUNCH_IMAGE_TAG="${KRUNCH_IMAGE:-ghcr.io/dmatth1/krunch:latest}"

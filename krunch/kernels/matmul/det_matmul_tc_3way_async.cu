@@ -250,6 +250,6 @@ extern "C" void launch_det_matmul_tc_3way_async(
     } else {
         fprintf(stderr, "FATAL: launch_det_matmul_tc_3way_async requires "
                 "K in {768, 3072}, got K=%d\n", K);
-        std::abort();
+        abort();
     }
 }

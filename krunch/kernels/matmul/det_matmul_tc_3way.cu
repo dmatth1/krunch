@@ -147,6 +147,6 @@ extern "C" void launch_det_matmul_tc_3way(
         // tensor uninitialized.
         fprintf(stderr, "FATAL: launch_det_matmul_tc_3way requires "
                 "K in {768, 3072}, got K=%d\n", K);
-        std::abort();
+        abort();
     }
 }

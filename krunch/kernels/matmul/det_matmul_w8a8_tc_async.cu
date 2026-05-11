@@ -257,6 +257,6 @@ extern "C" void launch_det_matmul_w8a8_tc_async(
     } else {
         fprintf(stderr, "FATAL: launch_det_matmul_w8a8_tc_async requires "
                 "K in {768, 3072}, got K=%d\n", K);
-        std::abort();
+        abort();
     }
 }

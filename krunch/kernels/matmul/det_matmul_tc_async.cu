@@ -19,8 +19,8 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <mma.h>
-#include <cstdio>
-#include <cstdlib>
+#include <stdio.h>
+#include <stdlib.h>
 
 using namespace nvcuda;
 
@@ -227,6 +227,6 @@ extern "C" void launch_det_matmul_tc_async(
         // silently corrupt downstream math.
         fprintf(stderr, "FATAL: launch_det_matmul_tc_async requires "
                 "K in {768, 3072}, got K=%d\n", K);
-        std::abort();
+        abort();
     }
 }
