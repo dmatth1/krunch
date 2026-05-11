@@ -74,27 +74,25 @@ amortizes to zero on warm fleets and on large jobs.*
 ## Ratio comparisons
 
 Compressed-size ratio (smaller = better) on a single A10G g5.xlarge,
-1 MB chunks. ts_zip hasn't been benched locally yet.
+1 MB chunks.
 
-| corpus | krunch | ts_zip | zstd -22 --long | krunch vs zstd |
-|---|---|---|---|---|
-| Chat — WildChat-English (100 MB) | **0.114** | _tbd_ | 0.170 | **−33%** |
-| Wikipedia — enwik8 (100 MB) | **0.146** | _tbd_ | 0.253 | **−42%** |
-| Python code — CodeParrot (100 MB) | **0.097** | _tbd_ | 0.154 | **−37%** |
-| Support tickets — Bitext (19 MB) | 0.099 | _tbd_ | **0.083** | +20% |
-| HTTP logs — NASA Apache (100 MB) | 0.157 | _tbd_ | **0.061** | +158% |
+| corpus | krunch | zstd -22 --long | krunch vs zstd |
+|---|---|---|---|
+| Chat — WildChat-English (100 MB) | **0.114** | 0.170 | **−33%** |
+| Wikipedia — enwik8 (100 MB) | **0.146** | 0.253 | **−42%** |
+| Python code — CodeParrot (100 MB) | **0.097** | 0.154 | **−37%** |
+| Support tickets — Bitext (19 MB) | 0.099 | **0.083** | +20% |
+| HTTP logs — NASA Apache (100 MB) | 0.157 | **0.061** | +158% |
 
 All rows are byte-exact. Inputs that contain raw non-UTF-8 bytes
 (server logs with `%XX`-decoded byte sequences, mixed-encoding CSVs,
 arbitrary binary) round-trip losslessly via a private-use-area
 escape applied before tokenization.
 
-The honest story: krunch wins decisively on natural-language text
-(chat, prose, code) and loses to zstd-22's 128 MB dictionary window
+krunch wins decisively on natural-language text
+(chat, prose, code) and loses to zstd-22
 on highly-repetitive structured text (templated logs, intent
-labels). The fan-out story — N workers ≈ N× throughput on
-independent chunks — is independent of ratio, so the worker-scaling
-pitch still applies even on the rows where the ratio is worse.
+labels).
 
 ## What's inside the Docker image
 
