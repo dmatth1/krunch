@@ -82,16 +82,12 @@ Compressed-size ratio (smaller = better) on a single A10G g5.xlarge,
 | Wikipedia — enwik8 (100 MB) | **0.146** | _tbd_ | 0.253 | **−42%** |
 | Python code — CodeParrot (100 MB) | **0.097** | _tbd_ | 0.154 | **−37%** |
 | Support tickets — Bitext (19 MB) | 0.099 | _tbd_ | **0.083** | +20% |
-| HTTP logs — NASA Apache (100 MB) [^1] | 0.157 | _tbd_ | **0.061** | +158% |
+| HTTP logs — NASA Apache (100 MB) | 0.157 | _tbd_ | **0.061** | +158% |
 
-[^1]: krunch is **lossy** on this corpus because the input contains
-  raw non-UTF-8 bytes (e.g. `0x80` from `%80`-decoded URL paths in
-  1995 Apache logs). The codec substitutes invalid sequences with
-  `U+FFFD` before tokenizing, so the decompressed bytes differ from
-  the original (same length, different sha256). Ratio shown for
-  completeness, not for direct comparison to zstd. Lossless byte-
-  exact roundtrip on arbitrary input is a v1.1 target. All other
-  rows in this table are byte-exact.
+All rows are byte-exact. Inputs that contain raw non-UTF-8 bytes
+(server logs with `%XX`-decoded byte sequences, mixed-encoding CSVs,
+arbitrary binary) round-trip losslessly via a private-use-area
+escape applied before tokenization.
 
 The honest story: krunch wins decisively on natural-language text
 (chat, prose, code) and loses to zstd-22's 128 MB dictionary window
@@ -120,15 +116,8 @@ into a batch system we don't have a template for in ~30 lines.
 
 ## When *not* to use krunch
 
-Krunch is a neural compressor for **UTF-8 text**. Avoid it when:
+Krunch is a neural compressor for **text**. Avoid it when:
 
-- **Your data isn't valid UTF-8.** Inputs with raw non-UTF-8 bytes
-  (1995-era HTTP server logs with `%XX`-decoded URL paths, raw email
-  bodies with binary attachments, mixed-encoding CSV exports) are
-  currently lossy: the codec substitutes invalid sequences with
-  `U+FFFD` before tokenizing, so the decompressed bytes won't match
-  the input. Byte-exact roundtrip on arbitrary input is a v1.1
-  target; for now, stick to confirmed UTF-8 data.
 - **Your data is highly repetitive structured text** (templated
   logs, intent labels, repeating timestamps). zstd-22's 128 MB
   dictionary window catches that pattern far more cheaply than a

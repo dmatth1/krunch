@@ -94,17 +94,25 @@ def cmd_decompress(args):
     hdr = decode_header(blob)
     t0 = time.time()
     entries_bytes = blob[HEADER_SIZE:]
+    # tokenizer_id from the blob header selects the reverse
+    # text→bytes function — tokenizer_id=1 used errors="replace"
+    # (Bugs.md #3, lossy on non-UTF-8), tokenizer_id=2 uses the
+    # byte-safe PUA escape. Image bundles both for backward compat.
+    tid = hdr["tokenizer_id"]
     if hdr["n_chunks"] > 1:
         # Cross-chunk batched stepped forward saturates the GPU by
         # processing B chunks in parallel through one batched forward
         # per timestep. Bit-exact roundtrip.
         raw = decompress_all(
-            entries_bytes, hdr["n_chunks"], engine.decompress_chunk,
-            neural_batch_fn=engine.decompress_chunks_batched,
+            entries_bytes, hdr["n_chunks"],
+            lambda enc: engine.decompress_chunk(enc, tokenizer_id=tid),
+            neural_batch_fn=lambda encs: engine.decompress_chunks_batched(
+                encs, tokenizer_id=tid),
         )
     else:
         raw = decompress_all(
-            entries_bytes, hdr["n_chunks"], engine.decompress_chunk,
+            entries_bytes, hdr["n_chunks"],
+            lambda enc: engine.decompress_chunk(enc, tokenizer_id=tid),
         )
 
     # CRC check — skipped if header flags say "no CRC" (assembled-from-parts blobs)

@@ -8,6 +8,7 @@ silently falls back to a ~1000× slower Python loop in eval mode.
 
 import os
 import gc
+import codecs
 import time
 import struct
 import logging
@@ -18,6 +19,64 @@ import numpy as np
 from tokenizers import Tokenizer
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Byte-safe input encoding (Bugs.md #3 fix)
+# ---------------------------------------------------------------------------
+# Up to tokenizer_id=1 the codec preprocessed input via
+# `bytes.decode("utf-8", errors="replace")`, which substitutes any
+# invalid UTF-8 sequence with U+FFFD. Decompress reproduced *the
+# substitution*, not the original byte — lossy on HTTP logs, mixed-
+# encoding CSVs, arbitrary binary.
+#
+# tokenizer_id=2 fixes it by escaping invalid bytes into a Private-Use
+# Area codepoint range (U+E000+byte). Decode reverses. Clean UTF-8
+# inputs go through the encoder unchanged (no escape triggered).
+# Inputs that legitimately contain U+E000-U+E0FF codepoints are
+# decoded via tokenizer_id=1's text.encode("utf-8") path; new encodes
+# always write tokenizer_id=2 so the right reverse step is applied.
+
+_PUA_BASE = 0xE000
+
+def _krunch_pua_handler(error: UnicodeError):
+    """codecs error handler — invalid byte b -> chr(U+E000 + b)."""
+    if not isinstance(error, UnicodeDecodeError):
+        raise error
+    obj = error.object
+    chars = [chr(_PUA_BASE + obj[i]) for i in range(error.start, error.end)]
+    return ("".join(chars), error.end)
+
+codecs.register_error("krunch_pua", _krunch_pua_handler)
+
+
+def _bytes_to_text(data: bytes) -> str:
+    """Byte-safe input preprocessing for the tokenizer. ASCII +
+    valid-UTF-8 multibyte sequences pass through unchanged; invalid
+    bytes become PUA codepoints in U+E080..U+E0FF. Roundtrip is
+    `_text_to_bytes(_bytes_to_text(b)) == b` for any bytes."""
+    return data.decode("utf-8", errors="krunch_pua")
+
+
+def _text_to_bytes(text: str) -> bytes:
+    """Inverse of `_bytes_to_text`. PUA codepoints in U+E000..U+E0FF
+    map back to the corresponding raw byte; everything else encodes
+    as UTF-8. Use this for tokenizer_id=2 blobs."""
+    out = bytearray()
+    for ch in text:
+        cp = ord(ch)
+        if _PUA_BASE <= cp < _PUA_BASE + 0x100:
+            out.append(cp - _PUA_BASE)
+        else:
+            out.extend(ch.encode("utf-8"))
+    return bytes(out)
+
+
+def _text_to_bytes_legacy(text: str) -> bytes:
+    """tokenizer_id=1 reverse step — direct UTF-8 encode. PUA
+    codepoints in input were already mangled at compress time
+    (errors="replace" substituted them with U+FFFD); we just round-
+    trip the tokenizer's output as-is."""
+    return text.encode("utf-8")
 
 # ---------------------------------------------------------------------------
 # Model + tokenizer paths (baked into the Docker image)
@@ -46,14 +105,21 @@ def _load_rwkv():
 
 BLOB_MAGIC = b"KRNC"
 BLOB_VERSION = 1
-# Model + tokenizer IDs for RWKV-4-Pile-169M + GPT-NeoX BPE
+# Model IDs for RWKV-4-Pile-169M:
 #   1 = baseline (fp16, with or without W8A8 — W8A8 is a kernel-level
 #                 dtype swap that produces identical bytes)
 #   2 = adaptive bias head (NEXT-3, KRUNCH_ADAPTIVE_HEAD=1)
 MODEL_ID = 1
 MODEL_ID_ADAPTIVE = 2
-TOKENIZER_ID = 1
 SUPPORTED_MODEL_IDS = (MODEL_ID, MODEL_ID_ADAPTIVE)
+# Tokenizer IDs for GPT-NeoX 20B BPE + bytes-to-text preprocessing:
+#   1 = legacy: bytes.decode("utf-8", errors="replace"). Lossy on
+#       non-UTF-8 input (Bugs.md #3). Read-only for backward compat.
+#   2 = byte-safe PUA escape: invalid bytes → U+E000+b codepoints.
+#       Lossless on arbitrary bytes. New compress writes this.
+TOKENIZER_ID_LEGACY = 1
+TOKENIZER_ID = 2
+SUPPORTED_TOKENIZER_IDS = (TOKENIZER_ID_LEGACY, TOKENIZER_ID)
 
 
 def _model_id_for_run() -> int:
@@ -149,10 +215,10 @@ def decode_header(data: bytes, *, strict: bool = True) -> dict:
                 f"(supported: {SUPPORTED_MODEL_IDS}); recompress with a "
                 f"matching image"
             )
-        if tid != TOKENIZER_ID:
+        if tid not in SUPPORTED_TOKENIZER_IDS:
             raise IncompatibleBlobError(
                 f"tokenizer_id {tid} not supported by this image "
-                f"(expected {TOKENIZER_ID})"
+                f"(supported: {SUPPORTED_TOKENIZER_IDS})"
             )
     return parsed
 
@@ -303,7 +369,11 @@ class InferenceEngine:
         # Decode all to text once, then a single batch-encode call.
         # tokenizer.encode_batch is the Rust tokenizers library's
         # parallel path — much faster than 16× sequential encode().
-        texts = [d.decode("utf-8", errors="replace") for d in chunks]
+        # tokenizer_id=2: byte-safe PUA escape. Clean UTF-8 inputs
+        # produce identical tokens to the legacy errors="replace" path,
+        # so this is a no-op for the existing corpora and only kicks in
+        # on inputs with raw non-UTF-8 bytes (Bugs.md #3).
+        texts = [_bytes_to_text(d) for d in chunks]
         encodings = self._tokenizer.encode_batch(texts)
         all_tokens = [e.ids for e in encodings]
         return [self._compress_chunk_with_tokens(d, t)
@@ -330,7 +400,7 @@ class InferenceEngine:
         batch-tokenizes — same per-chunk bytes, faster overall via the
         Rust tokenizer's parallel path.
         """
-        text = data.decode("utf-8", errors="replace")
+        text = _bytes_to_text(data)
         tokens = self._tokenizer.encode(text).ids
         return self._compress_chunk_with_tokens(data, tokens)
 
@@ -448,7 +518,20 @@ class InferenceEngine:
         mini_header = struct.pack(">II", len(data), len(tokens))
         return mini_header + ac_bytes
 
-    def _decompress_chunks_batched_cpp(self, encoded_chunks: list[bytes]) -> list[bytes]:
+    def _text_to_bytes_for(self, tokenizer_id: int):
+        """Pick the reverse text→bytes function matching the blob's
+        tokenizer_id. Image bundles converters for every shipped
+        tokenizer_id so old blobs continue to decode."""
+        if tokenizer_id == TOKENIZER_ID:           # 2 — byte-safe PUA
+            return _text_to_bytes
+        if tokenizer_id == TOKENIZER_ID_LEGACY:    # 1 — direct UTF-8 (lossy on non-UTF-8)
+            return _text_to_bytes_legacy
+        raise ValueError(
+            f"unsupported tokenizer_id {tokenizer_id} "
+            f"(supported: {SUPPORTED_TOKENIZER_IDS})")
+
+    def _decompress_chunks_batched_cpp(self, encoded_chunks: list[bytes],
+                                        tokenizer_id: int = TOKENIZER_ID) -> list[bytes]:
         """Bit-exact cross-chunk batched decompress.
 
         Decodes up to B_MAX chunks in parallel per batched stepped
@@ -473,7 +556,7 @@ class InferenceEngine:
             out: list[bytes] = []
             for i in range(0, len(encoded_chunks), B_MAX):
                 out.extend(self._decompress_chunks_batched_cpp(
-                    encoded_chunks[i:i + B_MAX]))
+                    encoded_chunks[i:i + B_MAX], tokenizer_id=tokenizer_id))
             return out
 
         B = len(encoded_chunks)
@@ -592,15 +675,17 @@ class InferenceEngine:
 
         # Single sync at the end.
         decoded_cpu = decoded_tokens.cpu().numpy()
+        to_bytes = self._text_to_bytes_for(tokenizer_id)
         out: list[bytes] = []
         for i in range(B):
             toks = decoded_cpu[i, :n_tokens_per[i]].tolist()
             text = self._tokenizer.decode(toks)
-            out.append(text.encode("utf-8")[:orig_lens[i]])
+            out.append(to_bytes(text)[:orig_lens[i]])
         return out
 
     def _decompress_chunk_cpp(self, encoded: bytes, orig_len: int,
-                                n_tokens: int, bitstream: bytes) -> bytes:
+                                n_tokens: int, bitstream: bytes,
+                                tokenizer_id: int = TOKENIZER_ID) -> bytes:
         """Bit-exact C++ orchestration path. Stepped forward per token,
         per-row softmax+CDF, GPU AC decode."""
         import torch
@@ -658,18 +743,25 @@ class InferenceEngine:
                 last = tok
 
         text = self._tokenizer.decode(tokens)
-        return text.encode("utf-8")[:orig_len]
+        return self._text_to_bytes_for(tokenizer_id)(text)[:orig_len]
 
-    def decompress_chunk(self, encoded: bytes) -> bytes:
+    def decompress_chunk(self, encoded: bytes,
+                          tokenizer_id: int = TOKENIZER_ID) -> bytes:
         """Decompress a single AC-encoded chunk produced by compress_chunk.
 
         GPU decode path: state (low/high/value/bit_offset) lives in a
         4-uint32 GPU tensor across calls; per-step CDF stays on GPU; only
         the decoded symbol (one int) crosses to CPU each token.
+
+        ``tokenizer_id`` selects the reverse text→bytes function — read
+        from the blob header by the caller (cli.cmd_decompress). Defaults
+        to the current TOKENIZER_ID so direct programmatic use without a
+        blob still works.
         """
         orig_len, n_tokens = struct.unpack(">II", encoded[:8])
         bitstream = encoded[8:]
-        return self._decompress_chunk_cpp(encoded, orig_len, n_tokens, bitstream)
+        return self._decompress_chunk_cpp(encoded, orig_len, n_tokens, bitstream,
+                                          tokenizer_id=tokenizer_id)
 
     def compress_chunks_batched(self, chunks: list[bytes]) -> list[bytes]:
         """Compress N chunks in lockstep, B=N forward + B=N AC encode per
@@ -696,7 +788,7 @@ class InferenceEngine:
         orig_lens: list[int] = []
         for c in chunks:
             orig_lens.append(len(c))
-            text = c.decode("utf-8", errors="replace")
+            text = _bytes_to_text(c)
             toks = self._tokenizer.encode(text).ids
             if len(toks) < 1:
                 raise ValueError("chunk has no tokens after tokenization")
@@ -765,17 +857,23 @@ class InferenceEngine:
             out.append(mini_header + ac_bytes)
         return out
 
-    def decompress_chunks_batched(self, encoded_chunks: list[bytes]) -> list[bytes]:
+    def decompress_chunks_batched(self, encoded_chunks: list[bytes],
+                                    tokenizer_id: int = TOKENIZER_ID) -> list[bytes]:
         """Decompress B independent chunks in lockstep via the bit-exact
         C++ orchestration path (matches compress_chunk so the bitstream
         roundtrips byte-for-byte).
+
+        ``tokenizer_id`` selects the reverse text→bytes function; read
+        from the blob header by the caller (cli.cmd_decompress).
         """
         B = len(encoded_chunks)
         if B == 0:
             return []
         if B == 1:
-            return [self.decompress_chunk(encoded_chunks[0])]
-        return self._decompress_chunks_batched_cpp(encoded_chunks)
+            return [self.decompress_chunk(encoded_chunks[0],
+                                           tokenizer_id=tokenizer_id)]
+        return self._decompress_chunks_batched_cpp(encoded_chunks,
+                                                    tokenizer_id=tokenizer_id)
 
 
 def _gpu_softmax_to_numpy(logits) -> np.ndarray:

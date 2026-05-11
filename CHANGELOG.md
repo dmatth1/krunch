@@ -21,6 +21,28 @@ release? If no, bump `MODEL_ID` and document migration here.
 
 ## [Unreleased]
 
+### Fixed
+- **Bug #3 — Codec is lossy on non-UTF-8 input** (correctness bug).
+  Compress preprocessing used `bytes.decode("utf-8", errors="replace")`
+  which substituted invalid byte sequences with `U+FFFD`; decompress
+  reproduced *the substitution*, not the original. Affected HTTP logs,
+  mixed-encoding CSVs, raw email bodies — any input containing non-UTF-8
+  bytes. **Fix:** new `_bytes_to_text` / `_text_to_bytes` helpers that
+  escape invalid bytes as PUA codepoints `U+E000..U+E0FF`. Encoder
+  unconditionally uses the new path; decoder dispatches on the blob's
+  `tokenizer_id`. See `docs/Bugs.md` #3 for the limitation around input
+  literally containing valid UTF-8 sequences for U+E0XX codepoints.
+
+### Added
+- **`TOKENIZER_ID_LEGACY = 1`** + **`TOKENIZER_ID = 2`** —
+  `SUPPORTED_TOKENIZER_IDS = (1, 2)`. New compress writes
+  `tokenizer_id=2`. Existing `tokenizer_id=1` blobs continue to decode
+  via the legacy `text.encode("utf-8")` path that the image still
+  bundles. Bump driven by Bug #3 fix above.
+- `tests/unit/test_bytes_to_text_pua.py` (13 tests) — pins the
+  byte-safe encoding contract, the documented limitation, and the
+  legacy converter that stays around for old-blob compat.
+
 ### Added
 - **`MODEL_ID_ADAPTIVE = 2`** — second supported model_id covering
   blobs produced with `KRUNCH_ADAPTIVE_HEAD=1` (NEXT-3, per-document
