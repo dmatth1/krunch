@@ -31,20 +31,40 @@ jobs:
           docker system prune -af || true
           df -h
 
-      - name: Fetch model weights + tokenizer
+      - name: Fetch model weights + tokenizer (with sha256 verification)
         # Public BlinkDL release; no auth needed. Cached as actions cache so
         # subsequent runs skip the 325 MB download.
+        #
+        # Both files are pinned by sha256. The model digest is the
+        # canonical Git LFS OID published by HuggingFace
+        # (https://huggingface.co/BlinkDL/rwkv-4-pile-169m/raw/main/RWKV-4-Pile-169M-20220807-8023.pth
+        # returns the LFS pointer whose `oid sha256:` line matches
+        # below). The tokenizer digest is the contents of
+        # github.com/BlinkDL/RWKV-LM/raw/main/RWKV-v4/20B_tokenizer.json
+        # at the time this pin was set (2026-05-11). Bumping either
+        # requires recomputing the digest AND a MODEL_ID / TOKENIZER_ID
+        # bump per RELEASES.md, because the bitstream contract depends
+        # on these exact bytes.
+        env:
+          MODEL_SHA256:     713c6f6137a08d3a86ab57df4f09ea03563329beb3bbabc23509d6c57aa0f9e2
+          TOKENIZER_SHA256: 56ac4821e129d2c520fdaba60abd920fa852ada51b45c0dd52bbb6bd8c985ade
         run: |
+          set -euo pipefail
           mkdir -p models
           if [ ! -f models/RWKV-4-Pile-169M-20220807-8023.pth ]; then
-            curl -sL --fail \
+            curl -sL --fail --retry 5 --retry-delay 2 --retry-connrefused \
               "https://huggingface.co/BlinkDL/rwkv-4-pile-169m/resolve/main/RWKV-4-Pile-169M-20220807-8023.pth" \
               -o models/RWKV-4-Pile-169M-20220807-8023.pth
           fi
-          curl -sL --fail \
+          curl -sL --fail --retry 5 --retry-delay 2 --retry-connrefused \
             "https://github.com/BlinkDL/RWKV-LM/raw/main/RWKV-v4/20B_tokenizer.json" \
             -o models/20B_tokenizer.json
           ls -lh models/
+          # Verify both before COPY-ing them into the image. A mismatch
+          # halts the build, which is the correct response to an upstream
+          # republish — the bitstream contract pins these bytes.
+          echo "${MODEL_SHA256}  models/RWKV-4-Pile-169M-20220807-8023.pth" | sha256sum -c -
+          echo "${TOKENIZER_SHA256}  models/20B_tokenizer.json" | sha256sum -c -
 
       - name: Cache model weights
         uses: actions/cache@v4

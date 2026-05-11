@@ -29,3 +29,37 @@ constriction
 PyTorch + Hugging Face tokenizers
   Standard transitive Python dependencies of the inference path.
   Licenses: BSD-3-Clause (PyTorch), Apache-2.0 (tokenizers).
+
+L3TC — Leveraging RWKV for Learned Lossless Low-Complexity Text Compression
+  Upstream: https://github.com/alipay/L3TC-leveraging-rwkv-for-learned-lossless-low-complexity-text-compression
+  Paper:    Zhao et al., AAAI 2025 (https://arxiv.org/abs/2412.16642)
+  Used:     krunch's architectural shape (RWKV LM logits → arithmetic
+            coder, per-chunk encoding with state reset at chunk
+            boundaries) is descended from the L3TC reference. krunch
+            diverged on the deterministic encoder/decoder path, 24-bit
+            AC, self-describing blob format, B>1 batched stepped decoder,
+            single Docker image, and dynamic chunking. See
+            docs/PEER_CODEC_NOTES.md §0 for the lineage delta.
+  License:  Apache-2.0.
+
+Nacrith-GPU
+  Upstream: https://github.com/robtacconelli/Nacrith-GPU
+  Used:     `krunch/codec/adaptive_head.py` is a direct numpy port of
+            Nacrith-GPU's `adaptive_head.py` (the fp64 per-document
+            online bias correction algorithm + identical
+            adjust/update semantics). `krunch/codec/adaptive_head_gpu.py`
+            is the torch fp64 GPU mirror of the same algorithm, byte-
+            exact with the CPU port. Currently parked behind
+            KRUNCH_ADAPTIVE_HEAD=1 (see docs/OPTIMIZATIONS.md §4).
+  License:  Apache-2.0.
+
+rwkv-cpp-accelerated
+  Upstream: https://github.com/harrisonvanderbyl/rwkv-cpp-accelerated
+  Used:     Kernel-layout patterns referenced when designing krunch's
+            RWKV-4 CUDA kernels (uint8 weights with per-input-channel
+            scale/offset, 3-way fused KVR matmul launch shape, RWKV
+            state buffer layout). See docs/PEER_CODEC_NOTES.md §4 for
+            the technique trace. krunch's kernels were written from
+            scratch with WMMA + cp.async on top of these patterns;
+            no code copied verbatim.
+  License:  Apache-2.0.
