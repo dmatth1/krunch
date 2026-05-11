@@ -1,8 +1,8 @@
 # Krunch
 
 > **Krunch is a neural codec for text.** It works on any NVIDIA GPU
-> and beats traditional compression algorithms (like zstd-22) by 20-40%
-> on text-heavy data (logs, chat, support tickets, code).
+> and beats traditional compression algorithms (like zstd-22) by 30-40%
+> on natural-language text (chat, prose, code).
 >
 > Run it on one machine or parallelize across a cluster with any batch
 > system you already use.
@@ -83,11 +83,6 @@ Compressed-size ratio (smaller = better) on a single A10G g5.xlarge,
 | Python code — CodeParrot (100 MB) | **0.097** | 0.154 | **−37%** |
 | Support tickets — Bitext (19 MB) | 0.099 | **0.083** | +20% |
 | HTTP logs — NASA Apache (100 MB) | 0.157 | **0.061** | +158% |
-
-All rows are byte-exact. Inputs that contain raw non-UTF-8 bytes
-(server logs with `%XX`-decoded byte sequences, mixed-encoding CSVs,
-arbitrary binary) round-trip losslessly via a private-use-area
-escape applied before tokenization.
 
 krunch wins decisively on natural-language text
 (chat, prose, code) and loses to zstd-22
