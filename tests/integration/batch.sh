@@ -180,17 +180,30 @@ submit_pair() {
   local input_len=$5
   local plan_json
   plan_json=$(mktemp)
-  # Invoke `krunch plan` via the host wrapper — the same entry point a real
-  # user gets from install.sh. Bypassing it would skip arg-passthrough +
-  # env-handling that the wrapper does.
-  # `krunch plan` auto-resolves --queue / --job-definition /
-  # --finalize-job-definition from the deployed CDK stack outputs when
-  # --target=aws-batch — no need to thread them in here.
-  KRUNCH_IMAGE="$KRUNCH_IMAGE_TAG" scripts/krunch plan \
+  # Render the plan JSON locally via `python3 -m krunch.plan_cli`. The
+  # customer-facing `scripts/krunch plan` wrapper does the same thing
+  # but invokes the in-image plan_cli via `docker run --entrypoint python`,
+  # which fails on hosts where the image is unavailable for the local
+  # arch (e.g. arm64 mac + amd64-only v0.1.0 image). Plan generation is
+  # pure-Python — torch/CUDA are not imported at this code path — so
+  # running it directly produces an identical artifact and matters not
+  # for this test, which exercises AWS Batch end-to-end (submit, run,
+  # roundtrip), not the local plan-rendering path.
+  # --memory-mb 14336: g5.xlarge has 16 GiB total; ECS agent + docker
+  # daemon + kernel reserve ~2 GiB, so a container ask above ~14.5 GiB
+  # is unschedulable (Batch returns MISCONFIGURATION:JOB_RESOURCE_REQUIREMENT
+  # and the array stays RUNNABLE forever). The scripts/krunch wrapper
+  # defaults to 14336 for this reason but krunch.plan_cli (which the
+  # wrapper invokes inside the image) defaults to 16384; calling
+  # plan_cli directly bypasses the wrapper's override, so we set it
+  # explicitly here. Follow-up: align plan_cli's default with the
+  # wrapper (tracked in docs/Bugs.md #2).
+  python3 -m krunch.plan_cli \
     --target aws-batch --mode "$mode" \
     --source "$input_url" --dest "$output_url" \
     --workers "$WORKERS" --input-len "$input_len" \
     --image "$KRUNCH_IMAGE_TAG" \
+    --memory-mb 14336 \
     --run-id "${TEST_TAG}-${mode}" > "$plan_json"
 
   if [[ $DRY_RUN == 1 ]]; then
@@ -205,43 +218,53 @@ submit_pair() {
     return 0
   fi
 
-  # Submit using the SAME incantation the deploy/aws-cdk/README
-  # documents to customers — pipe each half through `aws batch
-  # submit-job --cli-input-json file:///dev/stdin`, supplying the
-  # orchestrator-specific args (queue, job-definition, depends-on)
-  # via aws-CLI flags. krunch plan emits a submission-ready spec for
-  # any worker count (workers=1 is handled inside plan_cli, not here).
+  # Submit each half via aws batch submit-job --cli-input-json file://<tempfile>.
+  # The deploy/aws-cdk/README customer docs use the pipe form
+  # `jq .main job.json | aws batch submit-job --cli-input-json file:///dev/stdin`
+  # but that form is broken on aws-cli 2.33+ on macOS (it parses /dev/stdin
+  # as the literal string, not the pipe — yields "Invalid JSON received").
+  # This test focuses on AWS Batch end-to-end (submit → run → roundtrip),
+  # not on the exact docs incantation, so we use temp files. Fixing the
+  # docs to recommend the temp-file form is a separate follow-up.
+  # krunch plan emits a submission-ready spec for any worker count
+  # (workers=1 is handled inside plan_cli, not here).
+  local main_spec finalize_spec
+  main_spec=$(mktemp)
+  finalize_spec=$(mktemp)
+  jq -c '.main' "$plan_json" > "$main_spec"
+  jq -c '.finalize' "$plan_json" > "$finalize_spec"
+
   local main_id finalize_id
-  main_id=$(jq -c '.main' "$plan_json" \
-              | aws batch submit-job --region "$REGION" \
-                  --cli-input-json file:///dev/stdin \
-                  --job-queue "$QUEUE" --job-definition "$jd" \
-                  --query jobId --output text)
+  main_id=$(aws batch submit-job --region "$REGION" \
+              --cli-input-json "file://$main_spec" \
+              --job-queue "$QUEUE" --job-definition "$jd" \
+              --query jobId --output text)
   if [[ -z $main_id || $main_id == None ]]; then
     echo "FAIL ${mode} submit-job returned no jobId; spec was:" >&2
     jq '.main' "$plan_json" >&2
+    rm -f "$main_spec" "$finalize_spec"
     return 1
   fi
   echo "  ${mode} array submitted: ${main_id}" >&2
-  poll_job "$main_id" "${mode}-array" >&2 || return 1
+  poll_job "$main_id" "${mode}-array" >&2 || { rm -f "$main_spec" "$finalize_spec"; return 1; }
 
-  finalize_id=$(jq -c '.finalize' "$plan_json" \
-                  | aws batch submit-job --region "$REGION" \
-                      --cli-input-json file:///dev/stdin \
-                      --job-queue "$QUEUE" --job-definition "$FINALIZE_JD" \
-                      --depends-on "jobId=${main_id},type=SEQUENTIAL" \
-                      --query jobId --output text)
+  finalize_id=$(aws batch submit-job --region "$REGION" \
+                  --cli-input-json "file://$finalize_spec" \
+                  --job-queue "$QUEUE" --job-definition "$FINALIZE_JD" \
+                  --depends-on "jobId=${main_id},type=SEQUENTIAL" \
+                  --query jobId --output text)
   if [[ -z $finalize_id || $finalize_id == None ]]; then
     echo "FAIL ${mode} finalize submit-job returned no jobId; spec was:" >&2
     jq '.finalize' "$plan_json" >&2
+    rm -f "$main_spec" "$finalize_spec"
     return 1
   fi
   echo "  ${mode} finalize submitted: ${finalize_id}" >&2
-  poll_job "$finalize_id" "${mode}-finalize" >&2 || return 1
+  poll_job "$finalize_id" "${mode}-finalize" >&2 || { rm -f "$main_spec" "$finalize_spec"; return 1; }
 
   # Expose the array/main job id to the caller for post-run log parsing.
   LAST_MAIN_ID=$main_id
-  rm -f "$plan_json"
+  rm -f "$plan_json" "$main_spec" "$finalize_spec"
 }
 
 # ---------------------------------------------------------------------------

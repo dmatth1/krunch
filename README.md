@@ -74,16 +74,31 @@ amortizes to zero on warm fleets and on large jobs.*
 ## Ratio comparisons
 
 Compressed-size ratio (smaller = better) on a single A10G g5.xlarge,
-1 MB chunks. Other corpora are pending; ts_zip hasn't been benched
-locally yet.
+1 MB chunks. ts_zip hasn't been benched locally yet.
 
 | corpus | krunch | ts_zip | zstd -22 --long | krunch vs zstd |
 |---|---|---|---|---|
 | Chat — WildChat-English (100 MB) | **0.114** | _tbd_ | 0.170 | **−33%** |
-| Wikipedia — enwik8 (100 MB) | _tbd_ | _tbd_ | 0.253 | _tbd_ |
-| HTTP logs — NASA Apache (100 MB) | _tbd_ | _tbd_ | 0.061 | _tbd_ |
-| Support tickets — Bitext (19 MB) | _tbd_ | _tbd_ | 0.083 | _tbd_ |
-| Python code — CodeParrot (100 MB) | _tbd_ | _tbd_ | 0.154 | _tbd_ |
+| Wikipedia — enwik8 (100 MB) | **0.146** | _tbd_ | 0.253 | **−42%** |
+| Python code — CodeParrot (100 MB) | **0.097** | _tbd_ | 0.154 | **−37%** |
+| Support tickets — Bitext (19 MB) | 0.099 | _tbd_ | **0.083** | +20% |
+| HTTP logs — NASA Apache (100 MB) [^1] | 0.157 | _tbd_ | **0.061** | +158% |
+
+[^1]: krunch is **lossy** on this corpus because the input contains
+  raw non-UTF-8 bytes (e.g. `0x80` from `%80`-decoded URL paths in
+  1995 Apache logs). The codec substitutes invalid sequences with
+  `U+FFFD` before tokenizing, so the decompressed bytes differ from
+  the original (same length, different sha256). Ratio shown for
+  completeness, not for direct comparison to zstd. Lossless byte-
+  exact roundtrip on arbitrary input is a v1.1 target. All other
+  rows in this table are byte-exact.
+
+The honest story: krunch wins decisively on natural-language text
+(chat, prose, code) and loses to zstd-22's 128 MB dictionary window
+on highly-repetitive structured text (templated logs, intent
+labels). The fan-out story — N workers ≈ N× throughput on
+independent chunks — is independent of ratio, so the worker-scaling
+pitch still applies even on the rows where the ratio is worse.
 
 ## What's inside the Docker image
 
@@ -105,11 +120,22 @@ into a batch system we don't have a template for in ~30 lines.
 
 ## When *not* to use krunch
 
-Krunch is a neural compressor for text. 
-If your data isn't text-heavy enough that the language model can
-predict it, krunch can produce *larger* output than the input. For
-arbitrary binary data, mixed media, or already-compressed payloads, use 
-a different compressor.
+Krunch is a neural compressor for **UTF-8 text**. Avoid it when:
+
+- **Your data isn't valid UTF-8.** Inputs with raw non-UTF-8 bytes
+  (1995-era HTTP server logs with `%XX`-decoded URL paths, raw email
+  bodies with binary attachments, mixed-encoding CSV exports) are
+  currently lossy: the codec substitutes invalid sequences with
+  `U+FFFD` before tokenizing, so the decompressed bytes won't match
+  the input. Byte-exact roundtrip on arbitrary input is a v1.1
+  target; for now, stick to confirmed UTF-8 data.
+- **Your data is highly repetitive structured text** (templated
+  logs, intent labels, repeating timestamps). zstd-22's 128 MB
+  dictionary window catches that pattern far more cheaply than a
+  169 M-parameter language model — see the ratio table above.
+- **Arbitrary binary, mixed media, or already-compressed payloads.**
+  A 169 M-parameter language model has no advantage predicting
+  randomness; krunch will produce *larger* output than the input.
 
 ## Contributing
 
