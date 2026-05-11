@@ -16,6 +16,8 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <mma.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 using namespace nvcuda;
 

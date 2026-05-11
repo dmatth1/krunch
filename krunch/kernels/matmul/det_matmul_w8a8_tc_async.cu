@@ -29,6 +29,8 @@
 #include <cuda_fp16.h>
 #include <mma.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 using namespace nvcuda;
 
