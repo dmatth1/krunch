@@ -15,7 +15,7 @@ Run on any host with an NVIDIA GPU + Docker:
 # 1. Install (~5-10 min one-time — downloads CLI + pulls 3.5 GB image)
 curl -fsSL https://raw.githubusercontent.com/dmatth1/krunch/main/install.sh | sudo bash
 # For a pinned, reproducible install:
-#   curl -fsSL .../install.sh | sudo KRUNCH_VERSION=v1.0.0 bash
+#   curl -fsSL .../install.sh | sudo KRUNCH_VERSION=v0.1.1 bash
 
 # 2. Use it (instant — image is cached)
 krunch compress   data.jsonl  -o data.krunch
