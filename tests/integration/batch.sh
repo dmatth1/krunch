@@ -14,12 +14,12 @@
 #   - jq available locally.
 #   - docker available locally (used to invoke `krunch plan` from image).
 #
-# Sample: defaults to the 100 MB WildChat slice at
-#   s3://dmatth1-bnn-checkpoints/krunch-tier3/20260428-105803/sample.bin
-# Override with KRUNCH_SAMPLE_S3_URL=s3://your-bucket/path/to/sample.bin.
-# The script copies the sample into the deployed KrunchStack's bucket
-# (which the Batch job role can read) — so the source bucket only needs
-# to be readable by your local AWS credentials, not the Batch role.
+# Sample: required. Set
+#   KRUNCH_SAMPLE_S3_URL=s3://your-bucket/path/to/sample.bin
+# (100 MB WildChat English or similar text-heavy slice). The script
+# copies it into the deployed KrunchStack's bucket (which the Batch
+# job role can read) — so the source bucket only needs to be readable
+# by your local AWS credentials, not the Batch role.
 #
 # Cost: ~$0.30/hr × 4 g5.xlarge × ~5 min = ~$0.10 plus a few cents of S3.
 # Transient ECS / image-pull failures: JobDefinition retryStrategy
@@ -45,7 +45,7 @@ cd "$(dirname "$0")/../.."
 REGION="${AWS_REGION:-us-east-1}"
 STACK="${KRUNCH_STACK_NAME:-KrunchStack}"
 WORKERS="${KRUNCH_BATCH_WORKERS:-4}"
-SAMPLE_S3_URL="${KRUNCH_SAMPLE_S3_URL:-s3://dmatth1-bnn-checkpoints/krunch-tier3/20260428-105803/sample.bin}"
+SAMPLE_S3_URL="${KRUNCH_SAMPLE_S3_URL:?must be set to s3://your-bucket/path/to/sample.bin (a text-heavy sample readable by your local AWS credentials)}"
 KRUNCH_IMAGE_TAG="${KRUNCH_IMAGE:-ghcr.io/dmatth1/krunch:latest}"
 TEST_TAG="$(date +%Y%m%d-%H%M%S)"
 POLL_INTERVAL="${KRUNCH_POLL_INTERVAL:-15}"
