@@ -125,4 +125,4 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-Apache-2.0. See `NOTICE` for upstream attributions (RWKV-LM, constriction).
+Apache-2.0. See `NOTICE` for upstream attributions.
