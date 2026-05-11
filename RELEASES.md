@@ -10,18 +10,18 @@ curl -fsSL https://raw.githubusercontent.com/dmatth1/krunch/main/install.sh | su
 
 # Pin to a specific version (recommended for production deployments)
 curl -fsSL https://raw.githubusercontent.com/dmatth1/krunch/main/install.sh \
-  | sudo KRUNCH_VERSION=v0.1.0 bash
+  | sudo KRUNCH_VERSION=v0.1.1 bash
 ```
 
 `KRUNCH_VERSION` controls both the wrapper script (`scripts/krunch`)
-and the Docker image tag (`ghcr.io/dmatth1/krunch:v0.1.0`). Both are
+and the Docker image tag (`ghcr.io/dmatth1/krunch:v0.1.1`). Both are
 fetched from the matching git tag, so the install is deterministic.
 
 To pin only the image (e.g., to test a release candidate against an
 already-installed wrapper):
 
 ```bash
-KRUNCH_IMAGE=ghcr.io/dmatth1/krunch:v0.1.0 krunch compress < in > out
+KRUNCH_IMAGE=ghcr.io/dmatth1/krunch:v0.1.1 krunch compress < in > out
 ```
 
 ## Versioning policy
@@ -31,13 +31,13 @@ contract is slightly looser — see the pre-1.0 caveat below.
 
 | What changed | Version bump | Compat impact |
 |---|---|---|
-| Bug fix, no behavior change | **patch** (`v0.1.0 → v0.1.1`) | none — same bits in, same bits out |
-| New flag, new orchestrator template, faster kernel that produces SAME compressed bits | **minor** (`v0.1.0 → v0.2.0`) | none — same bits |
+| Bug fix, no behavior change | **patch** (`v0.1.1 → v0.1.2`) | none — same bits in, same bits out |
+| New flag, new orchestrator template, faster kernel that produces SAME compressed bits | **minor** (`v0.1.1 → v0.2.0`) | none — same bits |
 | New `model_id` / new `tokenizer_id` / AC contract change → blob byte change | **major** (`v0.x → v1.0`) | OLD blobs still decode (image bundles old model); NEW blobs only decoded by ≥ v1.0 |
 
 **Pre-1.0 (v0.x) caveat:** breaking changes are possible between minor
 versions while we're stabilizing the format. Pin
-`KRUNCH_VERSION=v0.1.0` (or whatever stable tag you've validated) for
+`KRUNCH_VERSION=v0.1.1` (or whatever stable tag you've validated) for
 production deployments. We'll guarantee strict semver from v1.0
 onward.
 
@@ -61,7 +61,7 @@ crc32           u32
 
 **The hard contract:** every published krunch image bundles the
 weights + tokenizer for every `model_id` it has ever shipped. So a
-v3.0.0 client can decompress a v0.1.0 blob — the model
+v3.0.0 client can decompress a v0.1.1 blob — the model
 (`model_id=1`) used to encode it is still present in the v3.0.0
 image. Forward-compatibility is preserved indefinitely; you don't
 have to keep the old client around to read old archives.
@@ -93,34 +93,42 @@ What does NOT invalidate a blob (no version bump needed for compat):
 
 ## Cutting a release
 
-For maintainers — the four-step ritual:
+For maintainers — the four-step ritual (substitute `vX.Y.Z` with the
+new tag, e.g. `v0.1.2`):
 
 ```bash
-# 1. Tag (annotated, with notes)
-git tag v0.1.0 -a -m "First pre-launch — AWS Batch fan-out validated"
-git push origin v0.1.0
+# 1. Bump krunch/__init__.py + freeze the [Unreleased] header in
+#    CHANGELOG.md to the release date, then commit.
 
-# 2. Wait for the publish workflow (~5 min)
+# 2. Tag (annotated) and push
+git tag vX.Y.Z -a -m "vX.Y.Z — short summary"
+git push origin main vX.Y.Z
+
+# 3. Wait for the publish workflow (~5 min)
 gh run list --workflow=publish-image.yml --limit 1
 # Image lands at:
-#   ghcr.io/dmatth1/krunch:v0.1.0
-#   ghcr.io/dmatth1/krunch:0.1.0
-#   ghcr.io/dmatth1/krunch:0
+#   ghcr.io/dmatth1/krunch:vX.Y.Z
+#   ghcr.io/dmatth1/krunch:X.Y.Z
+#   ghcr.io/dmatth1/krunch:X
 #   (and :latest, since the tag landed on main)
 
-# 3. Cut a GitHub Release with notes
-gh release create v0.1.0 \
-  --title "v0.1.0 — first pre-launch tag" \
-  --notes-file RELEASE_NOTES_v0.1.0.md \
-  --prerelease   # drop this once we're at v1.0+
+# 4. Cut a GitHub Release with notes (inline heredoc works fine)
+gh release create vX.Y.Z --title "vX.Y.Z — short title" --notes "$(cat <<'EOF'
+... markdown body ...
+EOF
+)"
 
-# 4. Smoke-test the pin actually works on a fresh host
+# 5. (Optional) Smoke-test the pin on a fresh host
 #    (~$0.05, ~5 min on a g4dn.xlarge spot — see CLAUDE.md AWS access)
-KRUNCH_VERSION=v0.1.0 KRUNCH_INSTANCE_TYPE=g4dn.xlarge \
+KRUNCH_VERSION=vX.Y.Z KRUNCH_INSTANCE_TYPE=g4dn.xlarge \
   KRUNCH_SAMPLE_MB=1 bash tests/integration/gpu.sh
 ```
 
 ## Released versions
 
-_None yet — pre-launch. v0.1.0 will be the first tag once we're
-satisfied with the post-T4 state._
+| Version | Date | Highlight |
+|---|---|---|
+| `v0.1.1` | 2026-05-11 | Bug #3 fix (non-UTF-8 codec) + repo-scan hardening |
+| `v0.1.0` | 2026-05-08 | Initial pre-launch tag — AWS Batch fan-out validated |
+
+Full changelog: [`CHANGELOG.md`](CHANGELOG.md).

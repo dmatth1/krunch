@@ -10,7 +10,8 @@ What gets created:
 - Three job definitions: `compress` (GPU array), `decompress` (GPU
   array), and `finalize` (CPU stitcher used by both modes).
 - An S3 bucket for compressed output + temp parts, with a 3-day
-  lifecycle on `*.parts/` to auto-clean orphans.
+  lifecycle on objects tagged `lifecycle=temp` (which the worker
+  writes onto its temp parts) to auto-clean orphans.
 - A CloudWatch log-retention rule on `/aws/batch/job` (default 30
   days; override via `logRetention` prop).
 - Stack-level `Project: krunch` / `ManagedBy: cdk` tags propagated to
