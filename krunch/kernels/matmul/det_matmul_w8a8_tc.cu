@@ -34,6 +34,8 @@
 #include <cuda_fp16.h>
 #include <mma.h>
 #include <stdint.h>
+#include <cstdio>
+#include <cstdlib>
 
 using namespace nvcuda;
 
@@ -175,9 +177,11 @@ extern "C" void launch_det_matmul_w8a8_tc(
             write_fp32 ? nullptr : reinterpret_cast<__half*>(Y),
             write_fp32 ? reinterpret_cast<float*>(Y) : nullptr,
             M, N, write_fp32);
+    } else {
+        fprintf(stderr, "FATAL: launch_det_matmul_w8a8_tc requires "
+                "K in {768, 3072}, got K=%d\n", K);
+        std::abort();
     }
-    // RWKV-4-Pile-169M only uses K∈{768, 3072} for matmul shapes that
-    // quantize. Caller must pre-check.
 }
 
 
@@ -272,5 +276,9 @@ extern "C" void launch_quantize_per_row_int8(
             reinterpret_cast<int8_t*>(X_q),
             reinterpret_cast<__half*>(scale_x),
             M);
+    } else {
+        fprintf(stderr, "FATAL: launch_quantize_per_row_int8 requires "
+                "K in {768, 3072}, got K=%d\n", K);
+        std::abort();
     }
 }

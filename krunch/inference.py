@@ -71,6 +71,16 @@ def _model_id_for_run() -> int:
 HEADER_FMT = ">4sBIIIHHQII"  # big-endian
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
 
+# Defense-in-depth caps on header-declared sizes. A malformed or
+# malicious blob can declare absurd n_chunks (u32 → up to 4B) or
+# original_len (u64 → up to 2^64-1) that would OOM the decoder loop
+# long before CRC32 ever catches the corruption. These caps are
+# orders of magnitude above any realistic v1 workload — krunch v1's
+# canonical inputs are 1 MB – 10 GB.
+MAX_CHUNKS = 100_000_000        # 100M chunks (would need a 6.4 TB input at 64 KB/chunk)
+MAX_ORIGINAL_LEN = 1 << 40      # 1 TiB
+MAX_CHUNK_BYTES = 16 << 20      # 16 MiB per chunk (default chunk size is 64 KiB)
+
 
 def encode_header(original_len: int, n_chunks: int, crc32: int,
                   adapter_id: int = 0, adapter_version: int = 0,
@@ -114,6 +124,20 @@ def decode_header(data: bytes, *, strict: bool = True) -> dict:
         "original_len": orig_len, "n_chunks": n_chunks, "crc32": crc,
     }
     if strict:
+        # Cheap bound checks BEFORE the version checks so a malicious
+        # blob with absurd sizes can't tie up the decoder even on a
+        # codec-incompatible image.
+        if n_chunks > MAX_CHUNKS:
+            raise IncompatibleBlobError(
+                f"n_chunks {n_chunks} exceeds MAX_CHUNKS {MAX_CHUNKS}; "
+                f"either the blob is malformed or v1 caps need raising "
+                f"(see krunch/inference.py)"
+            )
+        if orig_len > MAX_ORIGINAL_LEN:
+            raise IncompatibleBlobError(
+                f"original_len {orig_len} exceeds MAX_ORIGINAL_LEN "
+                f"{MAX_ORIGINAL_LEN}; same as above"
+            )
         if bv != BLOB_VERSION:
             raise IncompatibleBlobError(
                 f"blob_version {bv} not supported by this image "

@@ -151,12 +151,26 @@ def decompress_all(entries_bytes: bytes, n_chunks: int,
     `KRUNCH_DECOMPRESS_BATCH > 1` a ThreadPoolExecutor for the rare
     callers that need it).
     """
-    # Pre-parse all chunks (cheap — just slicing + 8 bytes per entry)
+    # Pre-parse all chunks (cheap — just slicing + 8 bytes per entry).
+    # Defense-in-depth: cap per-chunk orig_len / comp_len so a malformed
+    # blob can't trigger a huge allocation before CRC32 ever runs. The
+    # top-level n_chunks cap is enforced in inference.decode_header.
+    from .inference import MAX_CHUNK_BYTES
     pos = 0
     chunks: list[tuple[int, bytes]] = []  # (orig_len, encoded)
-    for _ in range(n_chunks):
+    for i in range(n_chunks):
         orig_len, comp_len = struct.unpack(">II", entries_bytes[pos:pos + 8])
         pos += 8
+        if orig_len > MAX_CHUNK_BYTES:
+            raise ValueError(
+                f"chunk {i}: orig_len {orig_len} exceeds MAX_CHUNK_BYTES "
+                f"{MAX_CHUNK_BYTES}; blob malformed or v1 caps need raising"
+            )
+        if comp_len > MAX_CHUNK_BYTES:
+            raise ValueError(
+                f"chunk {i}: comp_len {comp_len} exceeds MAX_CHUNK_BYTES "
+                f"{MAX_CHUNK_BYTES}; same as above"
+            )
         chunks.append((orig_len, entries_bytes[pos:pos + comp_len]))
         pos += comp_len
 

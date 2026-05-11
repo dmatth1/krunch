@@ -111,7 +111,12 @@ def _run_compress_worker():
     crc = zlib.crc32(raw) & 0xFFFFFFFF
     blob = encode_header(len(raw), n_chunks, crc) + entries_bytes
 
-    url_io.write(part_url, blob)
+    # tag=lifecycle:temp so the CDK example stack's bucket lifecycle
+    # rule can expire orphaned partials (S3 lifecycle's `prefix`
+    # filter is literal-prefix only and can't match the `.parts/`
+    # substring in the middle of variable output paths). Tags are
+    # ignored for non-S3 schemes.
+    url_io.write(part_url, blob, tags={"lifecycle": "temp"})
     ratio = len(blob) / len(raw) if raw else 0.0
     logger.info("wrote %d bytes (ratio=%.3f, %d chunks) to %s",
                 len(blob), ratio, n_chunks, part_url)
@@ -183,7 +188,8 @@ def _run_decompress_worker():
     logger.info("KRUNCH_WORK_TIME mode=decompress part=%d bytes=%d "
                 "elapsed=%.3f rate_kbps=%.1f n_chunks=%d",
                 part_index, len(raw), work_elapsed, rate_kbps, len(my_chunks))
-    url_io.write(part_url, raw)
+    # See compress-side note above re: the lifecycle tag.
+    url_io.write(part_url, raw, tags={"lifecycle": "temp"})
     logger.info("wrote %d raw bytes (%d chunks) to %s",
                 len(raw), len(my_chunks), part_url)
 

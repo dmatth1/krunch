@@ -99,8 +99,15 @@ export class KrunchStack extends cdk.Stack {
       : new s3.Bucket(this, "KrunchBucket", {
           removalPolicy: cdk.RemovalPolicy.RETAIN,
           lifecycleRules: [{
-            // Auto-delete orphaned parts after 3 days
-            prefix: "*.parts/",
+            // Auto-delete orphaned partial blobs after 3 days.
+            //
+            // krunch workers (krunch/job.py) tag every part upload
+            // with `lifecycle=temp` (via krunch/url_io.py:write tags=).
+            // S3 lifecycle's `prefix` filter is literal-prefix only —
+            // a glob like `*.parts/` matches NOTHING. Using `tagFilters`
+            // is the correct way to target the per-job `<output>.parts/<i>`
+            // paths that have variable output prefixes.
+            tagFilters: { lifecycle: "temp" },
             expiration: cdk.Duration.days(3),
           }],
         });

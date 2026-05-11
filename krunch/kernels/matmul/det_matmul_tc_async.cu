@@ -19,6 +19,8 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <mma.h>
+#include <cstdio>
+#include <cstdlib>
 
 using namespace nvcuda;
 
@@ -218,5 +220,13 @@ extern "C" void launch_det_matmul_tc_async(
             write_fp32 ? nullptr : reinterpret_cast<__half*>(C),
             write_fp32 ? reinterpret_cast<float*>(C) : nullptr,
             M, N, write_fp32);
+    } else {
+        // Defensive — production routes K∈{768,3072} only; any future
+        // caller that bypasses the routing layer would otherwise leave
+        // the output tensor uninitialized (at::empty + no kernel) and
+        // silently corrupt downstream math.
+        fprintf(stderr, "FATAL: launch_det_matmul_tc_async requires "
+                "K in {768, 3072}, got K=%d\n", K);
+        std::abort();
     }
 }

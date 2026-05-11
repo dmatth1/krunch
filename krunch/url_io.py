@@ -12,6 +12,7 @@ The orchestrator uses it to read file size, assemble final blob, clean up parts.
 
 import urllib.request
 from pathlib import Path
+from typing import Optional
 
 
 # ---------------------------------------------------------------------------
@@ -85,12 +86,23 @@ def read_all(url: str) -> bytes:
 # Write
 # ---------------------------------------------------------------------------
 
-def write(url: str, data: bytes) -> None:
-    """Write data to url. Overwrites if already exists."""
+def write(url: str, data: bytes,
+          tags: Optional[dict[str, str]] = None) -> None:
+    """Write data to url. Overwrites if already exists.
+
+    ``tags`` (S3 only) attaches object tags at upload time. Used by
+    `krunch.job` to mark partial blobs as `lifecycle=temp` so the
+    CDK example stack's bucket lifecycle rule can expire them. Tags
+    are silently ignored for non-S3 schemes."""
     scheme, rest = _split(url)
     if scheme == "s3":
         bucket, key = _s3_parts(rest)
-        _s3().put_object(Bucket=bucket, Key=key, Body=data)
+        kwargs: dict = {"Bucket": bucket, "Key": key, "Body": data}
+        if tags:
+            # S3 expects a urlencoded `Tagging` string, not a dict.
+            from urllib.parse import urlencode
+            kwargs["Tagging"] = urlencode(tags)
+        _s3().put_object(**kwargs)
     elif scheme == "file":
         p = Path(_file_path(rest))
         p.parent.mkdir(parents=True, exist_ok=True)

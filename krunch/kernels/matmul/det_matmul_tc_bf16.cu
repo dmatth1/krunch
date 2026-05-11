@@ -192,5 +192,9 @@ extern "C" void launch_det_matmul_tc_async_bf16(
             write_fp32 ? nullptr : reinterpret_cast<__nv_bfloat16*>(C),
             write_fp32 ? reinterpret_cast<float*>(C) : nullptr,
             M, N, write_fp32);
+    } else {
+        fprintf(stderr, "FATAL: launch_det_matmul_tc_async_bf16 requires "
+                "K in {768, 3072}, got K=%d\n", K);
+        std::abort();
     }
 }

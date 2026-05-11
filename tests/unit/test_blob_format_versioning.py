@@ -19,6 +19,7 @@ from krunch.inference import (
     BLOB_MAGIC, BLOB_VERSION, MODEL_ID, MODEL_ID_ADAPTIVE,
     SUPPORTED_MODEL_IDS, TOKENIZER_ID,
     IncompatibleBlobError,
+    MAX_CHUNKS, MAX_ORIGINAL_LEN, MAX_CHUNK_BYTES,
 )
 
 
@@ -114,6 +115,47 @@ def test_adapter_fields_round_trip():
     assert parsed["adapter_id"] == 42
     assert parsed["adapter_version"] == 7
     assert parsed["flags"] == 0x05
+
+
+def test_reject_oversized_n_chunks():
+    """A malformed/malicious blob declaring n_chunks > MAX_CHUNKS must
+    be rejected up-front. Without this cap a 2^32-1 n_chunks would
+    spin the decoder loop and OOM long before CRC32 ever runs."""
+    bad = _hand_pack(n_chunks=MAX_CHUNKS + 1)
+    with pytest.raises(IncompatibleBlobError, match="MAX_CHUNKS"):
+        decode_header(bad)
+
+
+def test_reject_oversized_original_len():
+    """Same for original_len — declared u64 in the header. Cap at
+    MAX_ORIGINAL_LEN to bound the post-decode buffer."""
+    bad = _hand_pack(original_len=MAX_ORIGINAL_LEN + 1)
+    with pytest.raises(IncompatibleBlobError, match="MAX_ORIGINAL_LEN"):
+        decode_header(bad)
+
+
+def test_max_caps_orders_of_magnitude_above_v1_workload():
+    """Sanity: the caps must be far above any realistic v1 input. 10 GB
+    at the 64 KB chunk floor is ~163K chunks; the cap should be way
+    above that to give headroom but well below u32-max."""
+    assert MAX_CHUNKS >= 10_000_000  # 10M minimum headroom
+    assert MAX_CHUNKS < 2**32           # below u32-max so the header field can't overflow
+    assert MAX_ORIGINAL_LEN >= 10**11   # ≥ 100 GB realistic
+    assert MAX_ORIGINAL_LEN < 2**64
+    assert MAX_CHUNK_BYTES >= 1 << 20   # ≥ 1 MB (well above 64 KB chunk floor)
+
+
+def test_per_chunk_size_cap_rejects_oversized_entry():
+    """chunking.decompress_all must reject per-chunk orig_len/comp_len
+    exceeding MAX_CHUNK_BYTES. Catches malformed mini-headers inside
+    the entries section."""
+    from krunch.chunking import decompress_all
+    # Build an entries blob whose first chunk declares orig_len =
+    # MAX_CHUNK_BYTES + 1.
+    bogus_orig_len = MAX_CHUNK_BYTES + 1
+    bogus = struct.pack(">II", bogus_orig_len, 0)
+    with pytest.raises(ValueError, match="MAX_CHUNK_BYTES"):
+        decompress_all(bogus, n_chunks=1, neural_fn=lambda b: b)
 
 
 def test_header_format_string_is_frozen():

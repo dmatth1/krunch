@@ -141,7 +141,12 @@ extern "C" void launch_det_matmul_tc_3way(
             h0, h1, h2, f0, f1, f2,
             M, N, wf_mask);
     } else {
-        // Generic-K fallback: caller handles. (Not used in RWKV-4 paths.)
-        // Skipping for v0.
+        // RWKV-4-Pile-169M only uses K∈{768,3072}; routing in
+        // layer_cpp.cpp::gemm_fp16 guards this. Defensive abort so a
+        // future caller bypassing the routing doesn't leave the output
+        // tensor uninitialized.
+        fprintf(stderr, "FATAL: launch_det_matmul_tc_3way requires "
+                "K in {768, 3072}, got K=%d\n", K);
+        std::abort();
     }
 }

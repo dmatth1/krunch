@@ -254,5 +254,9 @@ extern "C" void launch_det_matmul_w8a8_tc_async(
             reinterpret_cast<const int8_t*>(W_q),
             reinterpret_cast<const __half*>(scale_w),
             Y, write_fp32, M, N);
+    } else {
+        fprintf(stderr, "FATAL: launch_det_matmul_w8a8_tc_async requires "
+                "K in {768, 3072}, got K=%d\n", K);
+        std::abort();
     }
 }

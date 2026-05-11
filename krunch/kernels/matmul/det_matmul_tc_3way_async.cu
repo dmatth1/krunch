@@ -247,5 +247,9 @@ extern "C" void launch_det_matmul_tc_3way_async(
             reinterpret_cast<const __half*>(B0), reinterpret_cast<const __half*>(B1),
             reinterpret_cast<const __half*>(B2),
             Y0, Y1, Y2, wf0, wf1, wf2, M, N);
+    } else {
+        fprintf(stderr, "FATAL: launch_det_matmul_tc_3way_async requires "
+                "K in {768, 3072}, got K=%d\n", K);
+        std::abort();
     }
 }

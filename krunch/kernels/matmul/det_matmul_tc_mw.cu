@@ -153,7 +153,13 @@ extern "C" void launch_det_matmul_tc_mw(
             write_fp32 ? nullptr : reinterpret_cast<__half*>(C),
             write_fp32 ? reinterpret_cast<float*>(C) : nullptr,
             M, N, write_fp32);
+    } else {
+        // Generic-K fallback intentionally absent — only the head matmul
+        // benefits and that's K=768. Defensive abort instead of the
+        // historical silent no-op so any future caller bypassing the
+        // routing layer fails loud rather than producing garbage.
+        fprintf(stderr, "FATAL: launch_det_matmul_tc_mw requires "
+                "K in {768, 3072}, got K=%d\n", K);
+        std::abort();
     }
-    // Generic-K fallback intentionally absent — only the head matmul benefits
-    // and that's K=768. Caller must pre-check shape.
 }

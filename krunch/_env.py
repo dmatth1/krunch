@@ -91,9 +91,13 @@ ENV_FLAGS: list[EnvFlag] = [
         "Changes blob structure (different chunk count → different blob).",
     ),
     EnvFlag(
-        "KRUNCH_TARGET_B", "32", "yes", "tuning",
-        "Target decompress batch size. Drives compute_chunk_size's "
-        "n_chunks ≈ 4 × target_B. Affects blob structure indirectly.",
+        # Default mirrors krunch.chunking._DEFAULT_TARGET_B (128). If this
+        # ever drifts the registry test (tests/unit/test_env_flags.py)
+        # passes but the documented contract lies to operators.
+        "KRUNCH_TARGET_B", "128", "yes", "tuning",
+        "Target decompress batch size (calibrated for A10G class). Drives "
+        "compute_chunk_size: n_chunks ≈ 4 × target_B. Affects blob structure "
+        "indirectly (chunk count is part of the blob).",
     ),
     # ---- Perf / kernel routing -----------------------------------------
     EnvFlag(
